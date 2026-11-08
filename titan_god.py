@@ -13,12 +13,14 @@ import imageio_ffmpeg
 
 init(autoreset=True)
 
+# --- НАСТРОЙКА FFMPEG (ДЛЯ ВИДЕО) ---
 try:
     os.environ["IMAGEIO_FFMPEG_EXE"] = imageio_ffmpeg.get_ffmpeg_exe()
     FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 except:
     FFMPEG_PATH = None
 
+# --- ФЕЙКОВЫЙ ВЕБ-СЕРВЕР ДЛЯ RENDER ---
 app = Flask(__name__)
 
 @app.route('/')
@@ -29,6 +31,7 @@ def run_web():
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port)
 
+# --- КОНФИГУРАЦИЯ ---
 API_ID = 2040
 API_HASH = 'b18441a1ff607e10a989891a5462e627'
 TEMPLATES_FILE = 'templates.json'
@@ -71,22 +74,18 @@ async def fetch_url(url, headers=None):
     except Exception as e:
         return f"ERROR: {e}"
 
-async def spam_loop():
-    global is_spamming, targets
+# --- ФУНКЦИЯ ДЛЯ ОДНОГО ЧАТА (РАБОТАЕТ БЕСКОНЕЧНО) ---
+async def spam_single_target(target):
+    global is_spamming
     counter = 0
     while is_spamming:
         try:
-            if not targets:
-                is_spamming = False
-                log("SPAM", "Очередь пуста.", Fore.YELLOW)
+            if not MESSAGES:
+                log("SPAM", "Нет шаблонов!", Fore.RED)
                 break
             
-            target = targets[0]
-            if not MESSAGES:
-                is_spamming = False
-                break
-
             text = random.choice(MESSAGES)
+            # Невидимый символ для уникальности
             if random.random() > 0.7: text += "\u200b"
                 
             await client.send_message(target, text)
@@ -97,13 +96,31 @@ async def spam_loop():
             await asyncio.sleep(wait_time)
             
         except FloodWaitError as e:
-            log("FLOOD", f"Бан на {e.seconds} сек. Ждем...", Fore.RED)
+            log("FLOOD", f"Бан на {e.seconds} сек для {target}. Ждем...", Fore.RED)
             await asyncio.sleep(e.seconds + 5)
         except Exception as e:
-            log("ERROR", f"Сбой: {e}", Fore.RED)
-            if targets: targets.pop(0)
-            await asyncio.sleep(1)
+            log("ERROR", f"Сбой на {target}: {e}", Fore.RED)
+            # Если ошибка фатальная (например, чат удален), выходим из цикла для этого чата
+            break
 
+# --- ЗАПУСК ПАРАЛЛЕЛЬНЫХ ПОТОКОВ ---
+async def spam_loop():
+    global is_spamming, targets
+    if not targets:
+        is_spamming = False
+        return
+        
+    log("SPAM", f"Запуск параллельного спама по {len(targets)} чатам", Fore.YELLOW)
+    
+    # Создаем задачи для каждой цели. Они будут работать одновременно.
+    tasks = [asyncio.create_task(spam_single_target(t)) for t in targets]
+    
+    # Ждем, пока все задачи не завершатся (или пока не нажмут .стоп)
+    await asyncio.gather(*tasks)
+    is_spamming = False
+    log("SPAM", "Все потоки спама завершены.", Fore.YELLOW)
+
+# --- ОБРАБОТЧИК КОМАНД ---
 @client.on(events.NewMessage(outgoing=True))
 async def handler(e):
     global MESSAGES, min_delay, max_delay, is_spamming, targets, afk_enabled, afk_text, auto_reply_enabled, auto_reply_text
@@ -133,15 +150,21 @@ async def handler(e):
         save_templates()
         await e.edit(f"✅ Сохранено: {len(MESSAGES)}")
 
+    # --- ОБНОВЛЕННЫЙ БЛОК СПАМА ---
     elif cmd == 'спам':
         if not MESSAGES: return await e.edit("❌ Нет шаблонов!")
         
         raw_targets = [x.strip() for x in arg.split(',') if x.strip()]
         targets = []
         
+        await e.edit("🔄 Синхронизирую чаты...")
+        try:
+            async for dialog in client.iter_dialogs():
+                pass
+        except: pass
+
         for t in raw_targets:
             try:
-                # Обработка ссылок tg://
                 if t.startswith('tg://'):
                     match = re.search(r'id=(\d+)', t)
                     if match:
@@ -150,32 +173,28 @@ async def handler(e):
                              chat_id = int(f"-100{chat_id}")
                         entity = await client.get_entity(chat_id)
                         targets.append(entity)
-                    else:
-                        targets.append(t)
-                # Обработка t.me/c/
                 elif 't.me/c/' in t:
                     chat_id = int(t.split('t.me/c/')[1].split('/')[0])
                     entity = await client.get_entity(int(f"-100{chat_id}"))
                     targets.append(entity)
-                # Обычный ID (-100...)
                 elif t.startswith('-') and t[1:].isdigit():
                     targets.append(int(t))
-                # Юзернейм
                 else:
                     targets.append(t)
-            except:
+            except Exception as ex:
+                log("ERROR", f"Не нашел чат {t}: {ex}", Fore.RED)
                 targets.append(t)
 
         if not is_spamming:
             is_spamming = True
             asyncio.create_task(spam_loop())
-            await e.edit(f"🚀 Ебашу по {len(targets)}")
+            await e.edit(f"🚀 Ебашу ОДНОВРЕМЕННО по {len(targets)} чатам")
         else:
             await e.edit("⚠️ Уже работает")
 
     elif cmd == 'стоп':
         is_spamming = False
-        await e.edit("🛑 СТОП")
+        await e.edit("🛑 СТОП (останавливаю все потоки)")
 
     elif cmd == 'задержка':
         try:
@@ -271,7 +290,7 @@ async def handler(e):
         await e.edit(f"`{(datetime.datetime.now() - s).microseconds / 1000:.1f} мс`")
 
     elif cmd == 'хелп':
-        await e.edit("**Команды:**\n.шаблоны, .спам, .стоп, .задержка\n.gpt, .картинка, .вики\n.скачать, .парсинг, .инфо\n.профиль, .погода, .курс, .пинг\n.афк, .автоответ\n\n**ID/Ссылки:** можно юзать tg:// и t.me/c/")
+        await e.edit("**Команды:**\n.шаблоны, .спам, .стоп, .задержка\n.gpt, .картинка, .вики\n.скачать, .парсинг, .инфо\n.профиль, .погода, .курс, .пинг\n.афк, .автоответ")
 
 @client.on(events.NewMessage(incoming=True))
 async def handler_auto(e):
@@ -284,7 +303,7 @@ async def handler_auto(e):
             except: pass
 
 async def main():
-    print(f"{Fore.CYAN}TITAN v26.0 (FULL + ID) ЗАПУЩЕН{Fore.RESET}")
+    print(f"{Fore.CYAN}TITAN v28.0 (MULTI-SPAM) ЗАПУЩЕН{Fore.RESET}")
     load_data()
     log("SYS", f"Шаблонов: {len(MESSAGES)}", Fore.GREEN)
     threading.Thread(target=run_web, daemon=True).start()
