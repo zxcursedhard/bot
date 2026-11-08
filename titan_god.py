@@ -32,7 +32,8 @@ def run_web():
 # --- КОНФИГУРАЦИЯ ---
 API_ID = 2040
 API_HASH = 'b18441a1ff607e10a989891a5462e627'
-BOT_TOKEN = '8732669492:AAF5bx9JLRqKfyGx0TXf4u5KVj18n4d4wYs'
+# Используем переменную окружения, если она есть, иначе токен по умолчанию
+BOT_TOKEN = os.environ.get('BOT_TOKEN', '8732669492:AAF5bx9JLRqKfyGx0TXf4u5KVj18n4d4wYs')
 
 # --- БАЗА ДАННЫХ ---
 DB_FILE = 'titan_database.db'
@@ -40,7 +41,7 @@ DB_FILE = 'titan_database.db'
 # Клиенты (основной бот)
 bot = TelegramClient('bot_master', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
-# Словарь для хранения активных сессий (чтобы не переподключаться каждый раз)
+# Словарь для хранения активных сессий
 active_clients = {}
 
 def log(tag, msg, color=Fore.WHITE):
@@ -87,7 +88,6 @@ async def save_user_data(user_id, session, templates, min_delay, max_delay):
         ''', (user_id, session, json.dumps(templates), min_delay, max_delay))
         await db.commit()
 
-# --- ПОЛУЧЕНИЕ КЛИЕНТА ПОЛЬЗОВАТЕЛЯ ---
 async def get_user_client(user_id):
     if user_id in active_clients:
         return active_clients[user_id]
@@ -101,13 +101,12 @@ async def get_user_client(user_id):
     active_clients[user_id] = client
     return client
 
-# --- СПАМ-ЛОГИКА (ДЛЯ КОНКРЕТНОГО ПОЛЬЗОВАТЕЛЯ) ---
+# --- СПАМ-ЛОГИКА ---
 async def spam_single_target(user_id, target, message_list, min_d, max_d):
     client = await get_user_client(user_id)
     if not client: return
     
     counter = 0
-    # Флаг остановки (можно добавить в базу, но для простоты проверяем существует ли клиент)
     while user_id in active_clients:
         try:
             if not message_list: break
@@ -138,7 +137,6 @@ def get_main_menu():
 async def start_handler(event):
     user_id = event.sender_id
     data = await get_user_data(user_id)
-    
     status = "❌ Не подключен" if not data or not data['session'] else "✅ Подключен"
     
     await event.reply(
@@ -154,7 +152,6 @@ async def callback_handler(event):
     user_id = event.sender_id
     data = await get_user_data(user_id)
     s_data = data if data else {'session': None, 'templates': [], 'min_delay': 100, 'max_delay': 300}
-    
     cb_data = event.data.decode('utf-8')
     
     if cb_data == "my_account":
@@ -172,12 +169,9 @@ async def callback_handler(event):
         await event.edit(f"⚙️ **Задержка:** `{s_data['min_delay']}-{s_data['max_delay']}` мс", buttons=[[Button.inline("🔙 Назад", b"back")]])
         
     elif cb_data == "start_spam":
-        if not s_data['session']:
-            await event.answer("❌ Сначала подключи аккаунт!", alert=True)
-        elif not s_data['templates']:
-            await event.answer("❌ Нет шаблонов!", alert=True)
-        else:
-            await event.edit("🚀 **Введи цель для спама:**\n\nОтправь сообщение в формате `@username` или `-100123456789`")
+        if not s_data['session']: await event.answer("❌ Сначала подключи аккаунт!", alert=True)
+        elif not s_data['templates']: await event.answer("❌ Нет шаблонов!", alert=True)
+        else: await event.edit("🚀 **Введи цель для спама:**\n\nОтправь сообщение в формате `@username` или `-100123456789`")
             
     elif cb_data == "stop_spam":
         if user_id in active_clients:
@@ -195,7 +189,6 @@ async def callback_handler(event):
         await save_user_data(user_id, None, s_data['templates'], s_data['min_delay'], s_data['max_delay'])
         await event.edit("❌ **Аккаунт отключен.**", buttons=[[Button.inline("🔙 Назад", b"back")]])
 
-# --- ОБРАБОТКА ТЕКСТОВЫХ СООБЩЕНИЙ (ВВОД НОМЕРА, КОДА И ЦЕЛЕЙ) ---
 @bot.on(events.NewMessage)
 async def text_handler(event):
     user_id = event.sender_id
@@ -203,21 +196,18 @@ async def text_handler(event):
     
     if text.startswith('/'): return
     
-    # Если это номер телефона для подключения
     if text.startswith('+') and len(text) > 10:
         await event.reply("⏳ Отправляю код...")
         client = TelegramClient(StringSession(), API_ID, API_HASH)
         await client.connect()
         try:
             await client.send_code_request(text)
-            # Сохраняем клиента во временный словарь для ожидания кода
             active_clients[f"temp_{user_id}"] = {'client': client, 'phone': text}
             await event.reply("📩 **Введи код из Telegram:**")
         except Exception as e:
             await event.reply(f"❌ Ошибка: {e}")
         return
         
-    # Если введен код (5 цифр)
     if text.isdigit() and len(text) == 5 and f"temp_{user_id}" in active_clients:
         temp = active_clients[f"temp_{user_id}"]
         client = temp['client']
@@ -225,36 +215,20 @@ async def text_handler(event):
         try:
             await client.sign_in(phone, code=text)
             session_str = client.session.save()
-            
             data = await get_user_data(user_id)
             templates = data['templates'] if data else []
             await save_user_data(user_id, session_str, templates, 100, 300)
-            
             await client.disconnect()
             del active_clients[f"temp_{user_id}"]
-            
-            # Переподключаем как постоянного клиента
             await get_user_client(user_id)
-            
             await event.reply("✅ **Аккаунт успешно подключен!** Теперь напиши свои шаблоны (с новой строки).", buttons=get_main_menu())
         except SessionPasswordNeededError:
+            active_clients[f"temp_{user_id}"]['await_password'] = True
             await event.reply("🔐 **Введи облачный пароль (2FA):**")
         except Exception as e:
             await event.reply(f"❌ Ошибка кода: {e}")
         return
-        
-    # Если введен облачный пароль
-    if f"temp_{user_id}" in active_clients and 'await_password' in active_clients[f"temp_{user_id}"]:
-        temp = active_clients[f"temp_{user_id}"]
-        try:
-            await temp['client'].sign_in(password=text)
-            session_str = temp['client'].session.save()
-            # ... сохранение сессии (аналогично коду)
-            await event.reply("✅ Аккаунт подключен!")
-        except: pass
-        return
 
-    # Если это ввод цели для спама (начинается с @ или -)
     if (text.startswith('@') or text.startswith('-')) and user_id in active_clients and not text.startswith('.'):
         data = await get_user_data(user_id)
         if data and data['templates']:
@@ -262,7 +236,6 @@ async def text_handler(event):
             await event.reply(f"🚀 **Спам запущен по:** `{text}`", parse_mode='md')
         return
 
-    # Если это просто текст (Шаблоны)
     data = await get_user_data(user_id)
     if data:
         new_templates = [line.strip() for line in text.split('\n') if line.strip()]
@@ -272,16 +245,16 @@ async def text_handler(event):
 
 async def main():
     print(f"{Fore.CYAN}TITAN MULTI-TENANT v1.0 ЗАПУЩЕН{Fore.RESET}")
-    
     await init_db()
     log("SYS", "База данных инициализирована", Fore.GREEN)
-    
     threading.Thread(target=run_web, daemon=True).start()
     
-    await bot.start()
-    log("SYS", "Мастер-бот подключен", Fore.GREEN)
-    
-    await bot.run_until_disconnected()
+    try:
+        await bot.start()
+        log("SYS", "Мастер-бот подключен", Fore.GREEN)
+        await bot.run_until_disconnected()
+    except Exception as e:
+        log("FATAL", f"Ошибка запуска бота: {e}", Fore.RED)
 
 if __name__ == '__main__':
     asyncio.run(main())
