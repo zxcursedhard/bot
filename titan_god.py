@@ -6,10 +6,6 @@ import sqlite3
 import threading
 import asyncio
 import random
-import string
-from datetime import datetime
-from functools import wraps
-
 from flask import Flask, request, jsonify, render_template_string, redirect, session, abort
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
@@ -18,7 +14,7 @@ from telethon.errors import SessionPasswordNeededError, FloodWaitError
 # ================= КОНФИГ =================
 API_ID = 2040
 API_HASH = 'b18441a1ff607e10a989891a5462e627'
-BOT_TOKEN = "8885567581:AAEDY44uIQw5W09dzGA0IFSZUMa05uHd4fI" # Твой токен
+BOT_TOKEN = "8885567581:AAEDY44uIQw5W09dzGA0IFSZUMa05uHd4fI" 
 
 ADMIN_IDS = {9058235147, 8773171051}
 DB_PATH = "titan.db"
@@ -66,10 +62,8 @@ async def spam_task(uid, target, templates, max_delay, session_str):
     try:
         while active_engines.get(uid):
             try:
-                # Выбираем случайную строку из шаблонов
                 text = random.choice(templates) + "\u200b"
                 await client.send_message(target, text)
-                # Рандомная задержка от 3 до max_delay секунд
                 await asyncio.sleep(random.uniform(3.0, max_delay))
             except FloodWaitError as e:
                 await asyncio.sleep(e.seconds + 5)
@@ -88,14 +82,10 @@ bot = TelegramClient("bot_session", API_ID, API_HASH)
 async def bot_start(event):
     uid = event.sender_id
     is_admin = uid in ADMIN_IDS
-    
-    # Генерируем уникальный токен для входа
     token = secrets.token_urlsafe(16)
     link = f"https://bot-1-dk7y.onrender.com/login?token={token}"
     
-    buttons = [
-        [Button.url("🌐 Войти в панель", link)]
-    ]
+    buttons = [[Button.url("🌐 Войти в панель", link)]]
     if is_admin:
         buttons.append([Button.inline("👑 Дать доступ", b"invite")])
 
@@ -124,7 +114,7 @@ def run_bot():
 
 threading.Thread(target=run_bot, daemon=True).start()
 
-# ================= ВЕБ-ИНТЕРФЕЙС (FLASK) =================
+# ================= ВЕБ-ИНТЕРФЕЙС =================
 BASE_HTML = r"""
 <!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{ title }} · TITAN</title>
@@ -231,7 +221,6 @@ async function genInvite(){let r=await fetch('/admin/gen_invite', {method:'POST'
 </script>
 """
 
-# ================= РОУТЫ =================
 @app.route("/")
 @app.route("/login")
 def login_page():
@@ -261,7 +250,6 @@ def logout():
     session.clear()
     return redirect("/login")
 
-# ================= API =================
 @app.route("/api/send-code", methods=["POST"])
 def api_send_code():
     data = request.json
@@ -277,7 +265,6 @@ def api_send_code():
     future = asyncio.run_coroutine_threadsafe(_send(), bot_loop)
     try:
         client, code_hash = future.result(timeout=30)
-        # Временное хранилище клиента (для простоты в памяти процесса)
         globals()[f"auth_{flow}"] = (client, phone, code_hash)
         return jsonify(status="ok", flow=flow)
     except Exception as e:
