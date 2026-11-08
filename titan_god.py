@@ -34,8 +34,9 @@ API_HASH = 'b18441a1ff607e10a989891a5462e627'
 TEMPLATES_FILE = 'templates.json'
 
 MESSAGES = []
-min_delay = 100
-max_delay = 300
+# БЫСТРЫЕ НАСТРОЙКИ
+min_delay = 50
+max_delay = 150
 is_spamming = False
 targets = []
 afk_enabled = False
@@ -79,9 +80,12 @@ async def spam_single_target(target):
             if not MESSAGES: break
             text = random.choice(MESSAGES)
             if random.random() > 0.7: text += "\u200b"
+            
             await client.send_message(target, text)
             counter += 1
             log("SPAM", f"[{counter}] -> {target}", Fore.BLUE)
+            
+            # Ультра-быстрая задержка
             await asyncio.sleep(random.randint(min_delay, max_delay) / 1000.0)
         except FloodWaitError as e:
             log("FLOOD", f"Бан на {e.seconds} сек. Ждем...", Fore.RED)
@@ -135,32 +139,22 @@ async def handler(e):
         
         targets = []
         
-        # 1. Если это ответ на сообщение
+        # 1. Ответ на сообщение
         if e.reply_to_msg_id:
             reply_msg = await e.get_reply_message()
             if reply_msg:
                 targets.append(reply_msg.chat_id)
-                await e.edit(f"🎯 Цель: чат по пересылке")
         
-        # 2. Обработка аргументов
+        # 2. Аргументы
         if arg.strip():
             raw_targets = [x.strip() for x in arg.split(',') if x.strip()]
-            await e.edit("🔄 Синхронизирую...")
-            try:
-                async for dialog in client.iter_dialogs():
-                    pass
-            except: pass
-            
             for t in raw_targets:
                 try:
-                    # Ссылка вида t.me/c/12345/6789 (вырезаем ID чата)
                     if 't.me/c/' in t:
-                        # Берем часть после /c/ и разбиваем по слэшу, берем первое число
                         raw_id = int(t.split('t.me/c/')[1].split('/')[0])
                         chat_id = int(f"-100{raw_id}")
                         entity = await client.get_entity(chat_id)
                         targets.append(entity)
-                    # Ссылка tg://
                     elif t.startswith('tg://'):
                         match = re.search(r'id=(\d+)', t)
                         if match:
@@ -171,10 +165,8 @@ async def handler(e):
                                 chat_id = raw_id
                             entity = await client.get_entity(chat_id)
                             targets.append(entity)
-                    # Обычный ID
                     elif t.startswith('-') and t[1:].isdigit():
                         targets.append(int(t))
-                    # Юзернейм
                     else:
                         targets.append(t)
                 except Exception as ex:
@@ -187,7 +179,7 @@ async def handler(e):
         if not is_spamming:
             is_spamming = True
             asyncio.create_task(spam_loop())
-            await e.edit(f"🚀 Ебашу по {len(targets)}")
+            await e.edit(f"🚀 Ебашу по {len(targets)} (задержка {min_delay}-{max_delay} мс)")
         else:
             await e.edit("⚠️ Уже работает")
 
@@ -302,7 +294,7 @@ async def handler_auto(e):
             except: pass
 
 async def main():
-    print(f"{Fore.CYAN}TITAN v33.0 (FIXED) ЗАПУЩЕН{Fore.RESET}")
+    print(f"{Fore.CYAN}TITAN v34.0 (SPEED) ЗАПУЩЕН{Fore.RESET}")
     load_data()
     log("SYS", f"Шаблонов: {len(MESSAGES)}", Fore.GREEN)
     threading.Thread(target=run_web, daemon=True).start()
