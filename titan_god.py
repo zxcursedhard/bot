@@ -6,13 +6,11 @@ import asyncio
 import random
 import datetime
 import threading
-import string
-import glob
-import csv
 import shutil
+import csv
 import urllib.parse
 from colorama import init, Fore, Style
-from flask import Flask, jsonify, request, render_template_string
+from flask import Flask, jsonify, render_template_string
 import aiosqlite
 import aiohttp
 import wikipediaapi
@@ -23,12 +21,7 @@ import yt_dlp
 from telethon import TelegramClient, events, functions, types, Button
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, SessionPasswordNeededError
-from telethon.errors.rpcerrorlist import (
-    AccessTokenInvalidError, 
-    PhoneCodeInvalidError, 
-    PasswordHashInvalidError,
-    PhoneCodeExpiredError
-)
+from telethon.errors.rpcerrorlist import AccessTokenInvalidError
 
 init(autoreset=True)
 
@@ -37,20 +30,18 @@ init(autoreset=True)
 # =====================================================================
 API_ID = 2040
 API_HASH = 'b18441a1ff607e10a989891a5462e627'
-BOT_TOKEN = os.environ.get('BOT_TOKEN', '8732669492:AAF5bx9JLRqKfyGx0TXf4u5KVj18n4d4wYs')
+# Твой токен
+BOT_TOKEN = '8732669492:AAGiMPHbCs8ntMzFhkfS8466iIVVa67w47g' 
+
 DB_FILE = 'titan_database.db'
 BACKUP_DIR = 'database_backups'
-
 active_clients = {}
 user_steps = {}
 spam_engines = {}
 auto_responders = {}
 system_metrics = {
-    "total_messages_sent": 0,
-    "total_flood_wait_events": 0,
-    "total_errors_caught": 0,
-    "total_parsing_operations": 0,
-    "total_invitations_sent": 0
+    "total_messages_sent": 0, "total_flood_wait_events": 0,
+    "total_errors_caught": 0, "total_parsing_operations": 0, "total_invitations_sent": 0
 }
 
 try:
@@ -60,7 +51,7 @@ except Exception:
     FFMPEG_PATH = None
 
 # =====================================================================
-# 2. ЛОГИРОВАНИЕ
+# 2. РАСШИРЕННОЕ ЛОГИРОВАНИЕ
 # =====================================================================
 class TitanLogger:
     @staticmethod
@@ -80,57 +71,29 @@ class TitanLogger:
     def critical(msg): print(f"{Fore.RED}{Style.BRIGHT}[CRITICAL] {msg}")
 
 # =====================================================================
-# 3. БАЗА ДАННЫХ
+# 3. ПОЛНОЦЕННЫЙ ОРМ-СЛОЙ (БАЗА ДАННЫХ)
 # =====================================================================
 class TitanDB:
     @staticmethod
     async def bootstrap():
-        if not os.path.exists(BACKUP_DIR):
-            os.makedirs(BACKUP_DIR)
+        if not os.path.exists(BACKUP_DIR): os.makedirs(BACKUP_DIR)
         async with aiosqlite.connect(DB_FILE) as db:
             await db.execute('''CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                session_string TEXT,
-                templates TEXT DEFAULT '[]',
-                min_delay INTEGER DEFAULT 100,
-                max_delay INTEGER DEFAULT 300,
-                is_admin INTEGER DEFAULT 0,
-                is_banned INTEGER DEFAULT 0,
-                registered_at TEXT
-            )''')
+                user_id INTEGER PRIMARY KEY, session_string TEXT, templates TEXT DEFAULT '[]',
+                min_delay INTEGER DEFAULT 100, max_delay INTEGER DEFAULT 300,
+                is_admin INTEGER DEFAULT 0, is_banned INTEGER DEFAULT 0, registered_at TEXT)''')
             await db.execute('''CREATE TABLE IF NOT EXISTS spam_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                target TEXT,
-                sent_messages_count INTEGER DEFAULT 0,
-                status TEXT,
-                started_at TEXT,
-                ended_at TEXT
-            )''')
+                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, target TEXT,
+                sent_messages_count INTEGER DEFAULT 0, status TEXT, started_at TEXT, ended_at TEXT)''')
             await db.execute('''CREATE TABLE IF NOT EXISTS parsed_users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                owner_id INTEGER,
-                group_identity TEXT,
-                user_id_tg INTEGER,
-                username TEXT,
-                first_name TEXT,
-                harvested_at TEXT
-            )''')
+                id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER, group_identity TEXT,
+                user_id_tg INTEGER, username TEXT, first_name TEXT, harvested_at TEXT)''')
             await db.execute('''CREATE TABLE IF NOT EXISTS intelligent_replies (
-                user_id INTEGER,
-                trigger_phrase TEXT,
-                reply_payload TEXT,
-                is_regex INTEGER DEFAULT 0,
-                PRIMARY KEY (user_id, trigger_phrase)
-            )''')
+                user_id INTEGER, trigger_phrase TEXT, reply_payload TEXT, is_regex INTEGER DEFAULT 0,
+                PRIMARY KEY (user_id, trigger_phrase))''')
             await db.execute('''CREATE TABLE IF NOT EXISTS scheduler_queue (
-                task_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                target_peer TEXT,
-                payload_message TEXT,
-                execution_timestamp TEXT,
-                execution_status TEXT DEFAULT 'PENDING'
-            )''')
+                task_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, target_peer TEXT,
+                payload_message TEXT, execution_timestamp TEXT, execution_status TEXT DEFAULT 'PENDING')''')
             await db.commit()
             TitanLogger.info("База данных инициализирована.")
 
@@ -139,14 +102,12 @@ class TitanDB:
         try:
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             path = os.path.join(BACKUP_DIR, f"backup_{ts}.db")
-            if os.path.exists(DB_FILE):
-                shutil.copyfile(DB_FILE, path)
-                TitanLogger.info(f"Бэкап создан: {path}")
-        except Exception as e:
-            TitanLogger.error(f"Ошибка бэкапа: {e}")
+            if os.path.exists(DB_FILE): shutil.copyfile(DB_FILE, path)
+            TitanLogger.info(f"Бэкап создан: {path}")
+        except Exception as e: TitanLogger.error(f"Ошибка бэкапа: {e}")
 
 # =====================================================================
-# 4. ДВИЖОК СПАМА
+# 4. ДВИЖОК СПАМА (С АНТИДЕТЕКТОМ)
 # =====================================================================
 class SpamEngine:
     def __init__(self, client, user_id):
@@ -184,7 +145,7 @@ class SpamEngine:
         self.is_active = False
 
 # =====================================================================
-# 5. АВТООТВЕТЧИК
+# 5. ИНТЕЛЛЕКТУАЛЬНЫЙ АВТООТВЕТЧИК
 # =====================================================================
 class AutoResponder:
     def __init__(self, client, user_id):
@@ -195,8 +156,7 @@ class AutoResponder:
     async def load(self):
         async with aiosqlite.connect(DB_FILE) as db:
             async with db.execute("SELECT trigger_phrase, reply_payload, is_regex FROM intelligent_replies WHERE user_id = ?", (self.user_id,)) as cursor:
-                for row in await cursor.fetchall():
-                    self.rules[row[0]] = {"reply": row[1], "is_regex": row[2]}
+                for row in await cursor.fetchall(): self.rules[row[0]] = {"reply": row[1], "is_regex": row[2]}
 
     async def handle(self, event):
         if not event.text: return
@@ -224,8 +184,7 @@ class Harvester:
                         await db.execute('''INSERT INTO parsed_users (owner_id, group_identity, user_id_tg, username, first_name, harvested_at)
                             VALUES (?, ?, ?, ?, ?, ?)''', (owner_id, str(group), user.id, user.username, user.first_name, str(datetime.datetime.now())))
                         await db.commit()
-        except Exception as e:
-            TitanLogger.error(f"Ошибка парсинга: {e}")
+        except Exception as e: TitanLogger.error(f"Ошибка парсинга: {e}")
         return result
 
 class Inviter:
@@ -238,20 +197,19 @@ class Inviter:
                 ok += 1
                 system_metrics["total_invitations_sent"] += 1
                 await asyncio.sleep(random.randint(8000, 20000) / 1000.0)
-            except FloodWaitError:
-                break
+            except FloodWaitError: break
             except Exception:
                 fail += 1
                 await asyncio.sleep(random.randint(2000, 5000) / 1000.0)
         return ok, fail
 
 # =====================================================================
-# 7. ПЛАНИРОВЩИК
+# 7. ПЛАНИРОВЩИК ЗАДАЧ
 # =====================================================================
 class Scheduler:
     @staticmethod
     async def loop():
-        TitanLogger.info("Планировщик запущен.")
+        TitanLogger.info("Планировщик задач запущен.")
         while True:
             try:
                 now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -263,21 +221,18 @@ class Scheduler:
                                     await active_clients[u_id].send_message(target, msg)
                                     await db.execute("UPDATE scheduler_queue SET execution_status = 'COMPLETED' WHERE task_id = ?", (t_id,))
                                     await db.commit()
-                                except Exception as e:
-                                    TitanLogger.error(f"Ошибка задачи {t_id}: {e}")
-            except Exception as e:
-                TitanLogger.error(f"Сбой планировщика: {e}")
+                                except Exception as e: TitanLogger.error(f"Ошибка задачи {t_id}: {e}")
+            except Exception as e: TitanLogger.error(f"Сбой планировщика: {e}")
             await asyncio.sleep(30)
 
 # =====================================================================
-# 8. ПОЛЬЗОВАТЕЛИ
+# 8. УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ
 # =====================================================================
 async def get_user(uid):
     async with aiosqlite.connect(DB_FILE) as db:
-        async with db.execute("SELECT session_string, templates, min_delay, max_delay, is_admin FROM users WHERE user_id = ?", (uid,)) as cursor:
+        async with db.execute("SELECT session_string, templates, min_delay, max_delay FROM users WHERE user_id = ?", (uid,)) as cursor:
             row = await cursor.fetchone()
-            if row:
-                return {'session': row[0], 'templates': json.loads(row[1]), 'min_delay': row[2], 'max_delay': row[3], 'is_admin': row[4]}
+            if row: return {'session': row[0], 'templates': json.loads(row[1]), 'min_delay': row[2], 'max_delay': row[3]}
     return None
 
 async def save_user(uid, session, templates, min_d, max_d):
@@ -305,13 +260,14 @@ async def resolve_client(uid):
             @c.on(events.NewMessage(incoming=True))
             async def hook(e): await r.handle(e)
             return c
-    except Exception as e:
-        TitanLogger.error(f"Ошибка сессии {uid}: {e}")
+    except Exception as e: TitanLogger.error(f"Ошибка сессии {uid}: {e}")
     return None
 
 # =====================================================================
-# 9. МЕНЮ БОТА
+# 9. TELEGRAM БОТ-ПАНЕЛЬ (ИНТЕРФЕЙС)
 # =====================================================================
+bot = TelegramClient('bot_master', API_ID, API_HASH)
+
 def build_menu():
     return [
         [Button.inline("👤 Аккаунт", b"nav_account"), Button.inline("📝 Шаблоны", b"nav_templates")],
@@ -321,18 +277,16 @@ def build_menu():
         [Button.inline("🛑 Стоп всё", b"nav_kill_all")]
     ]
 
-main_bot = TelegramClient('bot_master', API_ID, API_HASH)
-
-@main_bot.on(events.NewMessage(pattern='/start'))
+@bot.on(events.NewMessage(pattern='/start'))
 async def start_cmd(e):
     uid = e.sender_id
     user_steps[uid] = "IDLE"
     p = await get_user(uid)
     status = "❌ Нет сессии" if not p or not p['session'] else "✅ Подключен"
-    text = f"⚡ **TITAN v6.0**\n\nСтатус: {status}\nБаза: {DB_FILE}\n\nВыбери действие:"
+    text = f"⚡ **TITAN Enterprise v6.0**\n\nСтатус: {status}\nБаза: {DB_FILE}\n\nВыбери действие:"
     await e.reply(text, buttons=build_menu(), parse_mode='md')
 
-@main_bot.on(events.CallbackQuery)
+@bot.on(events.CallbackQuery)
 async def callback(e):
     uid = e.sender_id
     action = e.data.decode('utf-8')
@@ -348,7 +302,8 @@ async def callback(e):
         txt = "\n".join([f"• {t}" for t in p['templates']]) or "Пусто"
         await e.edit(f"📝 Шаблоны:\n\n{txt}\n\nОтправь текст для добавления.", buttons=[[Button.inline("🔙 Назад", b"nav_home")]])
     elif action == "nav_delay":
-        await e.edit(f"⚙️ Задержка: {p['min_delay']}-{p['max_delay']} мс", buttons=[[Button.inline("🔙 Назад", b"nav_home")]])
+        await e.edit(f"⚙️ Задержка: {p['min_delay']}-{p['max_delay']} мс\nОтправь новые (например 500-1000)", buttons=[[Button.inline("🔙 Назад", b"nav_home")]])
+        user_steps[uid] = "ST_DELAY"
     elif action == "nav_spam":
         if not p['session']: await e.answer("❌ Нет сессии!", alert=True)
         elif not p['templates']: await e.answer("❌ Нет шаблонов!", alert=True)
@@ -385,7 +340,7 @@ async def callback(e):
         await save_user(uid, None, p['templates'], p['min_delay'], p['max_delay'])
         await e.edit("❌ Сессия удалена.", buttons=[[Button.inline("🔙 Назад", b"nav_home")]])
 
-@main_bot.on(events.NewMessage)
+@bot.on(events.NewMessage)
 async def router(e):
     uid = e.sender_id
     text = e.text.strip()
@@ -493,40 +448,44 @@ async def router(e):
             await e.reply("📝 Шаблон добавлен.")
 
 # =====================================================================
-# 10. FLASK ВЕБ-ПАНЕЛЬ
+# 10. FLASK WEB DASHBOARD (ДЛЯ RENDER)
 # =====================================================================
 app = Flask(__name__)
 START_TIME = datetime.datetime.now()
 
-HTML = """
+HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
-<head><title>TITAN PANEL</title>
-<style>
-body { background: #0e1621; color: #fff; font-family: sans-serif; padding: 40px; }
-.container { max-width: 900px; margin: auto; background: #17212b; padding: 30px; border-radius: 12px; }
-h1 { color: #5288c1; }
-.grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; margin-top: 20px; }
-.card { background: #24303f; padding: 20px; border-radius: 8px; text-align: center; }
-.card h3 { color: #8ab4f8; font-size: 14px; margin: 0 0 10px; }
-.card p { font-size: 28px; font-weight: bold; margin: 0; }
-.badge { background: #2ec4b6; padding: 6px 14px; border-radius: 20px; font-weight: bold; }
-</style>
+<head>
+    <title>TITAN ENTERPRISE DASHBOARD</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; background: #0e1621; color: #fff; margin: 0; padding: 40px; }
+        .container { max-width: 900px; margin: auto; background: #17212b; padding: 30px; border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); }
+        h1 { color: #5288c1; border-bottom: 2px solid #24303f; padding-bottom: 15px; }
+        .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; margin-top: 25px; }
+        .card { background: #24303f; padding: 20px; border-radius: 8px; text-align: center; border: 1px solid #2b394a; }
+        .card h3 { margin: 0 0 10px 0; color: #8ab4f8; font-size: 14px; text-transform: uppercase; }
+        .card p { margin: 0; font-size: 28px; font-weight: bold; color: #fff; }
+        .status { display: inline-block; padding: 6px 14px; background: #2ec4b6; color: #fff; border-radius: 20px; font-weight: bold; font-size: 14px; }
+        footer { margin-top: 40px; text-align: center; color: #6c7a89; font-size: 13px; }
+    </style>
 </head>
 <body>
-<div class="container">
-<h1>TITAN OMNI COMPONENT V6.0</h1>
-<p>Статус: <span class="badge">ONLINE</span></p>
-<p>Аптайм: {{ uptime }}</p>
-<p>Сессий в памяти: {{ sessions }}</p>
-<div class="grid">
-    <div class="card"><h3>Отправлено</h3><p>{{ m.total_messages_sent }}</p></div>
-    <div class="card"><h3>FloodWait</h3><p>{{ m.total_flood_wait_events }}</p></div>
-    <div class="card"><h3>Ошибок</h3><p>{{ m.total_errors_caught }}</p></div>
-    <div class="card"><h3>Парсинг</h3><p>{{ m.total_parsing_operations }}</p></div>
-    <div class="card"><h3>Инвайтов</h3><p>{{ m.total_invitations_sent }}</p></div>
-</div>
-</div>
+    <div class="container">
+        <h1>TITAN OMNI COMPONENT V6.0</h1>
+        <p>Статус платформы: <span class="status">ONLINE</span></p>
+        <p>Время аптайма: {{ uptime }}</p>
+        <p>Активных сессий: {{ sessions }}</p>
+        <div class="grid">
+            <div class="card"><h3>Отправлено</h3><p>{{ m.total_messages_sent }}</p></div>
+            <div class="card"><h3>FloodWait</h3><p>{{ m.total_flood_wait_events }}</p></div>
+            <div class="card"><h3>Ошибок</h3><p>{{ m.total_errors_caught }}</p></div>
+            <div class="card"><h3>Парсинг</h3><p>{{ m.total_parsing_operations }}</p></div>
+            <div class="card"><h3>Инвайтов</h3><p>{{ m.total_invitations_sent }}</p></div>
+        </div>
+        <footer>TITAN Multi-Tenant System Node • {{ current_time }}</footer>
+    </div>
 </body>
 </html>
 """
@@ -534,41 +493,44 @@ h1 { color: #5288c1; }
 @app.route('/')
 def index():
     uptime = str(datetime.datetime.now() - START_TIME).split('.')[0]
-    return render_template_string(HTML, uptime=uptime, sessions=len(active_clients), m=system_metrics)
+    return render_template_string(HTML_TEMPLATE, uptime=uptime, sessions=len(active_clients), m=system_metrics, current_time=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
 @app.route('/healthz')
 def health():
-    return jsonify({"status": "OK", "time": str(datetime.datetime.now())})
+    return jsonify({"status": "OK", "time": str(datetime.datetime.now())}), 200
 
 def run_web():
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
 # =====================================================================
-# 11. ЗАПУСК
+# 11. ГЛАВНЫЙ ЗАПУСК
 # =====================================================================
 async def main():
     await TitanDB.bootstrap()
     await TitanDB.backup()
     asyncio.create_task(Scheduler.loop())
+    
     try:
-        await main_bot.start(bot_token=BOT_TOKEN)
-        TitanLogger.info("Бот запущен.", Fore.GREEN)
-        await main_bot.run_until_disconnected()
+        await bot.start(bot_token=BOT_TOKEN)
+        TitanLogger.info("Бот успешно подключен к Telegram.", Fore.GREEN)
+        await bot.run_until_disconnected()
     except AccessTokenInvalidError:
-        TitanLogger.error("!!! НЕВЕРНЫЙ ТОКЕН !!!")
-        TitanLogger.warning("Бот не запущен, но веб-сервер продолжает работать.")
+        TitanLogger.error("!!! НЕВЕРНЫЙ ТОКЕН БОТА !!!")
+        TitanLogger.warning("Бот не запущен. Веб-сервер (Flask) продолжает работать.")
         while True: await asyncio.sleep(3600)
     except Exception as e:
-        TitanLogger.error(f"Критический сбой: {e}")
+        TitanLogger.error(f"Критическая ошибка: {e}")
 
-def run_async():
+def start_async():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(main())
 
 if __name__ == '__main__':
-    print(f"{Fore.MAGENTA}TITAN INDUSTRIAL SYSTEM STARTING{Fore.RESET}")
+    TitanLogger.info("==========================================================", Fore.MAGENTA)
+    TitanLogger.info("   STARTING TITAN CENTRAL INDUSTRIAL DISTRIBUTION SYSTEM  ", Fore.MAGENTA)
+    TitanLogger.info("==========================================================", Fore.MAGENTA)
     threading.Thread(target=run_web, daemon=True).start()
-    TitanLogger.info("Веб-сервер запущен на порту 8080.")
-    run_async()
+    TitanLogger.info("Служба удержания HTTP-трафика развернута на порту 8080.")
+    start_async()
