@@ -1,9 +1,6 @@
-from telethon import TelegramClient, events, functions, types
-from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest
-from telethon.tl.functions.account import UpdateProfileRequest
+from telethon import TelegramClient, events, functions, types, Button
 from telethon.errors import FloodWaitError
-import asyncio, random, re, os, datetime, string, json, urllib.parse, wikipediaapi, qrcode, pytz, glob
-from PIL import Image
+import asyncio, random, re, os, datetime, json, urllib.parse, wikipediaapi, qrcode, glob
 from colorama import init, Fore
 from flask import Flask
 import threading
@@ -29,8 +26,11 @@ def run_web():
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port)
 
+# --- КОНФИГУРАЦИЯ ---
 API_ID = 2040
 API_HASH = 'b18441a1ff607e10a989891a5462e627'
+BOT_TOKEN = '8732669492:AAF5bx9JLRqKfyGx0TXf4u5KVj18n4d4wYs'
+
 TEMPLATES_FILE = 'templates.json'
 CONFIG_FILE = 'config.json'
 
@@ -39,12 +39,12 @@ min_delay = 100
 max_delay = 300
 is_spamming = False
 targets = []
-afk_enabled = False
-afk_text = "Отошел."
-auto_reply_enabled = False
-auto_reply_text = "Занят."
 
-client = TelegramClient('my_account', API_ID, API_HASH)
+# --- ДВА КЛИЕНТА ---
+# 1. Юзербот (твой аккаунт)
+userbot = TelegramClient('my_account', API_ID, API_HASH)
+# 2. Бот-настройщик (через токен)
+bot = TelegramClient('bot_account', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
 def log(tag, msg, color=Fore.WHITE):
     t = datetime.datetime.now().strftime("%H:%M:%S")
@@ -85,6 +85,7 @@ async def fetch_url(url, headers=None):
     except Exception as e:
         return f"ERROR: {e}"
 
+# --- СПАМ ЧЕРЕЗ ЮЗЕРБОТА ---
 async def spam_single_target(target):
     global is_spamming
     counter = 0
@@ -94,16 +95,16 @@ async def spam_single_target(target):
             text = random.choice(MESSAGES)
             if random.random() > 0.7: text += "\u200b"
             
-            await client.send_message(target, text)
+            await userbot.send_message(target, text)
             counter += 1
             log("SPAM", f"[{counter}] -> {target}", Fore.BLUE)
             
             await asyncio.sleep(random.randint(min_delay, max_delay) / 1000.0)
         except FloodWaitError as e:
-            log("FLOOD", f"Бан на {e.seconds} сек. Ждем...", Fore.RED)
+            log("FLOOD", f"Бан {e.seconds}с", Fore.RED)
             await asyncio.sleep(e.seconds + 5)
         except Exception as e:
-            log("ERROR", f"Сбой на {target}: {e}", Fore.RED)
+            log("ERROR", f"Сбой: {e}", Fore.RED)
             break
 
 async def spam_loop():
@@ -111,29 +112,71 @@ async def spam_loop():
     if not targets:
         is_spamming = False
         return
-    log("SPAM", f"Запуск по {len(targets)} чатам", Fore.YELLOW)
+    log("SPAM", f"Запуск по {len(targets)}", Fore.YELLOW)
     tasks = [asyncio.create_task(spam_single_target(t)) for t in targets]
     await asyncio.gather(*tasks)
     is_spamming = False
-    log("SPAM", "Все потоки завершены.", Fore.YELLOW)
+    log("SPAM", "Потоки завершены.", Fore.YELLOW)
 
-@client.on(events.NewMessage(outgoing=True))
-async def handler(e):
-    global MESSAGES, min_delay, max_delay, is_spamming, targets, afk_enabled, afk_text, auto_reply_enabled, auto_reply_text
+# --- МЕНЮ БОТА-НАСТРОЙЩИКА ---
+def get_menu():
+    buttons = [
+        [Button.inline("📝 Шаблоны", b"templates"), Button.inline("⚙️ Задержка", b"delay")],
+        [Button.inline("🚀 Запустить спам", b"start_spam"), Button.inline("🛑 Остановить", b"stop_spam")],
+        [Button.inline("📊 Статистика", b"stats")]
+    ]
+    return buttons
+
+@bot.on(events.NewMessage(pattern='/start'))
+async def start_handler(event):
+    await event.reply(
+        f"👋 **TITAN Setup Panel**\n\n"
+        f"Шаблонов: `{len(MESSAGES)}`\n"
+        f"Задержка: `{min_delay}-{max_delay} мс`\n"
+        f"Статус: `{'Активен' if is_spamming else 'Выключен'}`",
+        buttons=get_menu(),
+        parse_mode='md'
+    )
+
+@bot.on(events.CallbackQuery)
+async def callback_handler(event):
+    global is_spamming, targets, min_delay, max_delay, MESSAGES
     
-    if e.document and e.document.mime_type == 'text/plain' and e.text and e.text.strip().startswith('.шаблоны'):
-        await e.edit("📥 Читаю файл...")
-        try:
-            path = await e.download_media()
-            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()
-            os.remove(path)
-            MESSAGES = [line.strip() for line in content.split('\n') if line.strip()]
-            save_templates()
-            await e.edit(f"✅ Загружено: {len(MESSAGES)}")
-        except Exception as ex: await e.edit(f"❌ {ex}")
-        return
+    data = event.data.decode('utf-8')
+    
+    if data == "templates":
+        text = "\n".join([f"{i+1}. {m}" for i, m in enumerate(MESSAGES[:10])])
+        await event.edit(f"📝 **Шаблоны (первые 10):**\n\n{text}", buttons=[[Button.inline("🔙 Назад", b"back")]], parse_mode='md')
+    
+    elif data == "delay":
+        await event.edit(f"⚙️ **Задержка:** `{min_delay}-{max_delay}` мс\n\nЧтобы изменить, напиши в Избранное: `.задержка 1000-2000`", buttons=[[Button.inline("🔙 Назад", b"back")]], parse_mode='md')
+    
+    elif data == "start_spam":
+        if not MESSAGES:
+            await event.answer("❌ Нет шаблонов!", alert=True)
+        elif not targets:
+            await event.answer("❌ Нет целей! Напиши в Избранное `.спам @user`", alert=True)
+        else:
+            await event.edit("🚀 **Спам запущен!**", buttons=[[Button.inline("🛑 Остановить", b"stop_spam")]])
+            if not is_spamming:
+                is_spamming = True
+                asyncio.create_task(spam_loop())
+    
+    elif data == "stop_spam":
+        is_spamming = False
+        await event.edit("🛑 **Спам остановлен.**", buttons=[[Button.inline("🔙 Назад", b"back")]])
+    
+    elif data == "stats":
+        await event.edit(f"📊 **Статистика:**\nШаблонов: `{len(MESSAGES)}`\nЗадержка: `{min_delay}-{max_delay}` мс\nСтатус: `{'Активен' if is_spamming else 'Выключен'}`", buttons=[[Button.inline("🔙 Назад", b"back")]], parse_mode='md')
+        
+    elif data == "back":
+        await event.edit("👋 **TITAN Setup Panel**\n\nВыбери действие:", buttons=get_menu(), parse_mode='md')
 
+# --- КОМАНДЫ В ИЗБРАННОМ (ЮЗЕРБОТ) ---
+@userbot.on(events.NewMessage(outgoing=True))
+async def handler(e):
+    global MESSAGES, min_delay, max_delay, is_spamming, targets
+    
     if not e.text or not e.text.startswith('.'): return
     text = e.text[1:]
     parts = text.split(' ', 1)
@@ -141,54 +184,17 @@ async def handler(e):
     arg = parts[1] if len(parts) > 1 else ""
 
     if cmd == 'шаблоны':
-        if not arg.strip(): return await e.edit("❌ Пусто!")
         MESSAGES = [line.strip() for line in arg.split('\n') if line.strip()]
         save_templates()
         await e.edit(f"✅ Сохранено: {len(MESSAGES)}")
 
     elif cmd == 'спам':
         if not MESSAGES: return await e.edit("❌ Нет шаблонов!")
-        
-        targets = []
-        if e.reply_to_msg_id:
-            reply_msg = await e.get_reply_message()
-            if reply_msg: targets.append(reply_msg.chat_id)
-        
-        if arg.strip():
-            raw_targets = [x.strip() for x in arg.split(',') if x.strip()]
-            await e.edit("🔄 Синхронизирую...")
-            try:
-                async for dialog in client.iter_dialogs(): pass
-            except: pass
-            
-            for t in raw_targets:
-                try:
-                    if 't.me/c/' in t:
-                        raw_id = int(t.split('t.me/c/')[1].split('/')[0])
-                        targets.append(int(f"-100{raw_id}"))
-                    elif t.startswith('tg://'):
-                        match = re.search(r'id=(\d+)', t)
-                        if match:
-                            raw_id = int(match.group(1))
-                            if raw_id > 0 and len(str(raw_id)) < 12:
-                                targets.append(int(f"-100{raw_id}"))
-                            else:
-                                targets.append(raw_id)
-                        else: targets.append(t)
-                    elif t.startswith('-') and t[1:].isdigit():
-                        targets.append(int(t))
-                    else:
-                        targets.append(t)
-                except Exception as ex:
-                    log("ERROR", f"Не нашел {t}: {ex}", Fore.RED)
-                    targets.append(t)
-
-        if not targets: return await e.edit("❌ Не удалось распознать цели.")
-
+        targets = [x.strip() for x in arg.split(',')]
         if not is_spamming:
             is_spamming = True
             asyncio.create_task(spam_loop())
-            await e.edit(f"🚀 Ебашу по {len(targets)} (задержка {min_delay}-{max_delay} мс)")
+            await e.edit(f"🚀 Запуск по {len(targets)}")
         else:
             await e.edit("⚠️ Уже работает")
 
@@ -206,34 +212,22 @@ async def handler(e):
 
     elif cmd == 'gpt':
         if not arg: return
-        await e.edit("🤖 Думаю...")
+        await e.edit("🤖...")
         res = await fetch_url(f"https://text.pollinations.ai/{urllib.parse.quote(arg)}")
         await e.edit(res[:4000] if not res.startswith("ERROR") else res)
 
     elif cmd == 'картинка':
         if not arg: return
-        await e.edit("🎨 Рисую...")
+        await e.edit("🎨...")
         try:
             img_url = f"https://image.pollinations.ai/prompt/{urllib.parse.quote(arg)}?width=1024&height=1024&nologo=true"
-            await client.send_file(e.chat_id, img_url, caption=f"Запрос: {arg}")
+            await userbot.send_file(e.chat_id, img_url, caption=f"Запрос: {arg}")
             await e.delete()
         except Exception as ex: await e.edit(f"❌ {ex}")
 
-    elif cmd == 'погода':
-        if not arg: return
-        r = await fetch_url(f"https://wttr.in/{urllib.parse.quote(arg)}?format=%C+%t")
-        await e.edit(f"🌤 `{r}`", parse_mode='md')
-
-    elif cmd == 'курс':
-        r = await fetch_url("https://www.cbr-xml-daily.ru/daily_json.js")
-        try:
-            data = json.loads(r)['Valute']
-            await e.edit(f"💵 USD: `{data['USD']['Value']}`\n💶 EUR: `{data['EUR']['Value']}`", parse_mode='md')
-        except: await e.edit("❌ Ошибка")
-
     elif cmd == 'вики':
         if not arg: return
-        await e.edit(f"🕵️ {arg}...")
+        await e.edit("🕵️...")
         try:
             wiki = wikipediaapi.Wikipedia('TitanBot/1.0', 'ru')
             page = wiki.page(arg)
@@ -241,49 +235,41 @@ async def handler(e):
             await e.edit(f"**{page.title}**\n\n{page.summary[:1000]}\n\n[Читать]({page.fullurl})", parse_mode='md', link_preview=False)
         except: pass
 
-    elif cmd == 'парсинг':
-        if not arg: return
-        await e.edit("📦 Сбор...")
-        try:
-            users = []
-            async for u in client.iter_participants(arg.strip()):
-                if u.username: users.append(f"@{u.username}")
-            with open('users.txt', 'w') as f: f.write('\n'.join(users))
-            await client.send_file(e.chat_id, 'users.txt', caption=f"✅ {len(users)}")
-            await e.delete()
-        except Exception as ex: await e.edit(f"❌ {ex}")
-
-    elif cmd == 'инфо':
-        try:
-            u = await client.get_entity(arg.strip())
-            await e.edit(f"**ID:** `{u.id}`\n**Ник:** `@{u.username}`")
-        except: await e.edit("❌ Не найден")
-
     elif cmd == 'скачать':
         if not arg: return
-        await e.edit("📥 Качаю...")
+        await e.edit("📥...")
         for f in glob.glob("video.*"): os.remove(f)
         try:
             ydl_opts = {'format': 'best[ext=mp4]/best', 'outtmpl': 'video.%(ext)s', 'quiet': True, 'ffmpeg_location': FFMPEG_PATH}
             with yt_dlp.YoutubeDL(ydl_opts) as ydl: ydl.download([arg.strip()])
             for f in glob.glob("video.*"):
-                await client.send_file(e.chat_id, f)
+                await userbot.send_file(e.chat_id, f)
                 os.remove(f)
                 break
             await e.delete()
         except Exception as ex: await e.edit(f"❌ {ex}")
 
+    elif cmd == 'парсинг':
+        if not arg: return
+        await e.edit("📦...")
+        try:
+            users = []
+            async for u in userbot.iter_participants(arg.strip()):
+                if u.username: users.append(f"@{u.username}")
+            with open('users.txt', 'w') as f: f.write('\n'.join(users))
+            await userbot.send_file(e.chat_id, 'users.txt', caption=f"✅ {len(users)}")
+            await e.delete()
+        except Exception as ex: await e.edit(f"❌ {ex}")
+
+    elif cmd == 'инфо':
+        try:
+            u = await userbot.get_entity(arg.strip())
+            await e.edit(f"**ID:** `{u.id}`\n**Ник:** `@{u.username}`")
+        except: await e.edit("❌ Не найден")
+
     elif cmd == 'профиль':
-        me = await client.get_me()
+        me = await userbot.get_me()
         await e.edit(f"**ID:** `{me.id}`\n**Имя:** `{me.first_name}`")
-
-    elif cmd == 'афк':
-        if arg == 'выкл': afk_enabled = False; await e.edit("🔕")
-        else: afk_text = arg or "Отошел"; afk_enabled = True; await e.edit("🔔")
-
-    elif cmd == 'автоответ':
-        if arg == 'выкл': auto_reply_enabled = False; await e.edit("🔕")
-        else: auto_reply_text = arg; auto_reply_enabled = True; await e.edit("🔔")
 
     elif cmd == 'пинг':
         s = datetime.datetime.now()
@@ -291,26 +277,29 @@ async def handler(e):
         await e.edit(f"`{(datetime.datetime.now() - s).microseconds / 1000:.1f} мс`")
 
     elif cmd == 'хелп':
-        await e.edit("**Команды:**\n.шаблоны, .спам, .стоп, .задержка\n.gpt, .картинка, .вики\n.скачать, .парсинг, .инфо\n.профиль, .погода, .курс, .пинг\n.афк, .автоответ")
-
-@client.on(events.NewMessage(incoming=True))
-async def handler_auto(e):
-    if e.is_private:
-        if afk_enabled: 
-            try: await e.reply(afk_text)
-            except: pass
-        elif auto_reply_enabled: 
-            try: await e.reply(auto_reply_text)
-            except: pass
+        await e.edit("**Команды:**\n.шаблоны, .спам, .стоп, .задержка\n.gpt, .картинка, .вики\n.скачать, .парсинг, .инфо\n.профиль, .пинг\n\n**Меню:** /start")
 
 async def main():
-    print(f"{Fore.CYAN}TITAN v37.0 (FINAL) ЗАПУЩЕН{Fore.RESET}")
+    print(f"{Fore.CYAN}TITAN v40.0 (BOT + USERBOT) ЗАПУЩЕН{Fore.RESET}")
     load_data()
     log("SYS", f"Шаблонов: {len(MESSAGES)}", Fore.GREEN)
     log("SYS", f"Задержка: {min_delay}-{max_delay} мс", Fore.GREEN)
+    
     threading.Thread(target=run_web, daemon=True).start()
-    await client.start()
-    await client.run_until_disconnected()
+    
+    # Запускаем юзербота
+    await userbot.start()
+    log("SYS", "Юзербот подключен", Fore.GREEN)
+    
+    # Запускаем бота-настройщика
+    await bot.start()
+    log("SYS", "Бот-настройщик подключен", Fore.GREEN)
+    
+    # Держим оба активными
+    await asyncio.gather(
+        userbot.run_until_disconnected(),
+        bot.run_until_disconnected()
+    )
 
 if __name__ == '__main__':
     asyncio.run(main())
