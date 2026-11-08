@@ -24,8 +24,6 @@ API_ID = int(os.environ.get("API_ID", "2040"))
 API_HASH = os.environ.get("API_HASH", "b18441a1ff607e10a989891a5462e627")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8732669492:AAEIMsA49rH-2MTp78gTgc9DrLLyCzgop3E")
 FLASK_SECRET_KEY = os.environ.get("FLASK_SECRET_KEY") or secrets.token_hex(32)
-
-# Твои два ID (Админы)
 ADMIN_IDS = {int(x.strip()) for x in os.environ.get("ADMIN_IDS", "9058235147,8773171051").split(",") if x.strip().isdigit()}
 
 DB_PATH = os.environ.get("DB_PATH", "titan_saas.db")
@@ -42,7 +40,7 @@ app.config.update(
     PERMANENT_SESSION_LIFETIME=60 * 60 * 12,
 )
 
-# Глобальный цикл событий
+# Глобальный цикл для веб-части
 async_loop = asyncio.new_event_loop()
 threading.Thread(target=lambda: (asyncio.set_event_loop(async_loop), async_loop.run_forever()), daemon=True).start()
 
@@ -76,7 +74,6 @@ def init_db():
 
 init_db()
 
-# ---------- Helpers ----------
 def get_user(user_id):
     with db() as conn:
         return conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
@@ -114,7 +111,6 @@ def admin_required(fn):
         return fn(*args, **kwargs)
     return wrapped
 
-# ---------- UI Templates ----------
 BASE_HTML = r"""
 <!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{ title }} · TITAN</title>
@@ -149,7 +145,6 @@ def inject_admins(): return {"admins": ADMIN_IDS}
 def render_page(title, content, user=None):
     return render_template_string(BASE_HTML, title=title, content=content, user=user)
 
-# ---------- ROUTES (LOGIN) ----------
 HOME = r"""
 <div class="panel" style="max-width:520px;margin:8vh auto">
 <h1>Вход в TITAN</h1><p class="sub">Подключение Telegram-аккаунта.</p>
@@ -176,7 +171,6 @@ def home():
     if current_user(): return redirect("/dashboard")
     return render_page("Вход", HOME)
 
-# Исправленный роут, который ловит и /login?token=, и /login?invite=
 @app.route("/login")
 def login_route():
     if current_user(): return redirect("/dashboard")
@@ -186,8 +180,7 @@ def login_route():
 def api_send_code():
     data = request.get_json(silent=True) or {}
     phone = (data.get("phone") or "").strip()
-    if not re.fullmatch(r"\+?[0-9 ()-]{7,24}", phone):
-        return jsonify(status="error", error="Проверьте номер.")
+    if not re.fullmatch(r"\+?[0-9 ()-]{7,24}", phone): return jsonify(status="error", error="Проверьте номер.")
     flow = secrets.token_urlsafe(32)
 
     async def create_and_send():
@@ -200,10 +193,7 @@ def api_send_code():
         client, code_hash = run_async(create_and_send())
         auth_flows[flow] = {"client": client, "phone": phone, "hash": code_hash, "created": time.time()}
         return jsonify(status="ok", flow=flow)
-    except FloodWaitError as e:
-        return jsonify(status="error", error=f"Подождите {e.seconds} секунд.")
-    except Exception as e:
-        return jsonify(status="error", error=f"Ошибка: {str(e)[:100]}")
+    except Exception as e: return jsonify(status="error", error=f"Ошибка: {str(e)[:100]}")
 
 @app.route("/api/verify-code", methods=["POST"])
 def api_verify_code():
@@ -212,8 +202,7 @@ def api_verify_code():
     if not flow or not code: return jsonify(status="error", error="Введите код.")
     
     auth = auth_flows.get(flow)
-    if not auth or time.time() - auth["created"] > AUTH_FLOW_TTL:
-        return jsonify(status="error", error="Сессия истекла.")
+    if not auth or time.time() - auth["created"] > AUTH_FLOW_TTL: return jsonify(status="error", error="Сессия истекла.")
 
     async def finish():
         client = auth["client"]
@@ -227,18 +216,14 @@ def api_verify_code():
 
     try:
         result = run_async(finish())
-        if result.get("need_password"):
-            return jsonify(status="error", error="Нужен пароль 2FA.")
-        
+        if result.get("need_password"): return jsonify(status="error", error="Нужен пароль 2FA.")
         save_user(result["user_id"], auth["phone"], result["session"])
         del auth_flows[flow]
         session.clear()
         session["uid"] = int(result["user_id"])
         return jsonify(status="ok")
-    except Exception as e:
-        return jsonify(status="error", error=f"Неверный код или ошибка: {str(e)[:100]}")
+    except Exception as e: return jsonify(status="error", error=f"Ошибка: {str(e)[:100]}")
 
-# ---------- ROUTES (DASHBOARD) ----------
 DASHBOARD = r"""
 <h1>Панель управления</h1><p class="sub">Аккаунт подключён.</p>
 <div class="grid">
@@ -247,7 +232,6 @@ DASHBOARD = r"""
 <label>Максимальная (сек.)</label><input id="maxdelay" type="number" min="3" max="3600" value="{{ user['max_delay'] }}">
 <button class="btn primary" onclick="saveSettings()" style="margin-top:12px">Сохранить</button></div>
 </div>
-
 <div class="panel"><h2>🚀 Запуск</h2>
 <div class="row">
     <input id="spam_target" placeholder="@username или -100123...">
@@ -256,12 +240,10 @@ DASHBOARD = r"""
 </div>
 <div id="spammsg" style="margin-top:10px"></div>
 </div>
-
 <div class="panel"><h2>Шаблоны</h2>
 <textarea id="templates" placeholder="Каждая строка — сообщение">{{ templates }}</textarea>
 <button class="btn primary" onclick="saveTemplates()" style="margin-top:12px">Сохранить</button>
 </div>
-
 <script>
 async function post(url,obj){let r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj)});return await r.json()}
 async function saveSettings(){await post('/api/settings',{max_delay:document.getElementById('maxdelay').value});alert('Сохранено!')}
@@ -302,7 +284,6 @@ def api_templates():
         conn.commit()
     return jsonify(status="ok", count=len(lines))
 
-# ---------- SPAM ENGINE ----------
 class SpamEngine:
     def __init__(self, user_id, target, templates, min_d, max_d, session_str):
         self.user_id, self.target, self.templates = user_id, target, templates
@@ -336,7 +317,6 @@ def api_spam_start():
     
     if not target: return jsonify(status="error", error="Укажите цель.")
     if uid in active_spam_engines: return jsonify(status="error", error="Уже запущено.")
-    
     templates = json.loads(user["templates"] or "[]")
     if not templates: return jsonify(status="error", error="Нет шаблонов.")
 
@@ -360,7 +340,6 @@ def logout():
     session.clear()
     return redirect("/")
 
-# ---------- ADMIN & INVITES ----------
 ADMIN_PAGE = r"""
 <h1>Админ-панель</h1>
 <div class="panel">
@@ -372,21 +351,11 @@ ADMIN_PAGE = r"""
 <table><tr><th>ID</th><th>Телефон</th><th>Состояние</th><th>Действие</th></tr>
 {% for u in users %}<tr><td>{{ u['user_id'] }}</td><td>{{ u['phone'] or '—' }}</td>
 <td>{% if u['is_banned'] %}Бан{% elif u['is_disabled'] %}Отключён{% else %}Активен{% endif %}</td>
-<td>
-<form method="post" action="/admin/action" style="display:inline">
-<input type="hidden" name="uid" value="{{u['user_id']}}">
-<input type="hidden" name="action" value="{{'unban' if u['is_banned'] else 'ban'}}">
-<button class="btn" type="submit">{{'Разбанить' if u['is_banned'] else 'Бан'}}</button>
-</form>
-</td></tr>{% endfor %}
+<td><form method="post" action="/admin/action" style="display:inline"><input type="hidden" name="uid" value="{{u['user_id']}}"><input type="hidden" name="action" value="{{'unban' if u['is_banned'] else 'ban'}}"><button class="btn" type="submit">{{'Разбанить' if u['is_banned'] else 'Бан'}}</button></form></td></tr>{% endfor %}
 </table>
 </div>
 <script>
-async function genInvite(){
-    let r=await fetch('/admin/gen_invite', {method:'POST'});
-    let d=await r.json();
-    document.getElementById('invite_link').innerHTML = `Ссылка: <b>https://bot-1-dk7y.onrender.com/login?invite=${d.token}</b>`;
-}
+async function genInvite(){let r=await fetch('/admin/gen_invite', {method:'POST'});let d=await r.json();document.getElementById('invite_link').innerHTML = `Ссылка: <b>https://bot-1-dk7y.onrender.com/login?invite=${d.token}</b>`;}
 </script>
 """
 
@@ -400,23 +369,17 @@ def admin():
 @app.route("/admin/action", methods=["POST"])
 @admin_required
 def admin_action():
-    admin_id = int(current_user()["user_id"])
     target_id = int(request.form.get("uid", ""))
     action = request.form.get("action")
-    
     if target_id in ADMIN_IDS: abort(403)
-    
     field = "is_banned" if action in ("ban", "unban") else "is_disabled"
     value = 1 if action in ("ban", "disable") else 0
-    
     with db() as conn:
         conn.execute(f"UPDATE users SET {field}=? WHERE user_id=?", (value, target_id))
         conn.commit()
-    
     if value == 1 and target_id in active_spam_engines:
         active_spam_engines[target_id].is_active = False
         del active_spam_engines[target_id]
-        
     return redirect("/admin")
 
 @app.route("/admin/gen_invite", methods=["POST"])
@@ -429,72 +392,58 @@ def gen_invite():
 @app.route("/health")
 def health(): return jsonify(status="ok")
 
-# ---------- BOT (С КНОПКАМИ) ----------
-bot_client = TelegramClient("bot_saas", API_ID, API_HASH)
-
-@bot_client.on(events.NewMessage(pattern="/start"))
-async def bot_start(event):
-    uid = event.sender_id
-    is_admin = uid in ADMIN_IDS
-    
-    # Создаем токен для входа на сайт
-    token = secrets.token_urlsafe(16)
-    invite_tokens[token] = time.time()
-    
-    web_link = f"https://bot-1-dk7y.onrender.com/login?token={token}"
-    
-    buttons = [
-        [Button.url("🌐 Открыть веб-панель", web_link)],
-        [Button.inline("👤 Мой профиль", b"profile"), Button.inline("⚙️ Настройки", b"settings")]
-    ]
-    if is_admin:
-        buttons.append([Button.inline("👑 Админка (генератор ссылок)", b"admin_panel")])
-        
-    text = (
-        f"⚡ **TITAN Enterprise v14.0**\n\n"
-        f"Твой Telegram ID: `{uid}`\n"
-        f"Статус: {'👑 Администратор' if is_admin else '👤 Пользователь'}\n\n"
-        f"Для управления рассылкой используй веб-панель (кнопка ниже)."
-    )
-    
-    await event.reply(text, buttons=buttons, parse_mode='md')
-
-@bot_client.on(events.CallbackQuery)
-async def bot_callback(event):
-    uid = event.sender_id
-    data = event.data.decode('utf-8')
-    
-    if data == "profile":
-        user = get_user(uid)
-        status = "✅ Подключен" if user and user['session_string'] else "❌ Нет сессии"
-        await event.answer(f"Статус аккаунта: {status}", alert=True)
-        
-    elif data == "settings":
-        await event.answer("Настройки меняются в веб-панели!", alert=True)
-        
-    elif data == "admin_panel":
-        if uid not in ADMIN_IDS:
-            return await event.answer("⛔ Доступ запрещен!", alert=True)
-            
-        token = secrets.token_urlsafe(16)
-        invite_tokens[token] = time.time()
-        link = f"https://bot-1-dk7y.onrender.com/login?invite={token}"
-        
-        await event.reply(f"👑 **Ссылка для кента:**\n\n`{link}`\n\n(Отправь её другу, чтобы он подключился)", parse_mode='md')
-
+# ---------- BOT (ИЗОЛИРОВАННЫЙ ПОТОК) ----------
 def start_bot_thread():
     if not BOT_TOKEN: 
         print("BOT_TOKEN не задан!")
         return
+    print("Запускаю бота...")
+    
+    # Создаем отдельный поток и цикл для бота
+    bot_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(bot_loop)
+    
+    bot = TelegramClient("bot_saas", API_ID, API_HASH)
+    
+    @bot.on(events.NewMessage(pattern="/start"))
+    async def bot_start(event):
+        uid = event.sender_id
+        is_admin = uid in ADMIN_IDS
+        token = secrets.token_urlsafe(16)
+        invite_tokens[token] = time.time()
+        web_link = f"https://bot-1-dk7y.onrender.com/login?token={token}"
+        
+        buttons = [[Button.url("🌐 Открыть веб-панель", web_link)]]
+        if is_admin:
+            buttons.append([Button.inline("👑 Ссылка для кента", b"admin_panel")])
+            
+        text = (
+            f"⚡ **TITAN Enterprise v15.0**\n\n"
+            f"Твой ID: `{uid}`\n"
+            f"Статус: {'👑 Админ' if is_admin else '👤 Юзер'}\n\n"
+            f"Нажми кнопку ниже для входа."
+        )
+        await event.reply(text, buttons=buttons, parse_mode='md')
+
+    @bot.on(events.CallbackQuery)
+    async def bot_callback(event):
+        uid = event.sender_id
+        data = event.data.decode('utf-8')
+        if data == "admin_panel":
+            if uid not in ADMIN_IDS: return await event.answer("⛔ Нет доступа", alert=True)
+            token = secrets.token_urlsafe(16)
+            invite_tokens[token] = time.time()
+            link = f"https://bot-1-dk7y.onrender.com/login?invite={token}"
+            await event.reply(f"👑 **Ссылка:**\n`{link}`", parse_mode='md')
+
     try:
-        print("Запускаю бота...")
-        run_async(bot_client.start(bot_token=BOT_TOKEN))
+        bot_loop.run_until_complete(bot.start(bot_token=BOT_TOKEN))
         print("Бот успешно запущен!")
-        run_async(bot_client.run_until_disconnected())
+        bot_loop.run_until_complete(bot.run_until_disconnected())
     except Exception as e:
         print(f"ОШИБКА БОТА: {e}")
 
-# Запуск в фоне
+# Запуск бота в фоне
 threading.Thread(target=start_bot_thread, daemon=True).start()
 
 if __name__ == "__main__":
