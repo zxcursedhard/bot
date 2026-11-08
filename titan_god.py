@@ -1,7 +1,8 @@
 from telethon import TelegramClient, events, functions, types
 from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest
+from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
 from telethon.tl.functions.account import UpdateProfileRequest
-from telethon.errors import FloodWaitError
+from telethon.errors import FloodWaitError, UserAlreadyParticipantError, InviteHashExpiredError
 import asyncio, random, re, os, datetime, string, json, urllib.parse, wikipediaapi, qrcode, pytz, glob
 from PIL import Image
 from colorama import init, Fore
@@ -13,14 +14,12 @@ import imageio_ffmpeg
 
 init(autoreset=True)
 
-# --- НАСТРОЙКА FFMPEG (ДЛЯ ВИДЕО) ---
 try:
     os.environ["IMAGEIO_FFMPEG_EXE"] = imageio_ffmpeg.get_ffmpeg_exe()
     FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 except:
     FFMPEG_PATH = None
 
-# --- ФЕЙКОВЫЙ ВЕБ-СЕРВЕР ДЛЯ RENDER ---
 app = Flask(__name__)
 
 @app.route('/')
@@ -31,7 +30,6 @@ def run_web():
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port)
 
-# --- КОНФИГУРАЦИЯ ---
 API_ID = 2040
 API_HASH = 'b18441a1ff607e10a989891a5462e627'
 TEMPLATES_FILE = 'templates.json'
@@ -74,49 +72,36 @@ async def fetch_url(url, headers=None):
     except Exception as e:
         return f"ERROR: {e}"
 
-# --- ФУНКЦИЯ ДЛЯ ОДНОГО ЧАТА (БЕСКОНЕЧНЫЙ ЦИКЛ) ---
 async def spam_single_target(target):
     global is_spamming
     counter = 0
     while is_spamming:
         try:
-            if not MESSAGES:
-                log("SPAM", "Нет шаблонов!", Fore.RED)
-                break
-            
+            if not MESSAGES: break
             text = random.choice(MESSAGES)
             if random.random() > 0.7: text += "\u200b"
-                
             await client.send_message(target, text)
             counter += 1
             log("SPAM", f"[{counter}] -> {target}", Fore.BLUE)
-            
-            wait_time = random.randint(min_delay, max_delay) / 1000.0
-            await asyncio.sleep(wait_time)
-            
+            await asyncio.sleep(random.randint(min_delay, max_delay) / 1000.0)
         except FloodWaitError as e:
-            log("FLOOD", f"Бан на {e.seconds} сек для {target}. Ждем...", Fore.RED)
+            log("FLOOD", f"Бан на {e.seconds} сек. Ждем...", Fore.RED)
             await asyncio.sleep(e.seconds + 5)
         except Exception as e:
             log("ERROR", f"Сбой на {target}: {e}", Fore.RED)
             break
 
-# --- ЗАПУСК ПАРАЛЛЕЛЬНЫХ ПОТОКОВ ---
 async def spam_loop():
     global is_spamming, targets
     if not targets:
         is_spamming = False
         return
-        
-    log("SPAM", f"Запуск параллельного спама по {len(targets)} чатам", Fore.YELLOW)
-    
+    log("SPAM", f"Запуск по {len(targets)} чатам", Fore.YELLOW)
     tasks = [asyncio.create_task(spam_single_target(t)) for t in targets]
     await asyncio.gather(*tasks)
-    
     is_spamming = False
-    log("SPAM", "Все потоки спама завершены.", Fore.YELLOW)
+    log("SPAM", "Все потоки завершены.", Fore.YELLOW)
 
-# --- ОБРАБОТЧИК КОМАНД ---
 @client.on(events.NewMessage(outgoing=True))
 async def handler(e):
     global MESSAGES, min_delay, max_delay, is_spamming, targets, afk_enabled, afk_text, auto_reply_enabled, auto_reply_text
@@ -146,7 +131,29 @@ async def handler(e):
         save_templates()
         await e.edit(f"✅ Сохранено: {len(MESSAGES)}")
 
-    # --- БЛОК СПАМА С КОНВЕРТАЦИЕЙ ID ---
+    # --- НОВАЯ КОМАНДА ВСТУПЛЕНИЯ ---
+    elif cmd == 'вступить':
+        if not arg: return await e.edit("❌ Укажи ссылку (t.me/+... или t.me/name)")
+        await e.edit("🚪 Пробую вступить...")
+        try:
+            if '+' in arg:
+                hash = arg.split('+')[1]
+                await client(ImportChatInviteRequest(hash))
+            else:
+                await client(JoinChannelRequest(arg))
+            await e.edit("✅ Успешно вступил! Теперь можешь спамить по этой ссылке.")
+        except UserAlreadyParticipantError:
+            await e.edit("✅ Ты уже состоишь в этом чате.")
+        except Exception as ex:
+            await e.edit(f"❌ Ошибка вступления: {ex}")
+            
+    elif cmd == 'выйти':
+        try:
+            await client(LeaveChannelRequest(e.chat_id))
+            await e.edit("🚪 Вышел из чата.")
+        except Exception as ex:
+            await e.edit(f"❌ Ошибка выхода: {ex}")
+
     elif cmd == 'спам':
         if not MESSAGES: return await e.edit("❌ Нет шаблонов!")
         
@@ -295,7 +302,7 @@ async def handler(e):
         await e.edit(f"`{(datetime.datetime.now() - s).microseconds / 1000:.1f} мс`")
 
     elif cmd == 'хелп':
-        await e.edit("**Команды:**\n.шаблоны, .спам, .стоп, .задержка\n.gpt, .картинка, .вики\n.скачать, .парсинг, .инфо\n.профиль, .погода, .курс, .пинг\n.афк, .автоответ\n\n**ID/Ссылки:** можно юзать tg:// и t.me/c/")
+        await e.edit("**Команды:**\n.шаблоны, .спам, .стоп, .задержка\n.gpt, .картинка, .вики\n.скачать, .парсинг, .инфо\n.профиль, .погода, .курс, .пинг\n.афк, .автоответ\n.вступить, .выйти")
 
 @client.on(events.NewMessage(incoming=True))
 async def handler_auto(e):
@@ -308,7 +315,7 @@ async def handler_auto(e):
             except: pass
 
 async def main():
-    print(f"{Fore.CYAN}TITAN v29.0 (FULL FINAL) ЗАПУЩЕН{Fore.RESET}")
+    print(f"{Fore.CYAN}TITAN v30.0 (FULL) ЗАПУЩЕН{Fore.RESET}")
     load_data()
     log("SYS", f"Шаблонов: {len(MESSAGES)}", Fore.GREEN)
     threading.Thread(target=run_web, daemon=True).start()
