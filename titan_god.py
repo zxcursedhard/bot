@@ -7,14 +7,13 @@ import sqlite3
 import threading
 import asyncio
 import random
-import hashlib
 from datetime import datetime, timezone
 from functools import wraps
 
 from flask import (
     Flask, request, jsonify, render_template_string, redirect, url_for, session, abort
 )
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
 from telethon.errors import (
     SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError, FloodWaitError
@@ -39,17 +38,17 @@ app.secret_key = FLASK_SECRET_KEY
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=False, # Для теста Render (без HTTPS) ставим False, если будут проблемы - поменяй на True
+    SESSION_COOKIE_SECURE=False,
     PERMANENT_SESSION_LIFETIME=60 * 60 * 12,
 )
 
-# Глобальный цикл событий для Telethon
+# Глобальный цикл событий
 async_loop = asyncio.new_event_loop()
 threading.Thread(target=lambda: (asyncio.set_event_loop(async_loop), async_loop.run_forever()), daemon=True).start()
 
 auth_flows = {}
-active_spam_engines = {} # uid -> SpamEngine
-invite_tokens = {} # token -> created_at
+active_spam_engines = {} 
+invite_tokens = {}
 
 def run_async(coro, timeout=45):
     future = asyncio.run_coroutine_threadsafe(coro, async_loop)
@@ -61,7 +60,6 @@ def utc_now():
 def db():
     conn = sqlite3.connect(DB_PATH, timeout=20)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
 def init_db():
@@ -175,6 +173,12 @@ if(d.status==='ok'){location.href='/dashboard'}else{msg.className='error';msg.te
 
 @app.route("/")
 def home():
+    if current_user(): return redirect("/dashboard")
+    return render_page("Вход", HOME)
+
+# Исправленный роут, который ловит и /login?token=, и /login?invite=
+@app.route("/login")
+def login_route():
     if current_user(): return redirect("/dashboard")
     return render_page("Вход", HOME)
 
@@ -425,30 +429,72 @@ def gen_invite():
 @app.route("/health")
 def health(): return jsonify(status="ok")
 
-# ---------- BOT ----------
+# ---------- BOT (С КНОПКАМИ) ----------
 bot_client = TelegramClient("bot_saas", API_ID, API_HASH)
 
 @bot_client.on(events.NewMessage(pattern="/start"))
 async def bot_start(event):
     uid = event.sender_id
-    if uid not in ADMIN_IDS:
-        return await event.reply("Это бот для управления. Зайдите на сайт: https://bot-1-dk7y.onrender.com")
-        
+    is_admin = uid in ADMIN_IDS
+    
+    # Создаем токен для входа на сайт
     token = secrets.token_urlsafe(16)
     invite_tokens[token] = time.time()
-    link = f"https://bot-1-dk7y.onrender.com/login?invite={token}"
-    await event.reply(f"👑 Привет, Админ!\nТвоя одноразовая ссылка для входа:\n{link}")
+    
+    web_link = f"https://bot-1-dk7y.onrender.com/login?token={token}"
+    
+    buttons = [
+        [Button.url("🌐 Открыть веб-панель", web_link)],
+        [Button.inline("👤 Мой профиль", b"profile"), Button.inline("⚙️ Настройки", b"settings")]
+    ]
+    if is_admin:
+        buttons.append([Button.inline("👑 Админка (генератор ссылок)", b"admin_panel")])
+        
+    text = (
+        f"⚡ **TITAN Enterprise v14.0**\n\n"
+        f"Твой Telegram ID: `{uid}`\n"
+        f"Статус: {'👑 Администратор' if is_admin else '👤 Пользователь'}\n\n"
+        f"Для управления рассылкой используй веб-панель (кнопка ниже)."
+    )
+    
+    await event.reply(text, buttons=buttons, parse_mode='md')
+
+@bot_client.on(events.CallbackQuery)
+async def bot_callback(event):
+    uid = event.sender_id
+    data = event.data.decode('utf-8')
+    
+    if data == "profile":
+        user = get_user(uid)
+        status = "✅ Подключен" if user and user['session_string'] else "❌ Нет сессии"
+        await event.answer(f"Статус аккаунта: {status}", alert=True)
+        
+    elif data == "settings":
+        await event.answer("Настройки меняются в веб-панели!", alert=True)
+        
+    elif data == "admin_panel":
+        if uid not in ADMIN_IDS:
+            return await event.answer("⛔ Доступ запрещен!", alert=True)
+            
+        token = secrets.token_urlsafe(16)
+        invite_tokens[token] = time.time()
+        link = f"https://bot-1-dk7y.onrender.com/login?invite={token}"
+        
+        await event.reply(f"👑 **Ссылка для кента:**\n\n`{link}`\n\n(Отправь её другу, чтобы он подключился)", parse_mode='md')
 
 def start_bot_thread():
-    if not BOT_TOKEN: return
+    if not BOT_TOKEN: 
+        print("BOT_TOKEN не задан!")
+        return
     try:
+        print("Запускаю бота...")
         run_async(bot_client.start(bot_token=BOT_TOKEN))
-        print("Бот запущен!")
+        print("Бот успешно запущен!")
         run_async(bot_client.run_until_disconnected())
     except Exception as e:
-        print(f"Ошибка бота: {e}")
+        print(f"ОШИБКА БОТА: {e}")
 
-# Запуск бота в фоне для Gunicorn
+# Запуск в фоне
 threading.Thread(target=start_bot_thread, daemon=True).start()
 
 if __name__ == "__main__":
