@@ -130,20 +130,19 @@ async def handler(e):
         save_templates()
         await e.edit(f"✅ Сохранено: {len(MESSAGES)}")
 
-    # --- СПАМ (Обновленный) ---
     elif cmd == 'спам':
         if not MESSAGES: return await e.edit("❌ Нет шаблонов!")
         
         targets = []
         
-        # 1. Если это ответ на сообщение, берем чат оттуда
+        # 1. Если это ответ на сообщение
         if e.reply_to_msg_id:
             reply_msg = await e.get_reply_message()
             if reply_msg:
                 targets.append(reply_msg.chat_id)
-                await e.edit(f"🎯 Нацелился на чат (по пересылке): {reply_msg.chat_id}")
+                await e.edit(f"🎯 Цель: чат по пересылке")
         
-        # 2. Если есть аргументы, пробуем их распознать
+        # 2. Обработка аргументов
         if arg.strip():
             raw_targets = [x.strip() for x in arg.split(',') if x.strip()]
             await e.edit("🔄 Синхронизирую...")
@@ -154,7 +153,15 @@ async def handler(e):
             
             for t in raw_targets:
                 try:
-                    if t.startswith('tg://'):
+                    # Ссылка вида t.me/c/12345/6789 (вырезаем ID чата)
+                    if 't.me/c/' in t:
+                        # Берем часть после /c/ и разбиваем по слэшу, берем первое число
+                        raw_id = int(t.split('t.me/c/')[1].split('/')[0])
+                        chat_id = int(f"-100{raw_id}")
+                        entity = await client.get_entity(chat_id)
+                        targets.append(entity)
+                    # Ссылка tg://
+                    elif t.startswith('tg://'):
                         match = re.search(r'id=(\d+)', t)
                         if match:
                             raw_id = int(match.group(1))
@@ -164,13 +171,10 @@ async def handler(e):
                                 chat_id = raw_id
                             entity = await client.get_entity(chat_id)
                             targets.append(entity)
-                    elif 't.me/c/' in t:
-                        raw_id = int(t.split('t.me/c/')[1].split('/')[0])
-                        chat_id = int(f"-100{raw_id}")
-                        entity = await client.get_entity(chat_id)
-                        targets.append(entity)
+                    # Обычный ID
                     elif t.startswith('-') and t[1:].isdigit():
                         targets.append(int(t))
+                    # Юзернейм
                     else:
                         targets.append(t)
                 except Exception as ex:
@@ -178,12 +182,12 @@ async def handler(e):
                     targets.append(t)
 
         if not targets:
-            return await e.edit("❌ Не удалось распознать цели. Используй ответ на сообщение или укажи @username.")
+            return await e.edit("❌ Не удалось распознать цели.")
 
         if not is_spamming:
             is_spamming = True
             asyncio.create_task(spam_loop())
-            await e.edit(f"🚀 Ебашу по {len(targets)} чатам")
+            await e.edit(f"🚀 Ебашу по {len(targets)}")
         else:
             await e.edit("⚠️ Уже работает")
 
@@ -298,7 +302,7 @@ async def handler_auto(e):
             except: pass
 
 async def main():
-    print(f"{Fore.CYAN}TITAN v32.0 (REPLY MODE) ЗАПУЩЕН{Fore.RESET}")
+    print(f"{Fore.CYAN}TITAN v33.0 (FIXED) ЗАПУЩЕН{Fore.RESET}")
     load_data()
     log("SYS", f"Шаблонов: {len(MESSAGES)}", Fore.GREEN)
     threading.Thread(target=run_web, daemon=True).start()
