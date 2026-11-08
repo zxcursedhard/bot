@@ -8,47 +8,40 @@ import asyncio
 import random
 from datetime import datetime, timezone
 from functools import wraps
-from flask import Flask, request, jsonify, render_template_string, redirect, url_for, session, abort
+
+from flask import (
+    Flask, request, jsonify, render_template_string, redirect, url_for, session, abort
+)
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
-from telethon.errors import SessionPasswordNeededError, FloodWaitError
+from telethon.errors import (
+    SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError, FloodWaitError
+)
 
 # =====================================================================
-# 1. НАСТРОЙКИ И ЛОГИРОВАНИЕ
+# 1. ЛОГИРОВАНИЕ И КОНФИГУРАЦИЯ
 # =====================================================================
 def log_msg(msg):
     print(msg, flush=True)
-    with open("bot_debug.log", "a", encoding="utf-8") as f:
-        f.write(f"{datetime.now()} - {msg}\n")
+    try:
+        with open("bot_debug.log", "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now()} - {msg}\n")
+    except: pass
 
 API_ID = int(os.environ.get("API_ID", "2040"))
 API_HASH = os.environ.get("API_HASH", "b18441a1ff607e10a989891a5462e627")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8885567581:AAEDY44uIQw5W09dzGA0IFSZUMa05uHd4fI")
 ADMIN_IDS = {int(x.strip()) for x in os.environ.get("ADMIN_IDS", "9058235147,8773171051").split(",") if x.strip().isdigit()}
 DB_PATH = "titan_saas.db"
-
-# Твой АКТУАЛЬНЫЙ домен на Render
 BASE_URL = "https://bot-1-i2nc.onrender.com"
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(32)
+# Отключаем Secure cookies для теста, чтобы не было проблем с авторизацией на Render
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SECURE=False)
 
 # =====================================================================
-# 2. АСИНХРОННЫЙ ЦИКЛ
-# =====================================================================
-async_loop = asyncio.new_event_loop()
-def start_async_loop(loop):
-    asyncio.set_event_loop(loop)
-    loop.run_forever()
-threading.Thread(target=start_async_loop, args=(async_loop,), daemon=True).start()
-
-def run_async(coro, timeout=45):
-    future = asyncio.run_coroutine_threadsafe(coro, async_loop)
-    return future.result(timeout=timeout)
-
-# =====================================================================
-# 3. БАЗА ДАННЫХ
+# 2. БАЗА ДАННЫХ (SQLITE)
 # =====================================================================
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
@@ -100,7 +93,7 @@ def admin_required(fn):
     return wrapped
 
 # =====================================================================
-# 4. СПАМ-ДВИЖОК
+# 3. СПАМ-ДВИЖОК
 # =====================================================================
 active_spam_engines = {}
 
@@ -117,7 +110,6 @@ async def spam_worker(uid, target, templates, max_delay, session_str):
                 await client.send_message(target, text)
                 await asyncio.sleep(random.uniform(3.0, max_delay))
             except FloodWaitError as e:
-                log_msg(f"Флуд на {e.seconds} сек.")
                 await asyncio.sleep(e.seconds + 5)
             except Exception as e:
                 log_msg(f"Ошибка спама {uid}: {e}")
@@ -128,47 +120,50 @@ async def spam_worker(uid, target, templates, max_delay, session_str):
             del active_spam_engines[uid]
 
 # =====================================================================
-# 5. БОТ
+# 4. TELEGRAM БОТ (ИЗОЛИРОВАННЫЙ ПОТОК)
 # =====================================================================
-bot = TelegramClient("bot_saas", API_ID, API_HASH)
-
-@bot.on(events.NewMessage(pattern="/start"))
-async def bot_start(event):
-    uid = event.sender_id
-    is_admin = uid in ADMIN_IDS
-    token = secrets.token_urlsafe(16)
-    globals()[f"web_token_{token}"] = uid
-    link = f"{BASE_URL}/login?token={token}"
-    
-    buttons = [[Button.url("🌐 Войти в панель", link)]]
-    if is_admin:
-        buttons.append([Button.inline("👑 Дать доступ", b"gen_invite")])
-
-    await event.reply(f"⚡ **TITAN Enterprise**\nВаш ID: `{uid}`\nСтатус: {'Админ' if is_admin else 'Пользователь'}", buttons=buttons, parse_mode='md')
-
-@bot.on(events.CallbackQuery)
-async def bot_callback(event):
-    if event.sender_id not in ADMIN_IDS:
-        return await event.answer("Доступ только для админа!", alert=True)
-    if event.data == b"gen_invite":
-        token = secrets.token_urlsafe(16)
-        link = f"{BASE_URL}/login?invite={token}"
-        await event.reply(f"🔗 **Ссылка для друга:**\n`{link}`", parse_mode='md')
-
 def start_bot_thread():
     log_msg(">>> ЗАПУСК БОТА...")
     if not BOT_TOKEN: return
+    
+    bot_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(bot_loop)
+    bot = TelegramClient("bot_saas", API_ID, API_HASH)
+
+    @bot.on(events.NewMessage(pattern="/start"))
+    async def bot_start(event):
+        uid = event.sender_id
+        is_admin = uid in ADMIN_IDS
+        token = secrets.token_urlsafe(16)
+        globals()[f"web_token_{token}"] = uid
+        link = f"{BASE_URL}/login?token={token}"
+        
+        buttons = [[Button.url("🌐 Войти в панель", link)]]
+        if is_admin:
+            buttons.append([Button.inline("👑 Дать доступ", b"gen_invite")])
+
+        await event.reply(f"⚡ **TITAN Enterprise**\nВаш ID: `{uid}`\nСтатус: {'Админ' if is_admin else 'Юзер'}", buttons=buttons, parse_mode='md')
+
+    @bot.on(events.CallbackQuery)
+    async def bot_callback(event):
+        if event.sender_id not in ADMIN_IDS:
+            return await event.answer("Доступ только для админа!", alert=True)
+        if event.data == b"gen_invite":
+            token = secrets.token_urlsafe(16)
+            link = f"{BASE_URL}/login?invite={token}"
+            await event.reply(f"🔗 **Ссылка для друга:**\n`{link}`", parse_mode='md')
+
     try:
         bot.start(bot_token=BOT_TOKEN)
         log_msg(">>> БОТ УСПЕШНО ЗАПУЩЕН!")
         bot.run_until_disconnected()
     except Exception as e:
-        log_msg(f">>> КРИТИЧЕСКАЯ ОШИБКА: {e}")
+        log_msg(f">>> КРИТИЧЕСКАЯ ОШИБКА БОТА: {e}")
 
 threading.Thread(target=start_bot_thread, daemon=True).start()
 
 # =====================================================================
-# 6. UI (ДИЗАЙН)
+# 5. ВЕБ-ИНТЕРФЕЙС (ДИЗАЙН)
 # =====================================================================
 BASE_HTML = r"""
 <!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -274,7 +269,7 @@ async function genInvite(){let r=await fetch('/admin/gen_invite', {method:'POST'
 """
 
 # =====================================================================
-# 7. МАРШРУТЫ
+# 6. МАРШРУТЫ FLASK
 # =====================================================================
 @app.route("/")
 @app.route("/login")
@@ -303,6 +298,9 @@ def logout():
     session.clear()
     return redirect("/login")
 
+# =====================================================================
+# 7. API
+# =====================================================================
 @app.route("/api/send-code", methods=["POST"])
 def api_send_code():
     data = request.json
@@ -316,7 +314,7 @@ def api_send_code():
         return c, req.phone_code_hash
 
     try:
-        client, code_hash = run_async(_send())
+        client, code_hash = asyncio.run(_send())
         globals()[f"auth_{flow}"] = (client, phone, code_hash)
         return jsonify(status="ok", flow=flow)
     except Exception as e:
@@ -343,7 +341,7 @@ def api_verify_code():
         return {"uid": me.id, "sess": client.session.save()}
 
     try:
-        res = run_async(_verify())
+        res = asyncio.run(_verify())
         if isinstance(res, dict) and res.get("need_password"):
              return jsonify(status="error", error="Нужен пароль 2FA")
         
@@ -385,7 +383,12 @@ def api_spam_start():
     if not tpls: return jsonify(status="error", error="Нет шаблонов")
     if not user["session_string"]: return jsonify(status="error", error="Нет сессии")
     
-    asyncio.run_coroutine_threadsafe(spam_worker(uid, target, tpls, user["max_delay"], user["session_string"]), async_loop)
+    def _start():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(spam_worker(uid, target, tpls, user["max_delay"], user["session_string"]))
+    
+    threading.Thread(target=_start, daemon=True).start()
     return jsonify(status="ok")
 
 @app.route("/api/spam/stop", methods=["POST"])
