@@ -1,133 +1,445 @@
 import os
-import sys
-import json
 import re
-import asyncio
-import random
-import datetime
-import threading
-import uuid
+import json
 import time
-import shutil
-from colorama import init, Fore, Style
-from flask import Flask, jsonify, render_template_string, request, redirect, url_for
-import aiosqlite
+import secrets
+import sqlite3
+import threading
+import asyncio
+from datetime import datetime, timezone
+from functools import wraps
 
-from telethon import TelegramClient, events, Button
+from flask import (
+    Flask, request, jsonify, render_template_string, redirect, url_for,
+    session, abort
+)
+from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.errors import FloodWaitError, SessionPasswordNeededError
-from telethon.errors.rpcerrorlist import AccessTokenInvalidError
+from telethon.errors import (
+    SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError,
+    FloodWaitError
+)
 
-init(autoreset=True)
+# ---------- Configuration ----------
+API_ID = int(os.environ.get("API_ID", "2040"))
+API_HASH = os.environ.get("API_HASH", "b18441a1ff607e10a989891a5462e627")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")  # ЗАДАЙ В RENDER!
+FLASK_SECRET_KEY = os.environ.get("FLASK_SECRET_KEY") or secrets.token_hex(32)
+ADMIN_IDS = {
+    int(x.strip()) for x in os.environ.get(
+        "ADMIN_IDS", "9058235147,8773171051"
+    ).split(",") if x.strip().isdigit()
+}
+DB_PATH = os.environ.get("DB_PATH", "titan_saas.db")
+LOGIN_LINK_TTL = 300
+AUTH_FLOW_TTL = 600
+MAX_TEMPLATE_LINES = 9999
+MIN_DELAY_SECONDS = 3.0
 
-# =====================================================================
-# 1. КОНСТАНТЫ И НАСТРОЙКИ
-# =====================================================================
-API_ID = 2040
-API_HASH = 'b18441a1ff607e10a989891a5462e627'
-BOT_TOKEN = '8732669492:AAGiMPHbCs8ntMzFhkfS8466iIVVa67w47g' 
+app = Flask(__name__)
+app.secret_key = FLASK_SECRET_KEY
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "1") == "1",
+    PERMANENT_SESSION_LIFETIME=60 * 60 * 12,
+)
 
-# ТВОИ ДВА ID (Доступ к Админке)
-ADMIN_IDS = [9058235147, 8773171051]
+# A single dedicated asyncio loop for Telethon; do not create a new loop per request.
+async_loop = asyncio.new_event_loop()
+loop_thread = threading.Thread(
+    target=lambda: (asyncio.set_event_loop(async_loop), async_loop.run_forever()),
+    daemon=True,
+    name="telethon-loop",
+)
+loop_thread.start()
 
-DB_FILE = 'titan_saas.db'
-BACKUP_DIR = 'db_backups'
-START_TIME = datetime.datetime.now()
+auth_flows = {}  # flow token -> {client, phone, phone_code_hash, created}
+auth_lock = threading.Lock()
+active_spam_engines = {}  # user_id -> SpamEngine
 
-active_clients = {}     
-spam_engines = {}       
-web_auth_cache = {}     
-user_states = {}        
 
-system_metrics = {"total_messages_sent": 0, "total_errors_caught": 0, "flood_waits": 0}
+def run_async(coro, timeout=45):
+    future = asyncio.run_coroutine_threadsafe(coro, async_loop)
+    return future.result(timeout=timeout)
 
-def log(tag, msg, color=Fore.WHITE):
-    t = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"{Fore.LIGHTBLACK_EX}[{t}]{Fore.RESET} {color}[{tag}]{Fore.RESET} {msg}")
 
-# =====================================================================
-# 2. МОДУЛЬ БАЗЫ ДАННЫХ (SQLITE)
-# =====================================================================
-async def init_db():
-    if not os.path.exists(BACKUP_DIR): os.makedirs(BACKUP_DIR)
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute('''CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY, phone TEXT, session_string TEXT, 
-            templates TEXT DEFAULT '[]', min_delay INTEGER DEFAULT 100, max_delay INTEGER DEFAULT 300,
-            is_banned INTEGER DEFAULT 0, is_admin INTEGER DEFAULT 0, web_token TEXT, registered_at TEXT
-        )''')
-        await db.execute('''CREATE TABLE IF NOT EXISTS web_tasks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, action TEXT,
-            payload TEXT, status TEXT DEFAULT 'PENDING', created_at TEXT
-        )''')
-        await db.commit()
-        log("DB", "База данных готова.", Fore.GREEN)
+def utc_now():
+    return datetime.now(timezone.utc).isoformat()
 
-async def get_user(uid):
-    async with aiosqlite.connect(DB_FILE) as db:
-        async with db.execute("SELECT session_string, templates, min_delay, max_delay, is_banned, is_admin, web_token FROM users WHERE user_id = ?", (uid,)) as cursor:
-            row = await cursor.fetchone()
-            if row: 
-                return {
-                    'session': row[0], 'templates': json.loads(row[1]), 'min_delay': row[2], 'max_delay': row[3], 
-                    'is_banned': row[4], 'is_admin': row[5], 'web_token': row[6]
-                }
-    return None
 
-async def get_user_by_token(token):
-    if not token: return None
-    async with aiosqlite.connect(DB_FILE) as db:
-        async with db.execute("SELECT user_id, session_string, templates, min_delay, max_delay, is_banned FROM users WHERE web_token = ?", (token,)) as cursor:
-            row = await cursor.fetchone()
-            if row: 
-                return {
-                    'user_id': row[0], 'session': row[1], 'templates': json.loads(row[2]), 
-                    'min_delay': row[3], 'max_delay': row[4], 'is_banned': row[5]
-                }
-    return None
+def db():
+    conn = sqlite3.connect(DB_PATH, timeout=20)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
 
-async def save_user(uid, **kwargs):
-    current = await get_user(uid) or {'session': None, 'templates': [], 'min_delay': 100, 'max_delay': 300, 'is_banned': 0, 'is_admin': 0, 'web_token': None}
-    s = kwargs.get('session', current['session']); t = kwargs.get('templates', current['templates'])
-    mind = kwargs.get('min_d', current['min_delay']); maxd = kwargs.get('max_d', current['max_delay'])
-    b = kwargs.get('is_banned', current['is_banned']); adm = kwargs.get('is_admin', current['is_admin'])
-    token = kwargs.get('token', current['web_token']); phone = kwargs.get('phone', None)
-    
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute('''INSERT INTO users (user_id, phone, session_string, templates, min_delay, max_delay, is_banned, is_admin, web_token, registered_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET
-            phone=COALESCE(excluded.phone, users.phone), session_string=excluded.session_string, templates=excluded.templates, 
-            min_delay=excluded.min_delay, max_delay=excluded.max_delay, is_banned=excluded.is_banned, is_admin=excluded.is_admin, web_token=excluded.web_token''',
-            (uid, phone, s, json.dumps(t), mind, maxd, b, adm, token, str(datetime.datetime.now())))
-        await db.commit()
 
-# =====================================================================
-# 3. ДВИЖОК СПАМА
-# =====================================================================
+def init_db():
+    with db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                phone TEXT,
+                session_string TEXT,
+                templates TEXT NOT NULL DEFAULT '[]',
+                min_delay REAL NOT NULL DEFAULT 3.0,
+                max_delay REAL NOT NULL DEFAULT 5.0,
+                is_banned INTEGER NOT NULL DEFAULT 0,
+                is_disabled INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                last_login TEXT,
+                session_version INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS login_tokens (
+                token_hash TEXT PRIMARY KEY,
+                telegram_id INTEGER NOT NULL,
+                expires_at REAL NOT NULL,
+                used INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS admin_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_id INTEGER NOT NULL,
+                target_id INTEGER,
+                action TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS web_sessions (
+                sid_hash TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                expires_at REAL NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+        conn.commit()
+
+
+init_db()
+
+
+def get_user(user_id):
+    with db() as conn:
+        return conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+
+
+def save_user(user_id, phone, session_string):
+    with db() as conn:
+        existing = conn.execute(
+            "SELECT user_id FROM users WHERE user_id=?", (user_id,)
+        ).fetchone()
+        if existing:
+            conn.execute("""
+                UPDATE users SET phone=?, session_string=?, last_login=?,
+                    session_version=session_version+1
+                WHERE user_id=?
+            """, (phone, session_string, utc_now(), user_id))
+        else:
+            conn.execute("""
+                INSERT INTO users(user_id, phone, session_string, created_at, last_login)
+                VALUES(?,?,?,?,?)
+            """, (user_id, phone, session_string, utc_now(), utc_now()))
+        conn.commit()
+
+
+def hash_token(value):
+    import hashlib
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def current_user():
+    uid = session.get("uid")
+    if not uid:
+        return None
+    user = get_user(int(uid))
+    if not user or user["is_banned"] or user["is_disabled"]:
+        session.clear()
+        return None
+    return user
+
+
+def login_required(fn):
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        if not current_user():
+            return redirect(url_for("home"))
+        return fn(*args, **kwargs)
+    return wrapped
+
+
+def admin_required(fn):
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        user = current_user()
+        if not user or int(user["user_id"]) not in ADMIN_IDS:
+            abort(403)
+        return fn(*args, **kwargs)
+    return wrapped
+
+
+def render_page(title, content, user=None):
+    return render_template_string(BASE_HTML, title=title, content=content, user=user)
+
+
+BASE_HTML = r"""
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ title }} · TITAN</title>
+<style>
+:root{color-scheme:dark;--bg:#101214;--panel:#191c20;--line:#2b3036;--muted:#9ba3ad;--text:#f2f4f6;--accent:#d5e6ff;--accentText:#111923;--danger:#ff7777}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif}
+.shell{max-width:1120px;margin:0 auto;padding:28px 18px}.top{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:26px}
+.brand{font-size:13px;letter-spacing:.18em;font-weight:800;color:#cbd5e1}.brand span{color:#fff}
+.nav{display:flex;gap:10px;align-items:center}.nav a,.btn{display:inline-flex;align-items:center;justify-content:center;text-decoration:none;border:1px solid var(--line);border-radius:10px;padding:9px 13px;color:var(--text);background:#20242a;cursor:pointer;font:inherit}
+.btn.primary{background:var(--accent);color:var(--accentText);border-color:var(--accent);font-weight:700}.btn.danger{color:var(--danger)}
+h1{font-size:clamp(25px,4vw,36px);line-height:1.15;margin:0 0 8px;letter-spacing:-.04em}h2{font-size:18px;margin:0 0 14px}
+.sub{color:var(--muted);margin:0 0 24px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:20px;margin-bottom:16px}
+label{display:block;font-size:13px;color:var(--muted);margin:12px 0 6px}
+input,textarea,select{width:100%;border:1px solid var(--line);background:#101316;color:var(--text);border-radius:10px;padding:12px;font:inherit;outline:none}
+textarea{min-height:220px;resize:vertical}input:focus,textarea:focus{border-color:#8799b1}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.row>*{flex:1}.small{font-size:12px;color:var(--muted)}
+table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:11px 8px;border-bottom:1px solid var(--line);vertical-align:middle}th{color:var(--muted);font-weight:600}
+.status{display:inline-block;border:1px solid var(--line);padding:3px 8px;border-radius:999px;font-size:12px}
+.error{color:#ff9292;margin-top:10px}.ok{color:#a7e7bd;margin-top:10px}
+@media(max-width:720px){.grid{grid-template-columns:1fr}.top{align-items:flex-start;flex-direction:column}.shell{padding:18px 12px}.panel{padding:15px}table{display:block;overflow-x:auto}}
+</style>
+</head>
+<body><div class="shell">
+<header class="top"><div class="brand">TITAN <span>CONTROL</span></div>
+<nav class="nav">{% if user %}<a href="/dashboard">Панель</a>{% if user['user_id']|int in admins %}<a href="/admin">Админка</a>{% endif %}<a href="/logout">Выйти</a>{% endif %}</nav></header>
+{{ content|safe }}
+</div></body></html>
+"""
+
+
+@app.context_processor
+def inject_admins():
+    return {"admins": ADMIN_IDS}
+
+
+HOME = r"""
+<div class="panel" style="max-width:520px;margin:8vh auto">
+<h1>Вход в TITAN</h1><p class="sub">Подключение Telegram-аккаунта по номеру и коду.</p>
+<label>Номер телефона</label><input id="phone" placeholder="+7 900 000-00-00" autocomplete="tel">
+<button class="btn primary" style="width:100%;margin-top:14px" onclick="sendCode()">Получить код</button>
+<div id="codebox" style="display:none"><label>Код Telegram</label><input id="code" autocomplete="one-time-code">
+<label>Облачный пароль (если включён)</label><input id="password" type="password" autocomplete="current-password">
+<button class="btn primary" style="width:100%;margin-top:14px" onclick="verify()">Войти</button></div>
+<div id="msg" class="error"></div>
+</div>
+<script>
+let flow=null;
+async function post(url,obj){let r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj)});return await r.json()}
+async function sendCode(){let p=document.getElementById('phone').value.trim();if(!p){msg.textContent='Введите номер телефона';return}
+let d=await post('/api/send-code',{phone:p});if(d.status==='ok'){flow=d.flow;codebox.style.display='block';msg.className='ok';msg.textContent='Код отправлен. Проверьте Telegram.'}else{msg.className='error';msg.textContent=d.error||'Не удалось отправить код'}}
+async function verify(){let d=await post('/api/verify-code',{flow:flow,code:document.getElementById('code').value.trim(),password:document.getElementById('password').value});
+if(d.status==='ok'){location.href='/dashboard'}else{msg.className='error';msg.textContent=d.error||'Ошибка входа'}}
+</script>
+"""
+
+
+@app.route("/")
+def home():
+    if current_user():
+        return redirect("/dashboard")
+    return render_page("Вход", HOME)
+
+
+@app.route("/api/send-code", methods=["POST"])
+def api_send_code():
+    data = request.get_json(silent=True) or {}
+    phone = (data.get("phone") or "").strip()
+    if not re.fullmatch(r"\+?[0-9 ()-]{7,24}", phone):
+        return jsonify(status="error", error="Проверьте номер телефона.")
+    flow = secrets.token_urlsafe(32)
+
+    async def create_and_send():
+        client = TelegramClient(StringSession(), API_ID, API_HASH)
+        await client.connect()
+        sent = await client.send_code_request(phone)
+        return client, sent.phone_code_hash
+
+    try:
+        client, code_hash = run_async(create_and_send())
+        with auth_lock:
+            auth_flows[flow] = {
+                "client": client, "phone": phone, "hash": code_hash,
+                "created": time.time()
+            }
+        return jsonify(status="ok", flow=flow)
+    except FloodWaitError as e:
+        return jsonify(status="error", error=f"Telegram просит подождать {e.seconds} секунд.")
+    except Exception as e:
+        return jsonify(status="error", error=f"Telegram не отправил код: {str(e)[:240]}")
+
+
+@app.route("/api/verify-code", methods=["POST"])
+def api_verify_code():
+    data = request.get_json(silent=True) or {}
+    flow = data.get("flow")
+    code = (data.get("code") or "").strip()
+    password = data.get("password") or ""
+    if not flow or not code:
+        return jsonify(status="error", error="Введите код.")
+    with auth_lock:
+        auth = auth_flows.get(flow)
+    if not auth:
+        return jsonify(status="error", error="Срок входа истёк. Запросите новый код.")
+    if time.time() - auth["created"] > AUTH_FLOW_TTL:
+        with auth_lock:
+            auth_flows.pop(flow, None)
+        return jsonify(status="error", error="Срок входа истёк. Запросите новый код.")
+
+    async def finish():
+        client = auth["client"]
+        try:
+            await client.sign_in(
+                phone=auth["phone"], code=code, phone_code_hash=auth["hash"]
+            )
+        except SessionPasswordNeededError:
+            if not password:
+                return {"need_password": True}
+            await client.sign_in(password=password)
+        me = await client.get_me()
+        return {"user_id": me.id, "session": client.session.save()}
+
+    try:
+        result = run_async(finish())
+        if result.get("need_password"):
+            return jsonify(status="error", error="Нужен облачный пароль Telegram (2FA). Введите его и нажмите «Войти» ещё раз.")
+        save_user(result["user_id"], auth["phone"], result["session"])
+        with auth_lock:
+            auth_flows.pop(flow, None)
+        session.clear()
+        session["uid"] = int(result["user_id"])
+        session.permanent = True
+        return jsonify(status="ok")
+    except PhoneCodeInvalidError:
+        return jsonify(status="error", error="Неверный код Telegram.")
+    except PhoneCodeExpiredError:
+        return jsonify(status="error", error="Код истёк. Запросите новый.")
+    except FloodWaitError as e:
+        return jsonify(status="error", error=f"Слишком много попыток. Подождите {e.seconds} секунд.")
+    except Exception as e:
+        return jsonify(status="error", error=f"Не удалось завершить вход: {str(e)[:240]}")
+
+
+DASHBOARD = r"""
+<h1>Панель управления</h1><p class="sub">Аккаунт подключён. Здесь можно управлять настройками и шаблонами.</p>
+<div class="grid">
+<div class="panel"><h2>Аккаунт</h2><p>Telegram ID: <b>{{ user['user_id'] }}</b></p>
+<p>Телефон: <b>{{ user['phone'] or '—' }}</b></p><p>Статус: <span class="status">Доступ разрешён</span></p></div>
+<div class="panel"><h2>Интервал для тестов</h2><p class="small">Минимальное значение зафиксировано на 3 секундах.</p>
+<label>Максимальная задержка (сек.)</label><input id="maxdelay" type="number" min="3" max="3600" step="0.1" value="{{ user['max_delay'] }}">
+<button class="btn primary" onclick="saveSettings()" style="margin-top:12px">Сохранить</button><div id="settingsmsg"></div></div>
+</div>
+
+<div class="panel"><h2>🚀 Запуск рассылки</h2><p class="sub">Введите цель (@username или ID чата) и запустите процесс.</p>
+<div class="row">
+    <input id="spam_target" placeholder="@username или -100123456789" style="flex:3">
+    <button class="btn primary" onclick="startSpam()" style="flex:1">Запустить</button>
+    <button class="btn danger" onclick="stopSpam()" style="flex:1">Остановить</button>
+</div>
+<div id="spammsg" class="small" style="margin-top:10px"></div>
+</div>
+
+<div class="panel"><h2>Шаблоны</h2><p class="sub">Каждая строка — отдельный шаблон. Максимум 9999 строк.</p>
+<textarea id="templates" placeholder="Введите шаблоны — каждый с новой строки">{{ templates }}</textarea>
+<div class="row"><button class="btn primary" onclick="saveTemplates()">Сохранить шаблоны</button><span class="small" id="count"></span></div><div id="templatemsg"></div></div>
+<script>
+const ta=document.getElementById('templates'),count=document.getElementById('count');
+function countLines(){count.textContent=ta.value?ta.value.split('\\n').length+' строк':'0 строк'}ta.addEventListener('input',countLines);countLines();
+async function post(url,obj){let r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj)});return await r.json()}
+async function saveSettings(){let d=await post('/api/settings',{max_delay:document.getElementById('maxdelay').value});settingsmsg.textContent=d.status==='ok'?'Сохранено':d.error;settingsmsg.className=d.status==='ok'?'ok':'error'}
+async function saveTemplates(){let d=await post('/api/templates',{text:ta.value});templatemsg.textContent=d.status==='ok'?'Сохранено ('+d.count+' строк)':d.error;templatemsg.className=d.status==='ok'?'ok':'error'}
+async function startSpam(){let d=await post('/api/spam/start',{target:document.getElementById('spam_target').value});document.getElementById('spammsg').textContent=d.status==='ok'?'🚀 Запущено':d.error}
+async function stopSpam(){let d=await post('/api/spam/stop',{});document.getElementById('spammsg').textContent=d.status==='ok'?'🛑 Остановлено':d.error}
+</script>
+"""
+
+
+@app.route("/dashboard")
+@login_required
+def dashboard():
+    user = current_user()
+    try:
+        templates = json.loads(user["templates"] or "[]")
+    except Exception:
+        templates = []
+    content = render_template_string(DASHBOARD, user=user, templates="\n".join(templates))
+    return render_page("Панель", content, user=user)
+
+
+@app.route("/api/settings", methods=["POST"])
+@login_required
+def api_settings():
+    data = request.get_json(silent=True) or {}
+    try:
+        max_delay = float(data.get("max_delay"))
+    except (TypeError, ValueError):
+        return jsonify(status="error", error="Введите корректную задержку.")
+    if not MIN_DELAY_SECONDS <= max_delay <= 3600:
+        return jsonify(status="error", error="Максимальная задержка должна быть от 3 до 3600 секунд.")
+    uid = int(current_user()["user_id"])
+    with db() as conn:
+        conn.execute("UPDATE users SET min_delay=?, max_delay=? WHERE user_id=?",
+                     (MIN_DELAY_SECONDS, max_delay, uid))
+        conn.commit()
+    return jsonify(status="ok")
+
+
+@app.route("/api/templates", methods=["POST"])
+@login_required
+def api_templates():
+    data = request.get_json(silent=True) or {}
+    text = data.get("text", "")
+    if not isinstance(text, str):
+        return jsonify(status="error", error="Некорректный формат.")
+    lines = [line.rstrip() for line in text.splitlines()]
+    if len(lines) > MAX_TEMPLATE_LINES:
+        return jsonify(status="error", error=f"Максимум {MAX_TEMPLATE_LINES} строк.")
+    uid = int(current_user()["user_id"])
+    with db() as conn:
+        conn.execute("UPDATE users SET templates=? WHERE user_id=?",
+                     (json.dumps(lines, ensure_ascii=False), uid))
+        conn.commit()
+    return jsonify(status="ok", count=len(lines))
+
+
+# ---------- SPAM ENGINE ----------
 class SpamEngine:
-    def __init__(self, uid, target, templates, min_d, max_d, session_str):
-        self.uid = uid; self.target = target; self.templates = templates
-        self.min_d = min_d; self.max_d = max_d; self.session_str = session_str
-        self.is_active = True; self.counter = 0; self.client = None
+    def __init__(self, user_id, target, templates, min_d, max_d, session_str):
+        self.user_id = user_id
+        self.target = target
+        self.templates = templates
+        self.min_d = min_d
+        self.max_d = max_d
+        self.session_str = session_str
+        self.is_active = False
+        self.client = None
 
     async def run(self):
+        self.is_active = True
         try:
             self.client = TelegramClient(StringSession(self.session_str), API_ID, API_HASH)
             await self.client.connect()
             while self.is_active:
                 try:
-                    if not self.templates: break
-                    text = random.choice(self.templates)
-                    stealth = "".join([random.choice(['\u200b', '\u200c', '\u200d']) for _ in range(random.randint(2, 6))])
-                    await self.client.send_message(self.target, f"{text}{stealth}")
-                    self.counter += 1
-                    system_metrics["total_messages_sent"] += 1
-                    await asyncio.sleep(random.randint(self.min_d, self.max_d) / 1000.0)
+                    text = random.choice(self.templates) + "\u200b"
+                    await self.client.send_message(self.target, text)
+                    await asyncio.sleep(random.uniform(self.min_d, self.max_d))
                 except FloodWaitError as e:
-                    system_metrics["flood_waits"] += 1
-                    await asyncio.sleep(e.seconds + 10)
+                    await asyncio.sleep(e.seconds + 5)
                 except Exception:
-                    system_metrics["total_errors_caught"] += 1
                     break
         except Exception:
             pass
@@ -135,505 +447,138 @@ class SpamEngine:
             if self.client: await self.client.disconnect()
             self.is_active = False
 
-# =====================================================================
-# 4. ВОРКЕР ЗАДАЧ
-# =====================================================================
-async def web_task_worker():
-    while True:
-        try:
-            async with aiosqlite.connect(DB_FILE) as db:
-                async with db.execute("SELECT id, user_id, action, payload FROM web_tasks WHERE status = 'PENDING'") as cursor:
-                    for t_id, u_id, action, payload in await cursor.fetchall():
-                        payload = json.loads(payload)
-                        if action == "START_SPAM":
-                            p = await get_user(u_id)
-                            if p and not p['is_banned']:
-                                eng = SpamEngine(u_id, payload['target'], p['templates'], p['min_delay'], p['max_delay'], p['session'])
-                                spam_engines[u_id] = eng
-                                asyncio.run_coroutine_threadsafe(eng.run(), loop_manager)
-                        await db.execute("UPDATE web_tasks SET status = 'DONE' WHERE id = ?", (t_id,))
-                        await db.commit()
-        except Exception: pass
-        await asyncio.sleep(2)
 
-# =====================================================================
-# 5. БОТ
-# =====================================================================
-bot = TelegramClient('bot_saas', API_ID, API_HASH)
+@app.route("/api/spam/start", methods=["POST"])
+@login_required
+def api_spam_start():
+    data = request.get_json(silent=True) or {}
+    target = data.get("target", "").strip()
+    if not target:
+        return jsonify(status="error", error="Укажите цель.")
+    
+    user = current_user()
+    uid = int(user["user_id"])
+    templates = json.loads(user["templates"] or "[]")
+    if not templates:
+        return jsonify(status="error", error="Сначала сохраните шаблоны.")
+    
+    if uid in active_spam_engines:
+        return jsonify(status="error", error="Рассылка уже запущена.")
 
-@bot.on(events.NewMessage(pattern='/start'))
-async def cmd_start(e):
-    uid = e.sender_id
-    p = await get_user(uid)
-    if not p or not p['web_token']:
-        token = uuid.uuid4().hex
-        await save_user(uid, token=token)
-        p = await get_user(uid)
-    link = f"https://bot-1-dk7y.onrender.com/login?token={p['web_token']}"
-    await e.reply(f"⚡ **TITAN SaaS**\n\n[👉 Войти в панель]({link})", parse_mode='md')
+    engine = SpamEngine(uid, target, templates, user["min_delay"], user["max_delay"], user["session_string"])
+    active_spam_engines[uid] = engine
+    asyncio.run_coroutine_threadsafe(engine.run(), async_loop)
+    return jsonify(status="ok")
 
-# =====================================================================
-# 6. WEB UI (FLASK) - PREMIUM DESIGN
-# =====================================================================
-app = Flask(__name__)
 
-# --- СТРАНИЦА ЛОГИНА ---
-HTML_LOGIN = """
-<!DOCTYPE html>
-<html lang="ru">
-<head>
-    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>TITAN | Authentication</title>
-    <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <style>
-        :root { --bg: #050508; --card: rgba(20, 22, 30, 0.7); --text: #fff; --acc: #6366f1; --err: #ef4444; }
-        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Manrope', sans-serif; }
-        body { 
-            background: var(--bg); color: var(--text); display: flex; justify-content: center; align-items: center; height: 100vh;
-            background-image: radial-gradient(circle at 15% 50%, rgba(99, 102, 241, 0.15), transparent 25%), 
-                              radial-gradient(circle at 85% 30%, rgba(236, 72, 153, 0.15), transparent 25%);
-        }
-        .login-box { 
-            background: var(--card); backdrop-filter: blur(20px); border: 1px solid rgba(255,255,255,0.1);
-            padding: 50px 40px; border-radius: 24px; width: 380px; text-align: center;
-            box-shadow: 0 25px 50px -12px rgba(0,0,0,0.5); position: relative; overflow: hidden;
-        }
-        .login-box::before { content: ''; position: absolute; top: 0; left: 0; width: 100%; height: 4px; background: linear-gradient(90deg, #6366f1, #ec4899); }
-        h2 { font-weight: 800; font-size: 28px; margin-bottom: 10px; letter-spacing: -0.5px; }
-        p.sub { color: #94a3b8; font-size: 14px; margin-bottom: 30px; }
-        .input-group { position: relative; margin-bottom: 20px; text-align: left; }
-        .input-group i { position: absolute; left: 18px; top: 18px; color: #64748b; font-size: 18px; }
-        input { 
-            width: 100%; padding: 16px 16px 16px 50px; background: rgba(0,0,0,0.4); border: 1px solid rgba(255,255,255,0.05); 
-            color: #fff; border-radius: 12px; font-size: 15px; outline: none; transition: 0.3s; font-family: 'Manrope';
-        }
-        input:focus { border-color: var(--acc); box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2); }
-        button { 
-            width: 100%; padding: 16px; background: linear-gradient(135deg, #6366f1, #8b5cf6); border: none; color: #fff; 
-            border-radius: 12px; cursor: pointer; font-weight: 700; font-size: 16px; transition: 0.3s; margin-top: 10px;
-            box-shadow: 0 10px 20px -10px rgba(99, 102, 241, 0.5);
-        }
-        button:hover { transform: translateY(-2px); box-shadow: 0 15px 25px -10px rgba(99, 102, 241, 0.6); }
-        .step2 { display: none; }
-        .error-text { color: var(--err); font-size: 13px; margin-top: 15px; min-height: 20px; font-weight: 600; }
-    </style>
-</head>
-<body>
-    <div class="login-box">
-        <h2>TITAN SAAS</h2>
-        <p class="sub">Вход в панель управления</p>
-        <div class="step1" id="step1">
-            <div class="input-group"><i class="fa-solid fa-phone"></i><input type="text" id="phone" placeholder="+7 (999) 000-00-00"></div>
-            <button onclick="sendCode()">Получить код</button>
-        </div>
-        <div class="step2" id="step2">
-            <div class="input-group"><i class="fa-solid fa-lock"></i><input type="text" id="code" placeholder="Код из Telegram"></div>
-            <button onclick="verifyCode()">Войти в систему</button>
-        </div>
-        <div class="error-text" id="error"></div>
-    </div>
-    <script>
-        const TOKEN = "{{ token }}";
-        async function sendCode() {
-            const phone = document.getElementById('phone').value;
-            if(!phone) return document.getElementById('error').innerText = "Введите номер!";
-            const res = await fetch('/api/send_code', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({token: TOKEN, phone: phone}) });
-            const data = await res.json();
-            if(data.status === 'ok') { document.getElementById('step1').style.display = 'none'; document.getElementById('step2').style.display = 'block'; } 
-            else { document.getElementById('error').innerText = data.error; }
-        }
-        async function verifyCode() {
-            const code = document.getElementById('code').value;
-            const res = await fetch('/api/verify_code', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({token: TOKEN, code: code}) });
-            const data = await res.json();
-            if(data.status === 'ok') { window.location.href = '/dashboard?token=' + TOKEN; } 
-            else { document.getElementById('error').innerText = data.error; }
-        }
-    </script>
-</body>
-</html>
+@app.route("/api/spam/stop", methods=["POST"])
+@login_required
+def api_spam_stop():
+    uid = int(current_user()["user_id"])
+    if uid in active_spam_engines:
+        active_spam_engines[uid].is_active = False
+        del active_spam_engines[uid]
+        return jsonify(status="ok")
+    return jsonify(status="error", error="Рассылка не запущена.")
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect("/")
+
+
+ADMIN_PAGE = r"""
+<h1>Админ-панель</h1><p class="sub">Управление доступом пользователей. Действия фиксируются в журнале.</p>
+<div class="panel"><table><thead><tr><th>Telegram ID</th><th>Телефон</th><th>Создан</th><th>Состояние</th><th>Действия</th></tr></thead><tbody>
+{% for u in users %}<tr><td>{{ u['user_id'] }}</td><td>{{ u['phone'] or '—' }}</td><td>{{ u['created_at'] or '—' }}</td>
+<td>{% if u['is_banned'] %}<span class="status">Бан</span>{% elif u['is_disabled'] %}<span class="status">Отключён</span>{% else %}<span class="status">Активен</span>{% endif %}</td>
+<td><div class="row">
+<form method="post" action="/admin/action"><input type="hidden" name="uid" value="{{u['user_id']}}"><input type="hidden" name="action" value="{{'unban' if u['is_banned'] else 'ban'}}"><button class="btn" type="submit">{{'Разбанить' if u['is_banned'] else 'Бан'}}</button></form>
+<form method="post" action="/admin/action"><input type="hidden" name="uid" value="{{u['user_id']}}"><input type="hidden" name="action" value="{{'enable' if u['is_disabled'] else 'disable'}}"><button class="btn" type="submit">{{'Включить' if u['is_disabled'] else 'Отключить'}}</button></form>
+</div></td></tr>{% endfor %}
+</tbody></table></div>
+<div class="panel"><h2>Последние действия администраторов</h2><table><tr><th>Админ</th><th>Пользователь</th><th>Действие</th><th>Дата</th></tr>
+{% for l in logs %}<tr><td>{{l['admin_id']}}</td><td>{{l['target_id']}}</td><td>{{l['action']}}</td><td>{{l['created_at']}}</td></tr>{% endfor %}</table></div>
 """
 
-# --- ДАШБОРД ---
-HTML_DASHBOARD = """
-<!DOCTYPE html>
-<html lang="ru">
-<head>
-    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>TITAN | Dashboard</title>
-    <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <style>
-        :root { --bg: #050508; --side: rgba(15, 17, 26, 0.8); --card: rgba(22, 25, 35, 0.6); --text: #fff; --mut: #94a3b8; --acc: #6366f1; --ok: #10b981; --err: #ef4444; --warn: #f59e0b; }
-        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Manrope', sans-serif; }
-        body { background: var(--bg); color: var(--text); display: flex; height: 100vh; overflow: hidden; background-image: radial-gradient(circle at 50% 0%, rgba(99, 102, 241, 0.1), transparent 40%); }
 
-        /* Sidebar */
-        .sidebar { width: 270px; background: var(--side); backdrop-filter: blur(20px); border-right: 1px solid rgba(255,255,255,0.05); padding: 30px 20px; display: flex; flex-direction: column; }
-        .logo { font-size: 22px; font-weight: 800; color: #fff; margin-bottom: 40px; display: flex; align-items: center; gap: 12px; letter-spacing: -0.5px; }
-        .logo i { color: var(--acc); }
-        .nav-item { display: flex; align-items: center; gap: 15px; padding: 14px 18px; border-radius: 12px; color: var(--mut); font-weight: 600; font-size: 15px; cursor: pointer; transition: 0.2s; margin-bottom: 8px; border: 1px solid transparent; }
-        .nav-item:hover { background: rgba(255,255,255,0.05); color: #fff; }
-        .nav-item.active { background: linear-gradient(90deg, rgba(99, 102, 241, 0.15), transparent); color: var(--acc); border-left: 3px solid var(--acc); border-radius: 4px 12px 12px 4px; }
+@app.route("/admin")
+@admin_required
+def admin():
+    with db() as conn:
+        users = conn.execute("SELECT * FROM users ORDER BY created_at DESC").fetchall()
+        logs = conn.execute("SELECT * FROM admin_logs ORDER BY id DESC LIMIT 50").fetchall()
+    user = current_user()
+    content = render_template_string(ADMIN_PAGE, users=users, logs=logs)
+    return render_page("Админка", content, user=user)
 
-        /* Main Content */
-        .main { flex: 1; padding: 40px; overflow-y: auto; }
-        .top-bar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 40px; }
-        .top-bar h1 { font-size: 32px; font-weight: 800; letter-spacing: -1px; }
-        .badge { padding: 8px 16px; border-radius: 30px; font-size: 13px; font-weight: 700; display: flex; align-items: center; gap: 8px; }
-        .badge.ok { background: rgba(16, 185, 129, 0.1); color: var(--ok); border: 1px solid rgba(16, 185, 129, 0.2); }
-        .badge.err { background: rgba(239, 68, 68, 0.1); color: var(--err); border: 1px solid rgba(239, 68, 68, 0.2); }
 
-        /* Cards & Grid */
-        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 25px; }
-        .card { background: var(--card); backdrop-filter: blur(10px); border-radius: 20px; padding: 30px; border: 1px solid rgba(255,255,255,0.05); box-shadow: 0 10px 30px -10px rgba(0,0,0,0.3); }
-        .card h3 { font-size: 18px; font-weight: 700; margin-bottom: 25px; display: flex; align-items: center; gap: 10px; color: #fff; }
-        .card h3 i { color: var(--acc); }
-        
-        /* Stats */
-        .stat-box { background: rgba(0,0,0,0.3); border-radius: 16px; padding: 20px; text-align: center; border: 1px solid rgba(255,255,255,0.03); }
-        .stat-val { font-size: 36px; font-weight: 800; background: linear-gradient(135deg, #fff, #94a3b8); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-        .stat-name { font-size: 13px; color: var(--mut); font-weight: 600; margin-top: 5px; text-transform: uppercase; letter-spacing: 0.5px; }
-
-        /* Forms */
-        label { display: block; font-size: 13px; color: var(--mut); margin-bottom: 10px; font-weight: 600; }
-        input, textarea { width: 100%; background: rgba(0,0,0,0.4); border: 1px solid rgba(255,255,255,0.1); color: #fff; padding: 16px; border-radius: 12px; font-size: 15px; margin-bottom: 20px; outline: none; transition: 0.3s; font-family: 'Manrope'; }
-        input:focus, textarea:focus { border-color: var(--acc); box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2); }
-        button { padding: 16px 24px; border: none; border-radius: 12px; font-weight: 700; font-size: 15px; cursor: pointer; transition: 0.3s; display: flex; justify-content: center; align-items: center; gap: 10px; width: 100%; color: #fff; }
-        button:hover { transform: translateY(-2px); }
-        .btn-primary { background: linear-gradient(135deg, #6366f1, #8b5cf6); box-shadow: 0 10px 20px -10px rgba(99, 102, 241, 0.4); }
-        .btn-danger { background: linear-gradient(135deg, #ef4444, #b91c1c); box-shadow: 0 10px 20px -10px rgba(239, 68, 68, 0.4); }
-        .btn-ok { background: linear-gradient(135deg, #10b981, #047857); box-shadow: 0 10px 20px -10px rgba(16, 185, 129, 0.4); }
-
-        /* Admin Table */
-        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-        th, td { padding: 18px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.05); font-size: 15px; font-weight: 500; }
-        th { color: var(--mut); font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; }
-        tr:hover td { background: rgba(255,255,255,0.02); }
-        .btn-sm { padding: 8px 16px; font-size: 13px; border-radius: 8px; width: auto; display: inline-flex; }
-        .badge-admin { background: rgba(245, 158, 11, 0.2); color: var(--warn); padding: 4px 10px; border-radius: 6px; font-size: 12px; font-weight: 700; }
-        
-        .hidden { display: none !important; }
-        #toast { position: fixed; bottom: 30px; right: 30px; background: var(--ok); color: #fff; padding: 16px 28px; border-radius: 12px; font-weight: 700; box-shadow: 0 10px 30px -10px rgba(0,0,0,0.5); opacity: 0; transform: translateY(20px); transition: 0.3s; pointer-events: none; z-index: 9999; display: flex; align-items: center; gap: 10px; }
-        #toast.show { opacity: 1; transform: translateY(0); }
-    </style>
-</head>
-<body>
-
-<div class="sidebar">
-    <div class="logo"><i class="fa-solid fa-bolt"></i> TITAN <span style="font-size:12px;color:var(--mut);font-weight:400;">v12.0</span></div>
-    <div class="nav-item active" id="nav-dash" onclick="showTab('dash')"><i class="fa-solid fa-chart-pie"></i> Дашборд</div>
-    <div class="nav-item" id="nav-spam" onclick="showTab('spam')"><i class="fa-solid fa-rocket"></i> Рассылка</div>
-    <div class="nav-item" id="nav-settings" onclick="showTab('settings')"><i class="fa-solid fa-gear"></i> Настройки</div>
-    {% if is_admin %}
-    <div class="nav-item" id="nav-admin" onclick="showTab('admin')" style="color:var(--warn);margin-top:20px;"><i class="fa-solid fa-crown"></i> Админ-панель</div>
-    {% endif %}
-</div>
-
-<div class="main">
-    <div class="top-bar">
-        <h1 id="pageTitle">Дашборд</h1>
-        <div class="badge {% if session %}ok{% else %}err{% endif %}" id="sessionStatus">
-            <i class="fa-solid {% if session %}fa-check-circle{% else %}fa-exclamation-circle{% endif %}"></i>
-            {% if session %}Сессия активна{% else %}Нет сессии{% endif %}
-        </div>
-    </div>
-
-    <!-- ДАШБОРД -->
-    <div id="tab-dash">
-        <div class="grid">
-            <div class="card">
-                <h3><i class="fa-solid fa-chart-simple"></i> Статистика</h3>
-                <div class="grid" style="grid-template-columns:1fr 1fr;gap:15px;">
-                    <div class="stat-box"><div class="stat-val" id="statSent">0</div><div class="stat-name">Отправлено</div></div>
-                    <div class="stat-box"><div class="stat-val" id="statErr">0</div><div class="stat-name">Ошибок</div></div>
-                    <div class="stat-box"><div class="stat-val" id="statFlood">0</div><div class="stat-name">FloodWait</div></div>
-                    <div class="stat-box"><div class="stat-val" id="statUp">0с</div><div class="stat-name">Аптайм</div></div>
-                </div>
-            </div>
-            <div class="card">
-                <h3><i class="fa-solid fa-file-lines"></i> Шаблоны сообщений</h3>
-                <textarea id="templates" style="height:120px;">{{ templates }}</textarea>
-                <button class="btn-primary" onclick="saveTpl()"><i class="fa-solid fa-floppy-disk"></i> Сохранить</button>
-            </div>
-        </div>
-    </div>
-
-    <!-- РАССЫЛКА -->
-    <div id="tab-spam" class="hidden">
-        <div class="card" style="max-width: 600px;">
-            <h3><i class="fa-solid fa-bullseye"></i> Запуск</h3>
-            <label>Цель (@username или ID чата)</label>
-            <input type="text" id="target" placeholder="@username">
-            <button class="btn-ok" onclick="startSpam()"><i class="fa-solid fa-play"></i> Запустить</button>
-            <button class="btn-danger" style="margin-top:15px;" onclick="stopSpam()"><i class="fa-solid fa-stop"></i> Остановить</button>
-        </div>
-    </div>
-
-    <!-- НАСТРОЙКИ -->
-    <div id="tab-settings" class="hidden">
-        <div class="card" style="max-width: 600px;">
-            <h3><i class="fa-solid fa-sliders"></i> Конфигурация</h3>
-            <label>Задержка (мин - макс, мс)</label>
-            <input type="text" id="delay" value="{{ min_d }}-{{ max_d }}">
-            <button class="btn-primary" onclick="saveDelay()"><i class="fa-solid fa-floppy-disk"></i> Сохранить</button>
-        </div>
-    </div>
-
-    <!-- АДМИНКА -->
-    {% if is_admin %}
-    <div id="tab-admin" class="hidden">
-        <div class="card">
-            <h3><i class="fa-solid fa-users-gear"></i> Управление пользователями</h3>
-            <table>
-                <thead><tr><th>ID</th><th>Телефон</th><th>Статус</th><th>Действие</th></tr></thead>
-                <tbody id="userList"></tbody>
-            </table>
-        </div>
-    </div>
-    {% endif %}
-</div>
-
-<div id="toast"><i class="fa-solid fa-check-circle"></i> <span id="toastText">Сохранено!</span></div>
-
-<script>
-    const TOKEN = "{{ token }}";
-    const IS_ADMIN = {{ 'true' if is_admin else 'false' }};
-    
-    function showToast(msg, isError = false) {
-        const t = document.getElementById('toast');
-        const txt = document.getElementById('toastText');
-        const icon = t.querySelector('i');
-        txt.innerText = msg;
-        t.style.background = isError ? 'var(--err)' : 'var(--ok)';
-        icon.className = isError ? 'fa-solid fa-circle-exclamation' : 'fa-solid fa-check-circle';
-        t.classList.add('show'); setTimeout(() => t.classList.remove('show'), 3000);
-    }
-
-    function showTab(id) {
-        document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
-        document.getElementById('nav-' + id).classList.add('active');
-        document.querySelectorAll('.main > div[id^="tab-"]').forEach(el => el.classList.add('hidden'));
-        document.getElementById('tab-' + id).classList.remove('hidden');
-        document.getElementById('pageTitle').innerText = document.getElementById('nav-' + id).innerText.trim();
-        if(id === 'admin') loadUsers();
-    }
-
-    async function saveTpl() {
-        const txt = document.getElementById('templates').value;
-        await fetch('/api/save_templates', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({token: TOKEN, templates: txt})});
-        showToast("Шаблоны сохранены!");
-    }
-    async function saveDelay() {
-        const val = document.getElementById('delay').value;
-        await fetch('/api/save_delay', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({token: TOKEN, delay: val})});
-        showToast("Задержка обновлена!");
-    }
-    async function startSpam() {
-        const tg = document.getElementById('target').value;
-        if(!tg) return showToast("Укажи цель!", true);
-        await fetch('/api/start_spam', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({token: TOKEN, target: tg})});
-        showToast("🚀 Рассылка запущена!");
-    }
-    async function stopSpam() {
-        await fetch('/api/stop_spam', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({token: TOKEN})});
-        showToast("🛑 Остановлено!", true);
-    }
-
-    if(IS_ADMIN) {
-        async function loadUsers() {
-            const res = await fetch('/api/admin/users');
-            const users = await res.json();
-            const tb = document.getElementById('userList');
-            tb.innerHTML = '';
-            users.forEach(u => {
-                const tr = document.createElement('tr');
-                tr.innerHTML = `<td><b>${u.user_id}</b></td>
-                                <td>${u.phone || '<span style="color:var(--mut)">-</span>'}</td>
-                                <td><span style="color:${u.is_banned ? 'var(--err)' : 'var(--ok)'}; font-weight:700;"><i class="fa-solid ${u.is_banned ? 'fa-ban' : 'fa-check'}"></i> ${u.is_banned ? 'Забанен' : 'Активен'}</span></td>
-                                <td><button class="btn-sm ${u.is_banned ? 'btn-ok' : 'btn-danger'}" onclick="toggleBan(${u.user_id}, ${u.is_banned ? 0 : 1})"><i class="fa-solid ${u.is_banned ? 'fa-unlock' : 'fa-lock'}"></i> ${u.is_banned ? 'Разбанить' : 'Забанить'}</button></td>`;
-                tb.appendChild(tr);
-            });
-        }
-        async function toggleBan(uid, ban) {
-            await fetch('/api/admin/ban', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({uid: uid, ban: ban})});
-            loadUsers();
-            showToast(ban ? "Пользователь забанен" : "Пользователь разбанен", ban);
-        }
-    }
-
-    setInterval(async () => {
-        const res = await fetch(`/api/stats?token=${TOKEN}`);
-        if(res.ok) {
-            const data = await res.json();
-            document.getElementById('statSent').innerText = data.messages;
-            document.getElementById('statErr').innerText = data.errors;
-            document.getElementById('statFlood').innerText = data.floods;
-            document.getElementById('statUp').innerText = data.uptime;
-        }
-    }, 2000);
-</script>
-</body>
-</html>
-"""
-
-@app.route('/')
-def index(): return "Server is running."
-
-@app.route('/login')
-def login():
-    token = request.args.get('token')
-    if not token: return "403: No token provided"
-    return render_template_string(HTML_LOGIN, token=token)
-
-@app.route('/dashboard')
-def dashboard():
-    token = request.args.get('token')
-    loop = asyncio.new_event_loop()
-    p = loop.run_until_complete(get_user_by_token(token))
-    loop.close()
-    
-    if not p: return "403 ACCESS DENIED"
-    if p['is_banned']: return "403 YOU ARE BANNED"
-    
-    is_admin = p['user_id'] in ADMIN_IDS
-    return render_template_string(HTML_DASHBOARD, token=token, templates="\n".join(p['templates']), min_d=p['min_delay'], max_d=p['max_delay'], session=p['session'], is_admin=is_admin)
-
-# --- WEB API ---
-@app.route('/api/send_code', methods=['POST'])
-def api_send_code():
-    data = request.json
-    token, phone = data.get('token'), data.get('phone')
-    loop = asyncio.new_event_loop()
-    p = loop.run_until_complete(get_user_by_token(token))
-    
-    if not p: 
-        loop.close(); return jsonify({"status":"error","error":"Токен недействителен"})
-    if p['is_banned']: 
-        loop.close(); return jsonify({"status":"error","error":"Вы забанены"})
-    
+@app.route("/admin/action", methods=["POST"])
+@admin_required
+def admin_action():
+    admin_id = int(current_user()["user_id"])
     try:
-        client = TelegramClient(StringSession(), API_ID, API_HASH)
-        loop.run_until_complete(client.connect())
-        req = loop.run_until_complete(client.send_code_request(phone))
-        web_auth_cache[token] = {'client': client, 'phone': phone, 'hash': req.phone_code_hash, 'loop': loop}
-        return jsonify({"status":"ok"})
-    except Exception as e:
-        loop.close(); return jsonify({"status":"error","error": str(e)})
-
-@app.route('/api/verify_code', methods=['POST'])
-def api_verify_code():
-    data = request.json
-    token, code = data.get('token'), data.get('code')
-    if token not in web_auth_cache: return jsonify({"status":"error","error":"Сессия истекла"})
+        target_id = int(request.form.get("uid", ""))
+    except ValueError:
+        abort(400)
+    action = request.form.get("action")
+    if target_id in ADMIN_IDS:
+        abort(403)
+    mapping = {
+        "ban": ("is_banned", 1), "unban": ("is_banned", 0),
+        "disable": ("is_disabled", 1), "enable": ("is_disabled", 0),
+    }
+    if action not in mapping:
+        abort(400)
+    field, value = mapping[action]
+    with db() as conn:
+        conn.execute(f"UPDATE users SET {field}=? WHERE user_id=?", (value, target_id))
+        conn.execute("DELETE FROM web_sessions WHERE user_id=?", (target_id,))
+        conn.execute("INSERT INTO admin_logs(admin_id,target_id,action,created_at) VALUES(?,?,?,?)",
+                     (admin_id, target_id, action, utc_now()))
+        conn.commit()
     
-    c_data = web_auth_cache[token]
-    try:
-        loop = c_data['loop']
-        loop.run_until_complete(c_data['client'].sign_in(c_data['phone'], code=code, phone_code_hash=c_data['hash']))
-        session_str = c_data['client'].session.save()
-        me = loop.run_until_complete(c_data['client'].get_me())
+    # Если баним — останавливаем движок
+    if action in ("ban", "disable") and target_id in active_spam_engines:
+        active_spam_engines[target_id].is_active = False
+        del active_spam_engines[target_id]
         
-        loop.run_until_complete(save_user(me.id, session=session_str, phone=c_data['phone'], token=token))
-        del web_auth_cache[token]
-        return jsonify({"status":"ok"})
-    except Exception:
-        return jsonify({"status":"error","error":"Неверный код"})
+    return redirect("/admin")
 
-@app.route('/api/save_templates', methods=['POST'])
-def api_save_templates():
-    data = request.json
-    loop = asyncio.new_event_loop()
-    p = loop.run_until_complete(get_user_by_token(data.get('token')))
-    if p:
-        tpls = [l.strip() for l in data.get('templates','').split('\n') if l.strip()]
-        loop.run_until_complete(save_user(p['user_id'], templates=tpls))
-    loop.close()
-    return jsonify({"status":"ok"})
 
-@app.route('/api/save_delay', methods=['POST'])
-def api_save_delay():
-    data = request.json
-    loop = asyncio.new_event_loop()
-    p = loop.run_until_complete(get_user_by_token(data.get('token')))
-    if p:
-        try:
-            low, high = map(int, data.get('delay').split('-'))
-            loop.run_until_complete(save_user(p['user_id'], min_d=low, max_d=high))
-        except: pass
-    loop.close()
-    return jsonify({"status":"ok"})
+@app.route("/health")
+def health():
+    return jsonify(status="ok", service="titan-control")
 
-@app.route('/api/start_spam', methods=['POST'])
-def api_start_spam():
-    data = request.json
-    loop = asyncio.new_event_loop()
-    p = loop.run_until_complete(get_user_by_token(data.get('token')))
-    if p and not p['is_banned']:
-        eng = SpamEngine(p['user_id'], data.get('target'), p['templates'], p['min_delay'], p['max_delay'], p['session'])
-        spam_engines[p['user_id']] = eng
-        asyncio.run_coroutine_threadsafe(eng.run(), loop_manager)
-    loop.close()
-    return jsonify({"status":"ok"})
 
-@app.route('/api/stop_spam', methods=['POST'])
-def api_stop_spam():
-    data = request.json
-    loop = asyncio.new_event_loop()
-    p = loop.run_until_complete(get_user_by_token(data.get('token')))
-    if p and p['user_id'] in spam_engines:
-        spam_engines[p['user_id']].is_active = False
-        del spam_engines[p['user_id']]
-    loop.close()
-    return jsonify({"status":"ok"})
+@app.errorhandler(403)
+def forbidden(_):
+    return render_page("Доступ запрещён", "<div class='panel'><h1>403</h1><p>Нет доступа.</p></div>")
 
-@app.route('/api/stats')
-def api_stats():
-    return jsonify({"messages": system_metrics["total_messages_sent"], "errors": system_metrics["total_errors_caught"], "floods": system_metrics["flood_waits"], "uptime": str(datetime.datetime.now() - START_TIME).split('.')[0]})
 
-@app.route('/api/admin/users')
-def admin_users():
-    loop = asyncio.new_event_loop()
-    async def fetch():
-        async with aiosqlite.connect(DB_FILE) as db:
-            async with db.execute("SELECT user_id, phone, is_banned FROM users") as cursor:
-                return [{"user_id": r[0], "phone": r[1], "is_banned": r[2]} for r in await cursor.fetchall()]
-    users = loop.run_until_complete(fetch())
-    loop.close()
-    return jsonify(users)
+# ---------- TELEGRAM BOT ----------
+bot_client = TelegramClient("bot_saas", API_ID, API_HASH)
 
-@app.route('/api/admin/ban', methods=['POST'])
-def admin_ban():
-    data = request.json
-    uid, ban = data.get('uid'), data.get('ban')
-    loop = asyncio.new_event_loop()
-    loop.run_until_complete(save_user(uid, is_banned=ban))
-    if ban and uid in spam_engines:
-        spam_engines[uid].is_active = False
-        del spam_engines[uid]
-    loop.close()
-    return jsonify({"status":"ok"})
+@bot_client.on(events.NewMessage(pattern="/start"))
+async def bot_start(event):
+    uid = event.sender_id
+    user = get_user(uid)
+    if not user:
+        return await event.reply("Сначала авторизуйтесь на сайте: https://bot-1-dk7y.onrender.com")
+    await event.reply(f"Вы авторизованы. Ваш ID: {uid}\nСсылка на панель: https://bot-1-dk7y.onrender.com/dashboard")
 
-def run_flask():
-    port = int(os.environ.get('PORT', 8080))
-    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+def start_bot():
+    if not BOT_TOKEN:
+        print("BOT_TOKEN не задан. Бот не запущен.")
+        return
+    run_async(bot_client.start(bot_token=BOT_TOKEN))
+    print("Telegram бот запущен.")
+    run_async(bot_client.run_until_disconnected())
 
-# =====================================================================
-# 7. ЗАПУСК
-# =====================================================================
-loop_manager = asyncio.new_event_loop()
 
-async def main():
-    await init_db()
-    threading.Thread(target=run_flask, daemon=True).start()
-    asyncio.create_task(web_task_worker())
-    try:
-        await bot.start(bot_token=BOT_TOKEN)
-        await bot.run_until_disconnected()
-    except AccessTokenInvalidError:
-        while True: await asyncio.sleep(3600)
-
-if __name__ == '__main__':
-    asyncio.set_event_loop(loop_manager)
-    loop_manager.run_until_complete(main())
+if __name__ == "__main__":
+    # Запускаем бота в фоне (если задан токен)
+    threading.Thread(target=start_bot, daemon=True).start()
+    
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")), debug=False)
