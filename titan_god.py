@@ -1,18 +1,45 @@
 from telethon import TelegramClient, events, functions, types
 from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest
 from telethon.tl.functions.account import UpdateProfileRequest
-from telethon.errors import FloodWaitError
-import asyncio, random, re, os, datetime, string, json, urllib.parse, wikipediaapi, qrcode, pytz
-from PIL import Image
-from colorama import init, Fore
+from telethon.errors import FloodWaitError, SessionPasswordNeededError, UserAlreadyParticipantError
+import asyncio
+import random
+import re
+import os
+import datetime
+import string
+import json
+import urllib.parse
+import wikipediaapi
+import qrcode
+import pytz
+import glob
+from PIL import Image, ImageDraw, ImageFont
+from colorama import init, Fore, Style
 from flask import Flask
 import threading
 import aiohttp
 import yt_dlp
+import imageio_ffmpeg
 
+# Инициализация colorama для цветных логов
 init(autoreset=True)
 
-# --- ФЕЙКОВЫЙ ВЕБ-СЕРВЕР ДЛЯ RENDER ---
+# ==========================================
+# 1. НАСТРОЙКА FFMPEG (ДЛЯ ВИДЕО)
+# ==========================================
+# Скачиваем ffmpeg при старте, чтобы yt-dlp мог склеивать видео
+try:
+    os.environ["IMAGEIO_FFMPEG_EXE"] = imageio_ffmpeg.get_ffmpeg_exe()
+    FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+    print(f"[SYS] FFMPEG найден: {FFMPEG_PATH}")
+except Exception as e:
+    print(f"[ERROR] FFMPEG не найден: {e}")
+    FFMPEG_PATH = None
+
+# ==========================================
+# 2. ФЕЙКОВЫЙ ВЕБ-СЕРВЕР ДЛЯ RENDER
+# ==========================================
 app = Flask(__name__)
 
 @app.route('/')
@@ -23,36 +50,44 @@ def run_web():
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port)
 
-# --- КОНФИГУРАЦИЯ ---
+# ==========================================
+# 3. КОНФИГУРАЦИЯ БОТА
+# ==========================================
 API_ID = 2040
 API_HASH = 'b18441a1ff607e10a989891a5462e627'
 TEMPLATES_FILE = 'templates.json'
 
-# Глобальные переменные
+# Глобальные переменные (Турбо-режим по умолчанию)
 MESSAGES = []
-min_delay = 2000
-max_delay = 4000
+min_delay = 100
+max_delay = 300
 is_spamming = False
 targets = []
 afk_enabled = False
-afk_text = "Отошел, отвечу позже."
+afk_text = "Отошел."
 auto_reply_enabled = False
-auto_reply_text = "Занят, напишу позже."
+auto_reply_text = "Занят."
 
+# Клиент Telegram
 client = TelegramClient('my_account', API_ID, API_HASH)
 
-# --- ЛОГГИРОВАНИЕ ---
+# ==========================================
+# 4. ЛОГИРОВАНИЕ
+# ==========================================
 def log(tag, msg, color=Fore.WHITE):
     t = datetime.datetime.now().strftime("%H:%M:%S")
     print(f"{Fore.LIGHTBLACK_EX}[{t}]{Fore.RESET} {color}[{tag}]{Fore.RESET} {msg}")
 
-# --- РАБОТА С ФАЙЛАМИ ---
+# ==========================================
+# 5. РАБОТА С ФАЙЛАМИ
+# ==========================================
 def load_data():
     global MESSAGES
     if os.path.exists(TEMPLATES_FILE):
         try:
             with open(TEMPLATES_FILE, 'r', encoding='utf-8') as f:
                 MESSAGES = json.load(f)
+            log("SYS", f"Загружено {len(MESSAGES)} шаблонов", Fore.GREEN)
         except Exception as e:
             log("ERROR", f"Ошибка загрузки шаблонов: {e}", Fore.RED)
             MESSAGES = []
@@ -64,7 +99,9 @@ def save_templates():
     except Exception as e:
         log("ERROR", f"Ошибка сохранения: {e}", Fore.RED)
 
-# --- АСИНХРОННЫЕ ЗАПРОСЫ (БЕЗ БЛОКИРОВКИ СПАМА) ---
+# ==========================================
+# 6. АСИНХРОННЫЕ ЗАПРОСЫ (БЕЗ БЛОКИРОВКИ)
+# ==========================================
 async def fetch_url(url, headers=None):
     try:
         async with aiohttp.ClientSession() as session:
@@ -73,7 +110,9 @@ async def fetch_url(url, headers=None):
     except Exception as e:
         return f"ERROR: {e}"
 
-# --- ЦИКЛ СПАМА ---
+# ==========================================
+# 7. ЦИКЛ СПАМА (ТУРБО)
+# ==========================================
 async def spam_loop():
     global is_spamming, targets
     counter = 0
@@ -93,46 +132,34 @@ async def spam_loop():
 
             text = random.choice(MESSAGES)
             
-            # Анти-бан: эмуляция набора текста (иногда)
-            if random.random() > 0.5:
-                try:
-                    async with client.action(target, 'typing'):
-                        await asyncio.sleep(random.uniform(1.0, 2.5))
-                except: pass
-            
-            # Анти-бан: невидимый символ
-            if random.random() > 0.8:
+            # Анти-бан: невидимый символ для уникальности
+            if random.random() > 0.7: 
                 text += "\u200b"
                 
             await client.send_message(target, text)
             counter += 1
             log("SPAM", f"[{counter}] -> {target}", Fore.BLUE)
             
-            # Рандомная пауза
+            # Турбо-задержка
             wait_time = random.randint(min_delay, max_delay) / 1000.0
-            
-            # Иногда делаем "умную" паузу (как будто отвлеклись)
-            if random.random() > 0.9:
-                extra = random.uniform(5.0, 10.0)
-                log("SPAM", f"Пауза на подумать {extra:.1f}с", Fore.YELLOW)
-                wait_time += extra
-                
             await asyncio.sleep(wait_time)
             
         except FloodWaitError as e:
-            log("FLOOD", f"Бан на {e.seconds} секунд. Ждем...", Fore.RED)
+            log("FLOOD", f"Telegram выдал бан на {e.seconds} секунд. Ждем...", Fore.RED)
             await asyncio.sleep(e.seconds + 5)
         except Exception as e:
-            log("ERROR", f"Сбой отправки: {e}", Fore.RED)
+            log("ERROR", f"Сбой отправки на {target}: {e}", Fore.RED)
             if targets: targets.pop(0)
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
 
-# --- ОСНОВНОЙ ОБРАБОТЧИК КОМАНД ---
+# ==========================================
+# 8. ОБРАБОТЧИК КОМАНД
+# ==========================================
 @client.on(events.NewMessage(outgoing=True))
 async def handler(e):
     global MESSAGES, min_delay, max_delay, is_spamming, targets, afk_enabled, afk_text, auto_reply_enabled, auto_reply_text
     
-    # Загрузка файлов
+    # --- ЗАГРУЗКА ШАБЛОНОВ ФАЙЛОМ ---
     if e.document and e.document.mime_type == 'text/plain' and e.text and e.text.strip().startswith('.шаблоны'):
         await e.edit("📥 Читаю файл...")
         try:
@@ -143,16 +170,18 @@ async def handler(e):
             MESSAGES = [line.strip() for line in content.split('\n') if line.strip()]
             save_templates()
             await e.edit(f"✅ Из файла загружено {len(MESSAGES)} шаблонов!")
-        except Exception as ex: await e.edit(f"❌ Ошибка: {ex}")
+        except Exception as ex: 
+            await e.edit(f"❌ Ошибка чтения файла: {ex}")
         return
 
     if not e.text or not e.text.startswith('.'): return
+    
     text = e.text[1:]
     parts = text.split(' ', 1)
     cmd = parts[0].lower()
     arg = parts[1] if len(parts) > 1 else ""
 
-    # --- СПАМ ---
+    # --- БАЗОВЫЕ КОМАНДЫ ---
     if cmd == 'шаблоны':
         if not arg.strip(): return await e.edit("❌ Текст пуст!")
         MESSAGES = [line.strip() for line in arg.split('\n') if line.strip()]
@@ -165,7 +194,7 @@ async def handler(e):
         if not is_spamming:
             is_spamming = True
             asyncio.create_task(spam_loop())
-            await e.edit(f"🚀 Запуск по {len(targets)} целям")
+            await e.edit(f"🚀 Ебашу по {len(targets)}")
         else:
             await e.edit("⚠️ Уже работает")
 
@@ -178,9 +207,10 @@ async def handler(e):
             if '-' in arg: min_delay, max_delay = map(int, arg.split('-'))
             else: min_delay = max_delay = int(arg)
             await e.edit(f"⏳ Задержка: {min_delay}-{max_delay} мс")
-        except: await e.edit("❌ Ошибка формата")
+        except: 
+            await e.edit("❌ Ошибка формата. Пример: .задержка 1000-2000")
 
-    # --- ИИ И УТИЛИТЫ ---
+    # --- НЕЙРОСЕТИ ---
     elif cmd == 'gpt':
         if not arg: return await e.edit("❌ Задай вопрос")
         await e.edit("🤖 Думаю...")
@@ -197,20 +227,40 @@ async def handler(e):
             img_url = f"https://image.pollinations.ai/prompt/{urllib.parse.quote(arg)}?width=1024&height=1024&nologo=true"
             await client.send_file(e.chat_id, img_url, caption=f"Запрос: {arg}")
             await e.delete()
-        except Exception as ex: await e.edit(f"❌ Ошибка: {ex}")
+        except Exception as ex: 
+            await e.edit(f"❌ Ошибка: {ex}")
 
-    elif cmd == 'погода':
-        if not arg: return await e.edit("❌ Укажи город")
-        r = await fetch_url(f"https://wttr.in/{urllib.parse.quote(arg)}?format=%C+%t")
-        await e.edit(f"🌤 `{r}`", parse_mode='md')
-
-    elif cmd == 'курс':
-        await e.edit("💱 Загружаю...")
-        r = await fetch_url("https://www.cbr-xml-daily.ru/daily_json.js")
+    # --- СКАЧИВАНИЕ ---
+    elif cmd == 'скачать':
+        if not arg: return await e.edit("❌ Укажи ссылку")
+        await e.edit("📥 Качаю видео (это займет время)...")
+        
+        for f in glob.glob("video.*"): os.remove(f)
+        
         try:
-            data = json.loads(r)['Valute']
-            await e.edit(f"💵 USD: `{data['USD']['Value']}`\n💶 EUR: `{data['EUR']['Value']}`", parse_mode='md')
-        except: await e.edit("❌ Ошибка загрузки")
+            ydl_opts = {
+                'format': 'best[ext=mp4]/best',
+                'outtmpl': 'video.%(ext)s',
+                'quiet': True,
+                'ffmpeg_location': FFMPEG_PATH
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([arg.strip()])
+            
+            downloaded = glob.glob("video.*")
+            if not downloaded: raise Exception("Файл не найден")
+                
+            file_path = downloaded[0]
+            file_size = os.path.getsize(file_path) / (1024 * 1024)
+            
+            if file_size > 50:
+                await e.edit(f"⚠️ Видео {file_size:.1f} МБ. Telegram может не пропустить...")
+                
+            await client.send_file(e.chat_id, file_path, caption=f"Видео готово ({file_size:.1f} МБ)")
+            os.remove(file_path)
+            await e.delete()
+        except Exception as ex:
+            await e.edit(f"❌ Ошибка: {ex}")
 
     # --- ТРОЛЛИНГ И ОСИНТ ---
     elif cmd == 'вики':
@@ -222,7 +272,8 @@ async def handler(e):
             if not page.exists(): return await e.edit("❌ Не найдено.")
             msg = f"**{page.title}**\n\n{page.summary[:1000]}\n\n[Читать]({page.fullurl})"
             await e.edit(msg, parse_mode='md', link_preview=False)
-        except Exception as ex: await e.edit(f"❌ Ошибка: {ex}")
+        except Exception as ex: 
+            await e.edit(f"❌ Ошибка: {ex}")
 
     elif cmd == 'парсинг':
         if not arg: return await e.edit("❌ Укажи ссылку на группу")
@@ -234,55 +285,36 @@ async def handler(e):
             with open('users.txt', 'w') as f: f.write('\n'.join(users))
             await client.send_file(e.chat_id, 'users.txt', caption=f"✅ Собрано: {len(users)}")
             await e.delete()
-        except Exception as ex: await e.edit(f"❌ Ошибка: {ex}")
+        except Exception as ex: 
+            await e.edit(f"❌ Ошибка: {ex}")
 
     elif cmd == 'инфо':
         if not arg: return await e.edit("❌ Укажи юзера")
         try:
             u = await client.get_entity(arg.strip())
             await e.edit(f"**ID:** `{u.id}`\n**Ник:** `@{u.username}`\n**Био:** {u.about if hasattr(u, 'about') else 'Нет'}")
-        except: await e.edit("❌ Не найден")
+        except: 
+            await e.edit("❌ Не найден")
 
-    # --- МЕДИА ---
-    elif cmd == 'скачать':
-        if not arg: return await e.edit("❌ Укажи ссылку")
-        await e.edit("📥 Качаю видео (может занять время)...")
+    # --- УТИЛИТЫ ---
+    elif cmd == 'погода':
+        if not arg: return await e.edit("❌ Укажи город")
+        r = await fetch_url(f"https://wttr.in/{urllib.parse.quote(arg)}?format=%C+%t")
+        await e.edit(f"🌤 `{r}`", parse_mode='md')
+
+    elif cmd == 'курс':
+        await e.edit("💱 Загружаю...")
+        r = await fetch_url("https://www.cbr-xml-daily.ru/daily_json.js")
         try:
-            ydl_opts = {'format': 'best[ext=mp4]', 'outtmpl': 'v.%(ext)s', 'quiet': True}
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl: ydl.download([arg.strip()])
-            for f in os.listdir('.'):
-                if f.startswith('v.'):
-                    await client.send_file(e.chat_id, f)
-                    os.remove(f)
-                    break
-            await e.delete()
-        except Exception as ex: await e.edit(f"❌ Ошибка: {ex} (возможно, нужен ffmpeg)")
+            data = json.loads(r)['Valute']
+            await e.edit(f"💵 USD: `{data['USD']['Value']}`\n💶 EUR: `{data['EUR']['Value']}`", parse_mode='md')
+        except: 
+            await e.edit("❌ Ошибка загрузки")
 
-    elif cmd == 'музыка':
-        if not arg: return await e.edit("❌ Укажи ссылку")
-        await e.edit("🎵 Качаю MP3...")
-        try:
-            ydl_opts = {'format': 'bestaudio', 'outtmpl': 'm.%(ext)s', 'quiet': True}
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl: ydl.download([arg.strip()])
-            for f in os.listdir('.'):
-                if f.startswith('m.'):
-                    await client.send_file(e.chat_id, f)
-                    os.remove(f)
-                    break
-            await e.delete()
-        except: await e.edit("❌ Ошибка скачивания")
-
-    # --- АККАУНТ ---
     elif cmd == 'профиль':
         me = await client.get_me()
         await e.edit(f"**ID:** `{me.id}`\n**Имя:** `{me.first_name}`\n**Ник:** `@{me.username}`")
 
-    elif cmd == 'био':
-        try:
-            await client(UpdateProfileRequest(about=arg)); await e.edit("✅ Био обновлено")
-        except: await e.edit("❌ Ошибка")
-
-    # --- АВТООТВЕТ ---
     elif cmd == 'афк':
         if arg == 'выкл': afk_enabled = False; await e.edit("🔕 АФК выкл")
         else: afk_text = arg or "Отошел"; afk_enabled = True; await e.edit(f"🔔 АФК: {afk_text}")
@@ -297,7 +329,7 @@ async def handler(e):
         await e.edit(f"`{(datetime.datetime.now() - s).microseconds / 1000:.1f} мс`")
 
     elif cmd == 'хелп':
-        await e.edit("**TITAN v21.0**\n.шаблоны, .спам, .стоп, .задержка\n.gpt, .картинка, .вики\n.профиль, .био, .парсинг, .инфо\n.скачать, .музыка\n.погода, .курс, .пинг\n.афк, .автоответ")
+        await e.edit("**TITAN v25.0**\n.шаблоны, .спам, .стоп, .задержка\n.gpt, .картинка, .вики\n.скачать, .парсинг, .инфо\n.профиль, .погода, .курс, .пинг\n.афк, .автоответ")
 
 # --- АВТООТВЕТЧИК ---
 @client.on(events.NewMessage(incoming=True))
@@ -310,22 +342,21 @@ async def handler_auto(e):
             try: await e.reply(auto_reply_text)
             except: pass
 
-# --- ЗАПУСК ---
+# ==========================================
+# ЗАПУСК БОТА
+# ==========================================
 async def main():
     print(f"{Fore.CYAN}{'='*45}{Fore.RESET}")
-    print(f"{Fore.CYAN}      TITAN v21.0 (MEGA RENDER)          {Fore.RESET}")
+    print(f"{Fore.CYAN}      TITAN v25.0 (MEGA RENDER)          {Fore.RESET}")
     print(f"{Fore.CYAN}{'='*45}{Fore.RESET}")
     
     load_data()
-    log("SYS", f"Загружено шаблонов: {len(MESSAGES)}", Fore.GREEN)
-    
-    # Запуск фейкового веб-сервера в отдельном потоке
     threading.Thread(target=run_web, daemon=True).start()
-    log("SYS", "Веб-сервер для Render запущен", Fore.GREEN)
+    log("SYS", "Фейковый сервер запущен", Fore.GREEN)
     
     try:
         await client.start()
-        log("SYS", "Бот успешно подключен к Telegram", Fore.GREEN)
+        log("SYS", "Бот подключен к Telegram", Fore.GREEN)
         await client.run_until_disconnected()
     except Exception as e:
         log("FATAL", f"Критическая ошибка: {e}", Fore.RED)
