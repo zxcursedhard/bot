@@ -8,50 +8,39 @@ import asyncio
 import random
 from datetime import datetime, timezone
 from functools import wraps
-
-from flask import (
-    Flask, request, jsonify, render_template_string, redirect, url_for, session, abort
-)
+from flask import Flask, request, jsonify, render_template_string, redirect, url_for, session, abort
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
-from telethon.errors import (
-    SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError, FloodWaitError
-)
+from telethon.errors import SessionPasswordNeededError, FloodWaitError
 
 # =====================================================================
-# 1. КОНФИГУРАЦИЯ
+# 1. НАСТРОЙКИ И ЛОГИРОВАНИЕ
 # =====================================================================
+def log_msg(msg):
+    print(msg, flush=True)
+    with open("bot_debug.log", "a", encoding="utf-8") as f:
+        f.write(f"{datetime.now()} - {msg}\n")
+
 API_ID = int(os.environ.get("API_ID", "2040"))
 API_HASH = os.environ.get("API_HASH", "b18441a1ff607e10a989891a5462e627")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8885567581:AAEDY44uIQw5W09dzGA0IFSZUMa05uHd4fI")
-FLASK_SECRET_KEY = os.environ.get("FLASK_SECRET_KEY") or secrets.token_hex(32)
-
-# ID Админов (твои аккаунты)
 ADMIN_IDS = {int(x.strip()) for x in os.environ.get("ADMIN_IDS", "9058235147,8773171051").split(",") if x.strip().isdigit()}
-
 DB_PATH = "titan_saas.db"
-AUTH_FLOW_TTL = 600
-MIN_DELAY_SECONDS = 3.0
-MAX_TEMPLATE_LINES = 9999
+
+# Твой АКТУАЛЬНЫЙ домен на Render
+BASE_URL = "https://bot-1-i2nc.onrender.com"
 
 app = Flask(__name__)
-app.secret_key = FLASK_SECRET_KEY
-app.config.update(
-    SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=False, 
-    PERMANENT_SESSION_LIFETIME=60 * 60 * 12,
-)
+app.secret_key = secrets.token_hex(32)
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SECURE=False)
 
 # =====================================================================
-# 2. ЕДИНЫЙ АСИНХРОННЫЙ ЦИКЛ ДЛЯ TELETHON (БОТ И СПАМ)
+# 2. АСИНХРОННЫЙ ЦИКЛ
 # =====================================================================
 async_loop = asyncio.new_event_loop()
-
 def start_async_loop(loop):
     asyncio.set_event_loop(loop)
     loop.run_forever()
-
 threading.Thread(target=start_async_loop, args=(async_loop,), daemon=True).start()
 
 def run_async(coro, timeout=45):
@@ -59,20 +48,17 @@ def run_async(coro, timeout=45):
     return future.result(timeout=timeout)
 
 # =====================================================================
-# 3. БАЗА ДАННЫХ (SQLITE)
+# 3. БАЗА ДАННЫХ
 # =====================================================================
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY, phone TEXT, session_string TEXT,
-                templates TEXT NOT NULL DEFAULT '[]', min_delay REAL NOT NULL DEFAULT 3.0,
-                max_delay REAL NOT NULL DEFAULT 5.0, is_banned INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL
-            )
-        """)
+        conn.execute("""CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY, phone TEXT, session_string TEXT,
+            templates TEXT NOT NULL DEFAULT '[]', min_delay REAL NOT NULL DEFAULT 3.0,
+            max_delay REAL NOT NULL DEFAULT 5.0, is_banned INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        )""")
         conn.commit()
-
 init_db()
 
 def get_user(user_id):
@@ -89,13 +75,6 @@ def save_user(user_id, phone, session_string):
             conn.execute("INSERT INTO users(user_id, phone, session_string, created_at) VALUES(?,?,?,?)", (user_id, phone, session_string, datetime.now(timezone.utc).isoformat()))
         conn.commit()
 
-def get_web_token(token):
-    # Для простоты токены храним в памяти (сбрасываются при рестарте)
-    return globals().get(f"web_token_{token}")
-
-def set_web_token(token, uid):
-    globals()[f"web_token_{token}"] = uid
-
 def current_user():
     uid = session.get("uid")
     if not uid: return None
@@ -108,7 +87,7 @@ def current_user():
 def login_required(fn):
     @wraps(fn)
     def wrapped(*args, **kwargs):
-        if not current_user(): return redirect(url_for("login_page"))
+        if not current_user(): return redirect("/login")
         return fn(*args, **kwargs)
     return wrapped
 
@@ -129,17 +108,19 @@ async def spam_worker(uid, target, templates, max_delay, session_str):
     client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
     await client.connect()
     active_spam_engines[uid] = True
+    log_msg(f"Запущен спам {uid} -> {target}")
     
     try:
         while active_spam_engines.get(uid):
             try:
                 text = random.choice(templates) + "\u200b"
                 await client.send_message(target, text)
-                await asyncio.sleep(random.uniform(MIN_DELAY_SECONDS, max_delay))
+                await asyncio.sleep(random.uniform(3.0, max_delay))
             except FloodWaitError as e:
+                log_msg(f"Флуд на {e.seconds} сек.")
                 await asyncio.sleep(e.seconds + 5)
             except Exception as e:
-                print(f"Ошибка спама {uid}: {e}")
+                log_msg(f"Ошибка спама {uid}: {e}")
                 break
     finally:
         await client.disconnect()
@@ -147,7 +128,7 @@ async def spam_worker(uid, target, templates, max_delay, session_str):
             del active_spam_engines[uid]
 
 # =====================================================================
-# 5. TELEGRAM БОТ
+# 5. БОТ
 # =====================================================================
 bot = TelegramClient("bot_saas", API_ID, API_HASH)
 
@@ -155,47 +136,39 @@ bot = TelegramClient("bot_saas", API_ID, API_HASH)
 async def bot_start(event):
     uid = event.sender_id
     is_admin = uid in ADMIN_IDS
-    
     token = secrets.token_urlsafe(16)
-    set_web_token(token, uid)
-    
-    link = f"https://bot-1-dk7y.onrender.com/login?token={token}"
+    globals()[f"web_token_{token}"] = uid
+    link = f"{BASE_URL}/login?token={token}"
     
     buttons = [[Button.url("🌐 Войти в панель", link)]]
     if is_admin:
         buttons.append([Button.inline("👑 Дать доступ", b"gen_invite")])
 
-    text = (
-        f"⚡ **TITAN Enterprise**\n\n"
-        f"Ваш ID: `{uid}`\n"
-        f"Статус: {'Администратор' if is_admin else 'Пользователь'}\n\n"
-        f"Нажмите кнопку ниже для входа в панель."
-    )
-    await event.reply(text, buttons=buttons, parse_mode='md')
+    await event.reply(f"⚡ **TITAN Enterprise**\nВаш ID: `{uid}`\nСтатус: {'Админ' if is_admin else 'Пользователь'}", buttons=buttons, parse_mode='md')
 
 @bot.on(events.CallbackQuery)
 async def bot_callback(event):
     if event.sender_id not in ADMIN_IDS:
         return await event.answer("Доступ только для админа!", alert=True)
-    
     if event.data == b"gen_invite":
         token = secrets.token_urlsafe(16)
-        link = f"https://bot-1-dk7y.onrender.com/login?invite={token}"
+        link = f"{BASE_URL}/login?invite={token}"
         await event.reply(f"🔗 **Ссылка для друга:**\n`{link}`", parse_mode='md')
 
 def start_bot_thread():
+    log_msg(">>> ЗАПУСК БОТА...")
     if not BOT_TOKEN: return
     try:
         bot.start(bot_token=BOT_TOKEN)
-        print(">>> БОТ УСПЕШНО ЗАПУЩЕН!")
+        log_msg(">>> БОТ УСПЕШНО ЗАПУЩЕН!")
         bot.run_until_disconnected()
     except Exception as e:
-        print(f">>> ОШИБКА БОТА: {e}")
+        log_msg(f">>> КРИТИЧЕСКАЯ ОШИБКА: {e}")
 
 threading.Thread(target=start_bot_thread, daemon=True).start()
 
 # =====================================================================
-# 6. UI (HTML/CSS) - ДИЗАЙН КАК ТЫ ПРОСИЛ
+# 6. UI (ДИЗАЙН)
 # =====================================================================
 BASE_HTML = r"""
 <!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -231,7 +204,6 @@ def inject_admins(): return {"admins": ADMIN_IDS}
 def render_page(title, content, user=None):
     return render_template_string(BASE_HTML, title=title, content=content, user=user)
 
-# ==================== СТРАНИЦА ВХОДА ====================
 HOME = r"""
 <div class="panel" style="max-width:520px;margin:8vh auto">
 <h1>Вход в TITAN</h1><p class="sub">Подключение Telegram-аккаунта.</p>
@@ -253,7 +225,6 @@ if(d.status==='ok'){location.href='/dashboard'}else{msg.className='error';msg.te
 </script>
 """
 
-# ==================== ДАШБОРД ====================
 DASHBOARD = r"""
 <h1>Панель управления</h1><p class="sub">Аккаунт подключён.</p>
 <div class="grid">
@@ -283,7 +254,6 @@ async function stopSpam(){await post('/api/spam/stop',{});document.getElementByI
 </script>
 """
 
-# ==================== АДМИНКА ====================
 ADMIN_PAGE = r"""
 <h1>Админ-панель</h1>
 <div class="panel">
@@ -299,12 +269,12 @@ ADMIN_PAGE = r"""
 </table>
 </div>
 <script>
-async function genInvite(){let r=await fetch('/admin/gen_invite', {method:'POST'});let d=await r.json();document.getElementById('invite_link').innerHTML = `Ссылка: <b>https://bot-1-dk7y.onrender.com/login?invite=${d.token}</b>`;}
+async function genInvite(){let r=await fetch('/admin/gen_invite', {method:'POST'});let d=await r.json();document.getElementById('invite_link').innerHTML = `Ссылка: <b>{{ base_url }}/login?invite=${d.token}</b>`;}
 </script>
 """
 
 # =====================================================================
-# 7. FLASK МАРШРУТЫ
+# 7. МАРШРУТЫ
 # =====================================================================
 @app.route("/")
 @app.route("/login")
@@ -326,16 +296,13 @@ def admin():
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         users = conn.execute("SELECT * FROM users ORDER BY user_id DESC").fetchall()
-    return render_page("Админка", render_template_string(ADMIN_PAGE, users=users), user=current_user())
+    return render_page("Админка", render_template_string(ADMIN_PAGE, users=users, base_url=BASE_URL), user=current_user())
 
 @app.route("/logout")
 def logout():
     session.clear()
     return redirect("/login")
 
-# =====================================================================
-# 8. API МАРШРУТЫ
-# =====================================================================
 @app.route("/api/send-code", methods=["POST"])
 def api_send_code():
     data = request.json
@@ -378,7 +345,7 @@ def api_verify_code():
     try:
         res = run_async(_verify())
         if isinstance(res, dict) and res.get("need_password"):
-             return jsonify(status="error", error="Нужен пароль 2FA (введите его и нажмите Войти)")
+             return jsonify(status="error", error="Нужен пароль 2FA")
         
         save_user(res["uid"], phone, res["sess"])
         session["uid"] = res["uid"]
@@ -412,18 +379,13 @@ def api_templates():
 def api_spam_start():
     uid = session["uid"]
     if uid in active_spam_engines: return jsonify(status="error", error="Уже запущено")
-    
     target = request.json.get("target")
     user = get_user(uid)
     tpls = json.loads(user["templates"])
-    
     if not tpls: return jsonify(status="error", error="Нет шаблонов")
     if not user["session_string"]: return jsonify(status="error", error="Нет сессии")
     
-    asyncio.run_coroutine_threadsafe(
-        spam_worker(uid, target, tpls, user["max_delay"], user["session_string"]), 
-        async_loop
-    )
+    asyncio.run_coroutine_threadsafe(spam_worker(uid, target, tpls, user["max_delay"], user["session_string"]), async_loop)
     return jsonify(status="ok")
 
 @app.route("/api/spam/stop", methods=["POST"])
