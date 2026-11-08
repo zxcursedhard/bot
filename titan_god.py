@@ -36,7 +36,7 @@ from telethon.errors import (
 # ---------- Configuration ----------
 API_ID = int(os.environ.get("API_ID", "2040"))
 API_HASH = os.environ.get("API_HASH", "b18441a1ff607e10a9898915462e627")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")  # set a freshly rotated token in Render
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8885567581:AAEDY44uIQw5W09dzGA0IFSZUMa05uHd4fI")  # set a freshly rotated token in Render
 FLASK_SECRET_KEY = os.environ.get("FLASK_SECRET_KEY") or secrets.token_hex(32)
 ADMIN_IDS = {
     int(x.strip()) for x in os.environ.get(
