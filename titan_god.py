@@ -8,7 +8,6 @@ import datetime
 import threading
 import shutil
 import csv
-import urllib.parse
 from colorama import init, Fore, Style
 from flask import Flask, jsonify, render_template_string
 import aiosqlite
@@ -513,7 +512,7 @@ async def main():
     
     try:
         await bot.start(bot_token=BOT_TOKEN)
-        TitanLogger.info("Бот успешно подключен к Telegram.", Fore.GREEN)
+        TitanLogger.info("Бот успешно подключен к Telegram.")
         await bot.run_until_disconnected()
     except AccessTokenInvalidError:
         TitanLogger.error("!!! НЕВЕРНЫЙ ТОКЕН БОТА !!!")
@@ -528,9 +527,11 @@ def start_async():
     loop.run_until_complete(main())
 
 if __name__ == '__main__':
-    TitanLogger.info("==========================================================", Fore.MAGENTA)
-    TitanLogger.info("   STARTING TITAN CENTRAL INDUSTRIAL DISTRIBUTION SYSTEM  ", Fore.MAGENTA)
-    TitanLogger.info("==========================================================", Fore.MAGENTA)
+    # ИСПРАВЛЕНА ОШИБКА С АРГУМЕНТАМИ В ЛОГГЕРЕ
+    TitanLogger.log("SYS", "==========================================================", Fore.MAGENTA)
+    TitanLogger.log("SYS", "   STARTING TITAN CENTRAL INDUSTRIAL DISTRIBUTION SYSTEM  ", Fore.MAGENTA)
+    TitanLogger.log("SYS", "==========================================================", Fore.MAGENTA)
+    
     threading.Thread(target=run_web, daemon=True).start()
     TitanLogger.info("Служба удержания HTTP-трафика развернута на порту 8080.")
     start_async()
