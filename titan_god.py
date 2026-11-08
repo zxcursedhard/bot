@@ -1,6 +1,7 @@
 from telethon import TelegramClient, events, functions, types, Button
-from telethon.errors import FloodWaitError
-import asyncio, random, re, os, datetime, json, urllib.parse, wikipediaapi, qrcode, glob
+from telethon.sessions import StringSession
+from telethon.errors import FloodWaitError, SessionPasswordNeededError
+import asyncio, random, re, os, datetime, json, urllib.parse, wikipediaapi, qrcode, glob, aiosqlite
 from colorama import init, Fore
 from flask import Flask
 import threading
@@ -10,17 +11,19 @@ import imageio_ffmpeg
 
 init(autoreset=True)
 
+# --- FFMPEG ---
 try:
     os.environ["IMAGEIO_FFMPEG_EXE"] = imageio_ffmpeg.get_ffmpeg_exe()
     FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 except:
     FFMPEG_PATH = None
 
+# --- ВЕБ-СЕРВЕР ДЛЯ RENDER ---
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "TITAN BOT IS ALIVE!"
+    return "TITAN MULTI-TENANT IS ALIVE!"
 
 def run_web():
     port = int(os.environ.get('PORT', 8080))
@@ -31,275 +34,254 @@ API_ID = 2040
 API_HASH = 'b18441a1ff607e10a989891a5462e627'
 BOT_TOKEN = '8732669492:AAF5bx9JLRqKfyGx0TXf4u5KVj18n4d4wYs'
 
-TEMPLATES_FILE = 'templates.json'
-CONFIG_FILE = 'config.json'
+# --- БАЗА ДАННЫХ ---
+DB_FILE = 'titan_database.db'
 
-MESSAGES = []
-min_delay = 100
-max_delay = 300
-is_spamming = False
-targets = []
+# Клиенты (основной бот)
+bot = TelegramClient('bot_master', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
-# --- ДВА КЛИЕНТА ---
-# 1. Юзербот (твой аккаунт)
-userbot = TelegramClient('my_account', API_ID, API_HASH)
-# 2. Бот-настройщик (через токен)
-bot = TelegramClient('bot_account', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
+# Словарь для хранения активных сессий (чтобы не переподключаться каждый раз)
+active_clients = {}
 
 def log(tag, msg, color=Fore.WHITE):
     t = datetime.datetime.now().strftime("%H:%M:%S")
     print(f"{Fore.LIGHTBLACK_EX}[{t}]{Fore.RESET} {color}[{tag}]{Fore.RESET} {msg}")
 
-def load_data():
-    global MESSAGES, min_delay, max_delay
-    if os.path.exists(TEMPLATES_FILE):
-        try:
-            with open(TEMPLATES_FILE, 'r', encoding='utf-8') as f:
-                MESSAGES = json.load(f)
-        except: pass
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                cfg = json.load(f)
-                min_delay = cfg.get('min_delay', 100)
-                max_delay = cfg.get('max_delay', 300)
-        except: pass
+# --- ИНИЦИАЛИЗАЦИЯ БАЗЫ ---
+async def init_db():
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                session_string TEXT,
+                templates TEXT,
+                min_delay INTEGER DEFAULT 100,
+                max_delay INTEGER DEFAULT 300
+            )
+        ''')
+        await db.commit()
 
-def save_templates():
-    try:
-        with open(TEMPLATES_FILE, 'w', encoding='utf-8') as f:
-            json.dump(MESSAGES, f, ensure_ascii=False, indent=2)
-    except: pass
+async def get_user_data(user_id):
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute("SELECT session_string, templates, min_delay, max_delay FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return {
+                    'session': row[0],
+                    'templates': json.loads(row[1]) if row[1] else [],
+                    'min_delay': row[2],
+                    'max_delay': row[3]
+                }
+    return None
 
-def save_config():
-    try:
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump({'min_delay': min_delay, 'max_delay': max_delay}, f)
-    except: pass
+async def save_user_data(user_id, session, templates, min_delay, max_delay):
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute('''
+            INSERT INTO users (user_id, session_string, templates, min_delay, max_delay)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+            session_string=excluded.session_string,
+            templates=excluded.templates,
+            min_delay=excluded.min_delay,
+            max_delay=excluded.max_delay
+        ''', (user_id, session, json.dumps(templates), min_delay, max_delay))
+        await db.commit()
 
-async def fetch_url(url, headers=None):
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=15) as response:
-                return await response.text()
-    except Exception as e:
-        return f"ERROR: {e}"
+# --- ПОЛУЧЕНИЕ КЛИЕНТА ПОЛЬЗОВАТЕЛЯ ---
+async def get_user_client(user_id):
+    if user_id in active_clients:
+        return active_clients[user_id]
+    
+    data = await get_user_data(user_id)
+    if not data or not data['session']:
+        return None
+    
+    client = TelegramClient(StringSession(data['session']), API_ID, API_HASH)
+    await client.connect()
+    active_clients[user_id] = client
+    return client
 
-# --- СПАМ ЧЕРЕЗ ЮЗЕРБОТА ---
-async def spam_single_target(target):
-    global is_spamming
+# --- СПАМ-ЛОГИКА (ДЛЯ КОНКРЕТНОГО ПОЛЬЗОВАТЕЛЯ) ---
+async def spam_single_target(user_id, target, message_list, min_d, max_d):
+    client = await get_user_client(user_id)
+    if not client: return
+    
     counter = 0
-    while is_spamming:
+    # Флаг остановки (можно добавить в базу, но для простоты проверяем существует ли клиент)
+    while user_id in active_clients:
         try:
-            if not MESSAGES: break
-            text = random.choice(MESSAGES)
+            if not message_list: break
+            text = random.choice(message_list)
             if random.random() > 0.7: text += "\u200b"
             
-            await userbot.send_message(target, text)
+            await client.send_message(target, text)
             counter += 1
-            log("SPAM", f"[{counter}] -> {target}", Fore.BLUE)
+            log("SPAM", f"[{user_id}] [{counter}] -> {target}", Fore.BLUE)
             
-            await asyncio.sleep(random.randint(min_delay, max_delay) / 1000.0)
+            await asyncio.sleep(random.randint(min_d, max_d) / 1000.0)
         except FloodWaitError as e:
-            log("FLOOD", f"Бан {e.seconds}с", Fore.RED)
+            log("FLOOD", f"[{user_id}] Бан {e.seconds}с", Fore.RED)
             await asyncio.sleep(e.seconds + 5)
         except Exception as e:
-            log("ERROR", f"Сбой: {e}", Fore.RED)
+            log("ERROR", f"[{user_id}] Сбой: {e}", Fore.RED)
             break
 
-async def spam_loop():
-    global is_spamming, targets
-    if not targets:
-        is_spamming = False
-        return
-    log("SPAM", f"Запуск по {len(targets)}", Fore.YELLOW)
-    tasks = [asyncio.create_task(spam_single_target(t)) for t in targets]
-    await asyncio.gather(*tasks)
-    is_spamming = False
-    log("SPAM", "Потоки завершены.", Fore.YELLOW)
-
-# --- МЕНЮ БОТА-НАСТРОЙЩИКА ---
-def get_menu():
-    buttons = [
-        [Button.inline("📝 Шаблоны", b"templates"), Button.inline("⚙️ Задержка", b"delay")],
-        [Button.inline("🚀 Запустить спам", b"start_spam"), Button.inline("🛑 Остановить", b"stop_spam")],
-        [Button.inline("📊 Статистика", b"stats")]
+# --- МЕНЮ ---
+def get_main_menu():
+    return [
+        [Button.inline("👤 Мой аккаунт", b"my_account"), Button.inline("📝 Шаблоны", b"templates")],
+        [Button.inline("⚙️ Задержка", b"delay"), Button.inline("🚀 Запустить", b"start_spam")],
+        [Button.inline("🛑 Остановить", b"stop_spam")]
     ]
-    return buttons
 
 @bot.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
+    user_id = event.sender_id
+    data = await get_user_data(user_id)
+    
+    status = "❌ Не подключен" if not data or not data['session'] else "✅ Подключен"
+    
     await event.reply(
-        f"👋 **TITAN Setup Panel**\n\n"
-        f"Шаблонов: `{len(MESSAGES)}`\n"
-        f"Задержка: `{min_delay}-{max_delay} мс`\n"
-        f"Статус: `{'Активен' if is_spamming else 'Выключен'}`",
-        buttons=get_menu(),
+        f"👋 **TITAN Multi-Account Panel**\n\n"
+        f"Статус аккаунта: {status}\n\n"
+        f"Выбери действие:",
+        buttons=get_main_menu(),
         parse_mode='md'
     )
 
 @bot.on(events.CallbackQuery)
 async def callback_handler(event):
-    global is_spamming, targets, min_delay, max_delay, MESSAGES
+    user_id = event.sender_id
+    data = await get_user_data(user_id)
+    s_data = data if data else {'session': None, 'templates': [], 'min_delay': 100, 'max_delay': 300}
     
-    data = event.data.decode('utf-8')
+    cb_data = event.data.decode('utf-8')
     
-    if data == "templates":
-        text = "\n".join([f"{i+1}. {m}" for i, m in enumerate(MESSAGES[:10])])
-        await event.edit(f"📝 **Шаблоны (первые 10):**\n\n{text}", buttons=[[Button.inline("🔙 Назад", b"back")]], parse_mode='md')
-    
-    elif data == "delay":
-        await event.edit(f"⚙️ **Задержка:** `{min_delay}-{max_delay}` мс\n\nЧтобы изменить, напиши в Избранное: `.задержка 1000-2000`", buttons=[[Button.inline("🔙 Назад", b"back")]], parse_mode='md')
-    
-    elif data == "start_spam":
-        if not MESSAGES:
-            await event.answer("❌ Нет шаблонов!", alert=True)
-        elif not targets:
-            await event.answer("❌ Нет целей! Напиши в Избранное `.спам @user`", alert=True)
+    if cb_data == "my_account":
+        if not s_data['session']:
+            await event.edit("🔑 **Подключение аккаунта**\n\nОтправь свой номер телефона в формате: `+79991234567`", buttons=[[Button.inline("🔙 Назад", b"back")]])
         else:
-            await event.edit("🚀 **Спам запущен!**", buttons=[[Button.inline("🛑 Остановить", b"stop_spam")]])
-            if not is_spamming:
-                is_spamming = True
-                asyncio.create_task(spam_loop())
-    
-    elif data == "stop_spam":
-        is_spamming = False
-        await event.edit("🛑 **Спам остановлен.**", buttons=[[Button.inline("🔙 Назад", b"back")]])
-    
-    elif data == "stats":
-        await event.edit(f"📊 **Статистика:**\nШаблонов: `{len(MESSAGES)}`\nЗадержка: `{min_delay}-{max_delay}` мс\nСтатус: `{'Активен' if is_spamming else 'Выключен'}`", buttons=[[Button.inline("🔙 Назад", b"back")]], parse_mode='md')
+            await event.edit("✅ **Аккаунт уже подключен.**\n\nЧтобы отключить, нажми кнопку ниже.", buttons=[[Button.inline("❌ Отключить аккаунт", b"logout")], [Button.inline("🔙 Назад", b"back")]])
+            
+    elif cb_data == "templates":
+        text = "\n".join([f"{i+1}. {m}" for i, m in enumerate(s_data['templates'][:10])])
+        if not text: text = "Пусто."
+        await event.edit(f"📝 **Твои шаблоны:**\n\n{text}\n\n*Чтобы изменить, напиши боту текст с новой строки (без точки)*", buttons=[[Button.inline("🔙 Назад", b"back")]], parse_mode='md')
         
-    elif data == "back":
-        await event.edit("👋 **TITAN Setup Panel**\n\nВыбери действие:", buttons=get_menu(), parse_mode='md')
-
-# --- КОМАНДЫ В ИЗБРАННОМ (ЮЗЕРБОТ) ---
-@userbot.on(events.NewMessage(outgoing=True))
-async def handler(e):
-    global MESSAGES, min_delay, max_delay, is_spamming, targets
-    
-    if not e.text or not e.text.startswith('.'): return
-    text = e.text[1:]
-    parts = text.split(' ', 1)
-    cmd = parts[0].lower()
-    arg = parts[1] if len(parts) > 1 else ""
-
-    if cmd == 'шаблоны':
-        MESSAGES = [line.strip() for line in arg.split('\n') if line.strip()]
-        save_templates()
-        await e.edit(f"✅ Сохранено: {len(MESSAGES)}")
-
-    elif cmd == 'спам':
-        if not MESSAGES: return await e.edit("❌ Нет шаблонов!")
-        targets = [x.strip() for x in arg.split(',')]
-        if not is_spamming:
-            is_spamming = True
-            asyncio.create_task(spam_loop())
-            await e.edit(f"🚀 Запуск по {len(targets)}")
+    elif cb_data == "delay":
+        await event.edit(f"⚙️ **Задержка:** `{s_data['min_delay']}-{s_data['max_delay']}` мс", buttons=[[Button.inline("🔙 Назад", b"back")]])
+        
+    elif cb_data == "start_spam":
+        if not s_data['session']:
+            await event.answer("❌ Сначала подключи аккаунт!", alert=True)
+        elif not s_data['templates']:
+            await event.answer("❌ Нет шаблонов!", alert=True)
         else:
-            await e.edit("⚠️ Уже работает")
+            await event.edit("🚀 **Введи цель для спама:**\n\nОтправь сообщение в формате `@username` или `-100123456789`")
+            
+    elif cb_data == "stop_spam":
+        if user_id in active_clients:
+            await active_clients[user_id].disconnect()
+            del active_clients[user_id]
+        await event.edit("🛑 **Спам остановлен.**", buttons=[[Button.inline("🔙 Назад", b"back")]])
+        
+    elif cb_data == "back":
+        await event.edit("👋 **Главное меню**", buttons=get_main_menu(), parse_mode='md')
+        
+    elif cb_data == "logout":
+        if user_id in active_clients:
+            await active_clients[user_id].disconnect()
+            del active_clients[user_id]
+        await save_user_data(user_id, None, s_data['templates'], s_data['min_delay'], s_data['max_delay'])
+        await event.edit("❌ **Аккаунт отключен.**", buttons=[[Button.inline("🔙 Назад", b"back")]])
 
-    elif cmd == 'стоп':
-        is_spamming = False
-        await e.edit("🛑 СТОП")
-
-    elif cmd == 'задержка':
+# --- ОБРАБОТКА ТЕКСТОВЫХ СООБЩЕНИЙ (ВВОД НОМЕРА, КОДА И ЦЕЛЕЙ) ---
+@bot.on(events.NewMessage)
+async def text_handler(event):
+    user_id = event.sender_id
+    text = event.text
+    
+    if text.startswith('/'): return
+    
+    # Если это номер телефона для подключения
+    if text.startswith('+') and len(text) > 10:
+        await event.reply("⏳ Отправляю код...")
+        client = TelegramClient(StringSession(), API_ID, API_HASH)
+        await client.connect()
         try:
-            if '-' in arg: min_delay, max_delay = map(int, arg.split('-'))
-            else: min_delay = max_delay = int(arg)
-            save_config()
-            await e.edit(f"⏳ Задержка: {min_delay}-{max_delay} мс")
+            await client.send_code_request(text)
+            # Сохраняем клиента во временный словарь для ожидания кода
+            active_clients[f"temp_{user_id}"] = {'client': client, 'phone': text}
+            await event.reply("📩 **Введи код из Telegram:**")
+        except Exception as e:
+            await event.reply(f"❌ Ошибка: {e}")
+        return
+        
+    # Если введен код (5 цифр)
+    if text.isdigit() and len(text) == 5 and f"temp_{user_id}" in active_clients:
+        temp = active_clients[f"temp_{user_id}"]
+        client = temp['client']
+        phone = temp['phone']
+        try:
+            await client.sign_in(phone, code=text)
+            session_str = client.session.save()
+            
+            data = await get_user_data(user_id)
+            templates = data['templates'] if data else []
+            await save_user_data(user_id, session_str, templates, 100, 300)
+            
+            await client.disconnect()
+            del active_clients[f"temp_{user_id}"]
+            
+            # Переподключаем как постоянного клиента
+            await get_user_client(user_id)
+            
+            await event.reply("✅ **Аккаунт успешно подключен!** Теперь напиши свои шаблоны (с новой строки).", buttons=get_main_menu())
+        except SessionPasswordNeededError:
+            await event.reply("🔐 **Введи облачный пароль (2FA):**")
+        except Exception as e:
+            await event.reply(f"❌ Ошибка кода: {e}")
+        return
+        
+    # Если введен облачный пароль
+    if f"temp_{user_id}" in active_clients and 'await_password' in active_clients[f"temp_{user_id}"]:
+        temp = active_clients[f"temp_{user_id}"]
+        try:
+            await temp['client'].sign_in(password=text)
+            session_str = temp['client'].session.save()
+            # ... сохранение сессии (аналогично коду)
+            await event.reply("✅ Аккаунт подключен!")
         except: pass
+        return
 
-    elif cmd == 'gpt':
-        if not arg: return
-        await e.edit("🤖...")
-        res = await fetch_url(f"https://text.pollinations.ai/{urllib.parse.quote(arg)}")
-        await e.edit(res[:4000] if not res.startswith("ERROR") else res)
+    # Если это ввод цели для спама (начинается с @ или -)
+    if (text.startswith('@') or text.startswith('-')) and user_id in active_clients and not text.startswith('.'):
+        data = await get_user_data(user_id)
+        if data and data['templates']:
+            asyncio.create_task(spam_single_target(user_id, text, data['templates'], data['min_delay'], data['max_delay']))
+            await event.reply(f"🚀 **Спам запущен по:** `{text}`", parse_mode='md')
+        return
 
-    elif cmd == 'картинка':
-        if not arg: return
-        await e.edit("🎨...")
-        try:
-            img_url = f"https://image.pollinations.ai/prompt/{urllib.parse.quote(arg)}?width=1024&height=1024&nologo=true"
-            await userbot.send_file(e.chat_id, img_url, caption=f"Запрос: {arg}")
-            await e.delete()
-        except Exception as ex: await e.edit(f"❌ {ex}")
-
-    elif cmd == 'вики':
-        if not arg: return
-        await e.edit("🕵️...")
-        try:
-            wiki = wikipediaapi.Wikipedia('TitanBot/1.0', 'ru')
-            page = wiki.page(arg)
-            if not page.exists(): return await e.edit("❌ Нет статьи")
-            await e.edit(f"**{page.title}**\n\n{page.summary[:1000]}\n\n[Читать]({page.fullurl})", parse_mode='md', link_preview=False)
-        except: pass
-
-    elif cmd == 'скачать':
-        if not arg: return
-        await e.edit("📥...")
-        for f in glob.glob("video.*"): os.remove(f)
-        try:
-            ydl_opts = {'format': 'best[ext=mp4]/best', 'outtmpl': 'video.%(ext)s', 'quiet': True, 'ffmpeg_location': FFMPEG_PATH}
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl: ydl.download([arg.strip()])
-            for f in glob.glob("video.*"):
-                await userbot.send_file(e.chat_id, f)
-                os.remove(f)
-                break
-            await e.delete()
-        except Exception as ex: await e.edit(f"❌ {ex}")
-
-    elif cmd == 'парсинг':
-        if not arg: return
-        await e.edit("📦...")
-        try:
-            users = []
-            async for u in userbot.iter_participants(arg.strip()):
-                if u.username: users.append(f"@{u.username}")
-            with open('users.txt', 'w') as f: f.write('\n'.join(users))
-            await userbot.send_file(e.chat_id, 'users.txt', caption=f"✅ {len(users)}")
-            await e.delete()
-        except Exception as ex: await e.edit(f"❌ {ex}")
-
-    elif cmd == 'инфо':
-        try:
-            u = await userbot.get_entity(arg.strip())
-            await e.edit(f"**ID:** `{u.id}`\n**Ник:** `@{u.username}`")
-        except: await e.edit("❌ Не найден")
-
-    elif cmd == 'профиль':
-        me = await userbot.get_me()
-        await e.edit(f"**ID:** `{me.id}`\n**Имя:** `{me.first_name}`")
-
-    elif cmd == 'пинг':
-        s = datetime.datetime.now()
-        await e.edit("📡")
-        await e.edit(f"`{(datetime.datetime.now() - s).microseconds / 1000:.1f} мс`")
-
-    elif cmd == 'хелп':
-        await e.edit("**Команды:**\n.шаблоны, .спам, .стоп, .задержка\n.gpt, .картинка, .вики\n.скачать, .парсинг, .инфо\n.профиль, .пинг\n\n**Меню:** /start")
+    # Если это просто текст (Шаблоны)
+    data = await get_user_data(user_id)
+    if data:
+        new_templates = [line.strip() for line in text.split('\n') if line.strip()]
+        if new_templates:
+            await save_user_data(user_id, data['session'], new_templates, data['min_delay'], data['max_delay'])
+            await event.reply(f"✅ **Шаблоны обновлены:** {len(new_templates)} шт.")
 
 async def main():
-    print(f"{Fore.CYAN}TITAN v40.0 (BOT + USERBOT) ЗАПУЩЕН{Fore.RESET}")
-    load_data()
-    log("SYS", f"Шаблонов: {len(MESSAGES)}", Fore.GREEN)
-    log("SYS", f"Задержка: {min_delay}-{max_delay} мс", Fore.GREEN)
+    print(f"{Fore.CYAN}TITAN MULTI-TENANT v1.0 ЗАПУЩЕН{Fore.RESET}")
+    
+    await init_db()
+    log("SYS", "База данных инициализирована", Fore.GREEN)
     
     threading.Thread(target=run_web, daemon=True).start()
     
-    # Запускаем юзербота
-    await userbot.start()
-    log("SYS", "Юзербот подключен", Fore.GREEN)
-    
-    # Запускаем бота-настройщика
     await bot.start()
-    log("SYS", "Бот-настройщик подключен", Fore.GREEN)
+    log("SYS", "Мастер-бот подключен", Fore.GREEN)
     
-    # Держим оба активными
-    await asyncio.gather(
-        userbot.run_until_disconnected(),
-        bot.run_until_disconnected()
-    )
+    await bot.run_until_disconnected()
 
 if __name__ == '__main__':
     asyncio.run(main())
