@@ -44,13 +44,6 @@ def save_user(uid, phone, session_str):
             ON CONFLICT(user_id) DO UPDATE SET phone=?, session_string=?""", (uid, phone, session_str, phone, session_str))
         conn.commit()
 
-# ================= ЦИКЛ СОБЫТИЙ =================
-bot_loop = asyncio.new_event_loop()
-def start_loop(loop):
-    asyncio.set_event_loop(loop)
-    loop.run_forever()
-threading.Thread(target=start_loop, args=(bot_loop,), daemon=True).start()
-
 # ================= СПАМ-ДВИЖОК =================
 active_engines = {}
 
@@ -68,7 +61,7 @@ async def spam_task(uid, target, templates, max_delay, session_str):
             except FloodWaitError as e:
                 await asyncio.sleep(e.seconds + 5)
             except Exception as e:
-                print(f"Ошибка спама: {e}")
+                print(f"Ошибка спама: {e}", flush=True)
                 break
     finally:
         await client.disconnect()
@@ -76,42 +69,43 @@ async def spam_task(uid, target, templates, max_delay, session_str):
             del active_engines[uid]
 
 # ================= БОТ =================
-bot = TelegramClient("bot_session", API_ID, API_HASH)
-
-@bot.on(events.NewMessage(pattern="/start"))
-async def bot_start(event):
-    uid = event.sender_id
-    is_admin = uid in ADMIN_IDS
-    token = secrets.token_urlsafe(16)
-    link = f"https://bot-1-dk7y.onrender.com/login?token={token}"
-    
-    buttons = [[Button.url("🌐 Войти в панель", link)]]
-    if is_admin:
-        buttons.append([Button.inline("👑 Дать доступ", b"invite")])
-
-    await event.reply(
-        f"⚡ **TITAN Enterprise**\n\nВаш ID: `{uid}`\nСтатус: {'Админ' if is_admin else 'Пользователь'}\n\nНажмите кнопку ниже для входа.", 
-        buttons=buttons, parse_mode='md'
-    )
-
-@bot.on(events.CallbackQuery)
-async def bot_cb(event):
-    if event.sender_id not in ADMIN_IDS:
-        return await event.answer("Доступ только для админа!", alert=True)
-    if event.data == b"invite":
-        token = secrets.token_urlsafe(16)
-        link = f"https://bot-1-dk7y.onrender.com/login?invite={token}"
-        await event.reply(f"🔗 **Ссылка для друга:**\n`{link}`", parse_mode='md')
-
 def run_bot():
-    print(">>> ЗАПУСК БОТА...")
+    print(">>> ЗАПУСК БОТА...", flush=True)
+    bot = TelegramClient("bot_session", API_ID, API_HASH)
+
+    @bot.on(events.NewMessage(pattern="/start"))
+    async def bot_start(event):
+        uid = event.sender_id
+        is_admin = uid in ADMIN_IDS
+        token = secrets.token_urlsafe(16)
+        link = f"https://bot-1-dk7y.onrender.com/login?token={token}"
+        
+        buttons = [[Button.url("🌐 Войти в панель", link)]]
+        if is_admin:
+            buttons.append([Button.inline("👑 Дать доступ", b"invite")])
+
+        await event.reply(
+            f"⚡ **TITAN Enterprise**\n\nВаш ID: `{uid}`\nСтатус: {'Админ' if is_admin else 'Пользователь'}\n\nНажмите кнопку ниже для входа.", 
+            buttons=buttons, parse_mode='md'
+        )
+
+    @bot.on(events.CallbackQuery)
+    async def bot_cb(event):
+        if event.sender_id not in ADMIN_IDS:
+            return await event.answer("Доступ только для админа!", alert=True)
+        if event.data == b"invite":
+            token = secrets.token_urlsafe(16)
+            link = f"https://bot-1-dk7y.onrender.com/login?invite={token}"
+            await event.reply(f"🔗 **Ссылка для друга:**\n`{link}`", parse_mode='md')
+
     try:
         bot.start(bot_token=BOT_TOKEN)
-        print(">>> БОТ УСПЕШНО ЗАПУЩЕН!")
+        print(">>> БОТ УСПЕШНО ЗАПУЩЕН!", flush=True)
         bot.run_until_disconnected()
     except Exception as e:
-        print(f">>> ОШИБКА БОТА: {e}")
+        print(f">>> ОШИБКА БОТА: {e}", flush=True)
 
+# Запускаем бота в фоновом потоке
 threading.Thread(target=run_bot, daemon=True).start()
 
 # ================= ВЕБ-ИНТЕРФЕЙС =================
@@ -262,9 +256,12 @@ def api_send_code():
         req = await c.send_code_request(phone)
         return c, req.phone_code_hash
 
-    future = asyncio.run_coroutine_threadsafe(_send(), bot_loop)
     try:
-        client, code_hash = future.result(timeout=30)
+        # Используем отдельный цикл для веб-запросов, чтобы не блокировать бота
+        loop = asyncio.new_event_loop()
+        client, code_hash = loop.run_until_complete(_send())
+        loop.close()
+        
         globals()[f"auth_{flow}"] = (client, phone, code_hash)
         return jsonify(status="ok", flow=flow)
     except Exception as e:
@@ -291,9 +288,11 @@ def api_verify_code():
         me = await client.get_me()
         return {"uid": me.id, "sess": client.session.save()}
 
-    future = asyncio.run_coroutine_threadsafe(_verify(), bot_loop)
     try:
-        res = future.result(timeout=30)
+        loop = asyncio.new_event_loop()
+        res = loop.run_until_complete(_verify())
+        loop.close()
+
         if isinstance(res, dict) and res.get("need_password"):
              return jsonify(status="error", error="Нужен пароль 2FA (введите его и нажмите Войти)")
         
@@ -337,10 +336,13 @@ def api_spam_start():
     if not tpls: return jsonify(status="error", error="Нет шаблонов")
     if not user["session_string"]: return jsonify(status="error", error="Нет сессии")
     
-    asyncio.run_coroutine_threadsafe(
-        spam_task(uid, target, tpls, user["max_delay"], user["session_string"]), 
-        bot_loop
-    )
+    # Запускаем в фоне через новый поток
+    def _start():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(spam_task(uid, target, tpls, user["max_delay"], user["session_string"]))
+    
+    threading.Thread(target=_start, daemon=True).start()
     return jsonify(status="ok")
 
 @app.route("/api/spam/stop", methods=["POST"])
