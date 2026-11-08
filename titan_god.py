@@ -1,8 +1,8 @@
 from telethon import TelegramClient, events, functions, types
 from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest
-from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
+from telethon.tl.functions.messages import ImportChatInviteRequest
 from telethon.tl.functions.account import UpdateProfileRequest
-from telethon.errors import FloodWaitError, UserAlreadyParticipantError, InviteHashExpiredError
+from telethon.errors import FloodWaitError, UserAlreadyParticipantError
 import asyncio, random, re, os, datetime, string, json, urllib.parse, wikipediaapi, qrcode, pytz, glob
 from PIL import Image
 from colorama import init, Fore
@@ -131,9 +131,8 @@ async def handler(e):
         save_templates()
         await e.edit(f"✅ Сохранено: {len(MESSAGES)}")
 
-    # --- НОВАЯ КОМАНДА ВСТУПЛЕНИЯ ---
     elif cmd == 'вступить':
-        if not arg: return await e.edit("❌ Укажи ссылку (t.me/+... или t.me/name)")
+        if not arg: return await e.edit("❌ Укажи ссылку")
         await e.edit("🚪 Пробую вступить...")
         try:
             if '+' in arg:
@@ -141,18 +140,11 @@ async def handler(e):
                 await client(ImportChatInviteRequest(hash))
             else:
                 await client(JoinChannelRequest(arg))
-            await e.edit("✅ Успешно вступил! Теперь можешь спамить по этой ссылке.")
+            await e.edit("✅ Вступил! Теперь можешь спамить.")
         except UserAlreadyParticipantError:
             await e.edit("✅ Ты уже состоишь в этом чате.")
         except Exception as ex:
-            await e.edit(f"❌ Ошибка вступления: {ex}")
-            
-    elif cmd == 'выйти':
-        try:
-            await client(LeaveChannelRequest(e.chat_id))
-            await e.edit("🚪 Вышел из чата.")
-        except Exception as ex:
-            await e.edit(f"❌ Ошибка выхода: {ex}")
+            await e.edit(f"❌ Ошибка: {ex}")
 
     elif cmd == 'спам':
         if not MESSAGES: return await e.edit("❌ Нет шаблонов!")
@@ -160,7 +152,7 @@ async def handler(e):
         raw_targets = [x.strip() for x in arg.split(',') if x.strip()]
         targets = []
         
-        await e.edit("🔄 Синхронизирую чаты...")
+        await e.edit("🔄 Синхронизирую...")
         try:
             async for dialog in client.iter_dialogs():
                 pass
@@ -168,45 +160,46 @@ async def handler(e):
 
         for t in raw_targets:
             try:
-                if t.startswith('tg://'):
-                    match = re.search(r'id=(\d+)', t)
-                    if match:
-                        raw_id = int(match.group(1))
-                        if raw_id > 0 and len(str(raw_id)) < 12:
-                            chat_id = int(f"-100{raw_id}")
-                        else:
-                            chat_id = raw_id
+                # Пытаемся найти как есть
+                entity = await client.get_entity(t)
+                targets.append(entity)
+            except:
+                # Если не нашли, пробуем преобразовать tg://
+                try:
+                    if t.startswith('tg://'):
+                        match = re.search(r'id=(\d+)', t)
+                        if match:
+                            raw_id = int(match.group(1))
+                            if raw_id > 0 and len(str(raw_id)) < 12:
+                                chat_id = int(f"-100{raw_id}")
+                            else:
+                                chat_id = raw_id
+                            entity = await client.get_entity(chat_id)
+                            targets.append(entity)
+                    elif 't.me/c/' in t:
+                        raw_id = int(t.split('t.me/c/')[1].split('/')[0])
+                        chat_id = int(f"-100{raw_id}")
                         entity = await client.get_entity(chat_id)
                         targets.append(entity)
-                
-                elif 't.me/c/' in t:
-                    raw_id = int(t.split('t.me/c/')[1].split('/')[0])
-                    chat_id = int(f"-100{raw_id}")
-                    entity = await client.get_entity(chat_id)
-                    targets.append(entity)
-                
-                elif t.startswith('-') and t[1:].isdigit():
-                    targets.append(int(t))
-                
-                else:
+                    else:
+                        targets.append(t)
+                except Exception as ex:
+                    log("ERROR", f"Не нашел {t}: {ex}", Fore.RED)
                     targets.append(t)
-            except Exception as ex:
-                log("ERROR", f"Не нашел чат {t}: {ex}", Fore.RED)
-                targets.append(t)
 
         if not targets:
-            return await e.edit("❌ Не удалось распознать ни одну цель.")
+            return await e.edit("❌ Не удалось распознать цели.")
 
         if not is_spamming:
             is_spamming = True
             asyncio.create_task(spam_loop())
-            await e.edit(f"🚀 Ебашу ОДНОВРЕМЕННО по {len(targets)} чатам")
+            await e.edit(f"🚀 Ебашу по {len(targets)} чатам")
         else:
             await e.edit("⚠️ Уже работает")
 
     elif cmd == 'стоп':
         is_spamming = False
-        await e.edit("🛑 СТОП (останавливаю все потоки)")
+        await e.edit("🛑 СТОП")
 
     elif cmd == 'задержка':
         try:
@@ -302,7 +295,7 @@ async def handler(e):
         await e.edit(f"`{(datetime.datetime.now() - s).microseconds / 1000:.1f} мс`")
 
     elif cmd == 'хелп':
-        await e.edit("**Команды:**\n.шаблоны, .спам, .стоп, .задержка\n.gpt, .картинка, .вики\n.скачать, .парсинг, .инфо\n.профиль, .погода, .курс, .пинг\n.афк, .автоответ\n.вступить, .выйти")
+        await e.edit("**Команды:**\n.шаблоны, .спам, .стоп, .задержка\n.gpt, .картинка, .вики\n.скачать, .парсинг, .инфо\n.профиль, .погода, .курс, .пинг\n.афк, .автоответ\n.вступить")
 
 @client.on(events.NewMessage(incoming=True))
 async def handler_auto(e):
@@ -315,7 +308,7 @@ async def handler_auto(e):
             except: pass
 
 async def main():
-    print(f"{Fore.CYAN}TITAN v30.0 (FULL) ЗАПУЩЕН{Fore.RESET}")
+    print(f"{Fore.CYAN}TITAN v31.0 (FINAL) ЗАПУЩЕН{Fore.RESET}")
     load_data()
     log("SYS", f"Шаблонов: {len(MESSAGES)}", Fore.GREEN)
     threading.Thread(target=run_web, daemon=True).start()
