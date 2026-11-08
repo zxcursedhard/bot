@@ -74,7 +74,7 @@ async def fetch_url(url, headers=None):
     except Exception as e:
         return f"ERROR: {e}"
 
-# --- ФУНКЦИЯ ДЛЯ ОДНОГО ЧАТА (РАБОТАЕТ БЕСКОНЕЧНО) ---
+# --- ФУНКЦИЯ ДЛЯ ОДНОГО ЧАТА (БЕСКОНЕЧНЫЙ ЦИКЛ) ---
 async def spam_single_target(target):
     global is_spamming
     counter = 0
@@ -85,7 +85,6 @@ async def spam_single_target(target):
                 break
             
             text = random.choice(MESSAGES)
-            # Невидимый символ для уникальности
             if random.random() > 0.7: text += "\u200b"
                 
             await client.send_message(target, text)
@@ -100,7 +99,6 @@ async def spam_single_target(target):
             await asyncio.sleep(e.seconds + 5)
         except Exception as e:
             log("ERROR", f"Сбой на {target}: {e}", Fore.RED)
-            # Если ошибка фатальная (например, чат удален), выходим из цикла для этого чата
             break
 
 # --- ЗАПУСК ПАРАЛЛЕЛЬНЫХ ПОТОКОВ ---
@@ -112,11 +110,9 @@ async def spam_loop():
         
     log("SPAM", f"Запуск параллельного спама по {len(targets)} чатам", Fore.YELLOW)
     
-    # Создаем задачи для каждой цели. Они будут работать одновременно.
     tasks = [asyncio.create_task(spam_single_target(t)) for t in targets]
-    
-    # Ждем, пока все задачи не завершатся (или пока не нажмут .стоп)
     await asyncio.gather(*tasks)
+    
     is_spamming = False
     log("SPAM", "Все потоки спама завершены.", Fore.YELLOW)
 
@@ -150,7 +146,7 @@ async def handler(e):
         save_templates()
         await e.edit(f"✅ Сохранено: {len(MESSAGES)}")
 
-    # --- ОБНОВЛЕННЫЙ БЛОК СПАМА ---
+    # --- БЛОК СПАМА С КОНВЕРТАЦИЕЙ ID ---
     elif cmd == 'спам':
         if not MESSAGES: return await e.edit("❌ Нет шаблонов!")
         
@@ -168,22 +164,31 @@ async def handler(e):
                 if t.startswith('tg://'):
                     match = re.search(r'id=(\d+)', t)
                     if match:
-                        chat_id = int(match.group(1))
-                        if str(chat_id).startswith('2'):
-                             chat_id = int(f"-100{chat_id}")
+                        raw_id = int(match.group(1))
+                        if raw_id > 0 and len(str(raw_id)) < 12:
+                            chat_id = int(f"-100{raw_id}")
+                        else:
+                            chat_id = raw_id
                         entity = await client.get_entity(chat_id)
                         targets.append(entity)
+                
                 elif 't.me/c/' in t:
-                    chat_id = int(t.split('t.me/c/')[1].split('/')[0])
-                    entity = await client.get_entity(int(f"-100{chat_id}"))
+                    raw_id = int(t.split('t.me/c/')[1].split('/')[0])
+                    chat_id = int(f"-100{raw_id}")
+                    entity = await client.get_entity(chat_id)
                     targets.append(entity)
+                
                 elif t.startswith('-') and t[1:].isdigit():
                     targets.append(int(t))
+                
                 else:
                     targets.append(t)
             except Exception as ex:
                 log("ERROR", f"Не нашел чат {t}: {ex}", Fore.RED)
                 targets.append(t)
+
+        if not targets:
+            return await e.edit("❌ Не удалось распознать ни одну цель.")
 
         if not is_spamming:
             is_spamming = True
@@ -290,7 +295,7 @@ async def handler(e):
         await e.edit(f"`{(datetime.datetime.now() - s).microseconds / 1000:.1f} мс`")
 
     elif cmd == 'хелп':
-        await e.edit("**Команды:**\n.шаблоны, .спам, .стоп, .задержка\n.gpt, .картинка, .вики\n.скачать, .парсинг, .инфо\n.профиль, .погода, .курс, .пинг\n.афк, .автоответ")
+        await e.edit("**Команды:**\n.шаблоны, .спам, .стоп, .задержка\n.gpt, .картинка, .вики\n.скачать, .парсинг, .инфо\n.профиль, .погода, .курс, .пинг\n.афк, .автоответ\n\n**ID/Ссылки:** можно юзать tg:// и t.me/c/")
 
 @client.on(events.NewMessage(incoming=True))
 async def handler_auto(e):
@@ -303,7 +308,7 @@ async def handler_auto(e):
             except: pass
 
 async def main():
-    print(f"{Fore.CYAN}TITAN v28.0 (MULTI-SPAM) ЗАПУЩЕН{Fore.RESET}")
+    print(f"{Fore.CYAN}TITAN v29.0 (FULL FINAL) ЗАПУЩЕН{Fore.RESET}")
     load_data()
     log("SYS", f"Шаблонов: {len(MESSAGES)}", Fore.GREEN)
     threading.Thread(target=run_web, daemon=True).start()
