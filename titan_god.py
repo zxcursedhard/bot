@@ -1,8 +1,7 @@
 from telethon import TelegramClient, events, functions, types
 from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest
-from telethon.tl.functions.messages import ImportChatInviteRequest
 from telethon.tl.functions.account import UpdateProfileRequest
-from telethon.errors import FloodWaitError, UserAlreadyParticipantError
+from telethon.errors import FloodWaitError
 import asyncio, random, re, os, datetime, string, json, urllib.parse, wikipediaapi, qrcode, pytz, glob
 from PIL import Image
 from colorama import init, Fore
@@ -131,40 +130,29 @@ async def handler(e):
         save_templates()
         await e.edit(f"✅ Сохранено: {len(MESSAGES)}")
 
-    elif cmd == 'вступить':
-        if not arg: return await e.edit("❌ Укажи ссылку")
-        await e.edit("🚪 Пробую вступить...")
-        try:
-            if '+' in arg:
-                hash = arg.split('+')[1]
-                await client(ImportChatInviteRequest(hash))
-            else:
-                await client(JoinChannelRequest(arg))
-            await e.edit("✅ Вступил! Теперь можешь спамить.")
-        except UserAlreadyParticipantError:
-            await e.edit("✅ Ты уже состоишь в этом чате.")
-        except Exception as ex:
-            await e.edit(f"❌ Ошибка: {ex}")
-
+    # --- СПАМ (Обновленный) ---
     elif cmd == 'спам':
         if not MESSAGES: return await e.edit("❌ Нет шаблонов!")
         
-        raw_targets = [x.strip() for x in arg.split(',') if x.strip()]
         targets = []
         
-        await e.edit("🔄 Синхронизирую...")
-        try:
-            async for dialog in client.iter_dialogs():
-                pass
-        except: pass
-
-        for t in raw_targets:
+        # 1. Если это ответ на сообщение, берем чат оттуда
+        if e.reply_to_msg_id:
+            reply_msg = await e.get_reply_message()
+            if reply_msg:
+                targets.append(reply_msg.chat_id)
+                await e.edit(f"🎯 Нацелился на чат (по пересылке): {reply_msg.chat_id}")
+        
+        # 2. Если есть аргументы, пробуем их распознать
+        if arg.strip():
+            raw_targets = [x.strip() for x in arg.split(',') if x.strip()]
+            await e.edit("🔄 Синхронизирую...")
             try:
-                # Пытаемся найти как есть
-                entity = await client.get_entity(t)
-                targets.append(entity)
-            except:
-                # Если не нашли, пробуем преобразовать tg://
+                async for dialog in client.iter_dialogs():
+                    pass
+            except: pass
+            
+            for t in raw_targets:
                 try:
                     if t.startswith('tg://'):
                         match = re.search(r'id=(\d+)', t)
@@ -181,6 +169,8 @@ async def handler(e):
                         chat_id = int(f"-100{raw_id}")
                         entity = await client.get_entity(chat_id)
                         targets.append(entity)
+                    elif t.startswith('-') and t[1:].isdigit():
+                        targets.append(int(t))
                     else:
                         targets.append(t)
                 except Exception as ex:
@@ -188,7 +178,7 @@ async def handler(e):
                     targets.append(t)
 
         if not targets:
-            return await e.edit("❌ Не удалось распознать цели.")
+            return await e.edit("❌ Не удалось распознать цели. Используй ответ на сообщение или укажи @username.")
 
         if not is_spamming:
             is_spamming = True
@@ -295,7 +285,7 @@ async def handler(e):
         await e.edit(f"`{(datetime.datetime.now() - s).microseconds / 1000:.1f} мс`")
 
     elif cmd == 'хелп':
-        await e.edit("**Команды:**\n.шаблоны, .спам, .стоп, .задержка\n.gpt, .картинка, .вики\n.скачать, .парсинг, .инфо\n.профиль, .погода, .курс, .пинг\n.афк, .автоответ\n.вступить")
+        await e.edit("**Команды:**\n.шаблоны, .спам, .стоп, .задержка\n.gpt, .картинка, .вики\n.скачать, .парсинг, .инфо\n.профиль, .погода, .курс, .пинг\n.афк, .автоответ")
 
 @client.on(events.NewMessage(incoming=True))
 async def handler_auto(e):
@@ -308,7 +298,7 @@ async def handler_auto(e):
             except: pass
 
 async def main():
-    print(f"{Fore.CYAN}TITAN v31.0 (FINAL) ЗАПУЩЕН{Fore.RESET}")
+    print(f"{Fore.CYAN}TITAN v32.0 (REPLY MODE) ЗАПУЩЕН{Fore.RESET}")
     load_data()
     log("SYS", f"Шаблонов: {len(MESSAGES)}", Fore.GREEN)
     threading.Thread(target=run_web, daemon=True).start()
