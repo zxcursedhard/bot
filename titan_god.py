@@ -7,6 +7,7 @@ import threading
 import asyncio
 import random
 import concurrent.futures
+import urllib.parse
 from datetime import datetime, timezone
 from functools import wraps
 
@@ -29,6 +30,20 @@ ADMIN_IDS = {int(x.strip()) for x in os.environ.get("ADMIN_IDS", "9058235147,877
 DB_PATH = "titan_saas.db"
 BASE_URL = "https://bot-1-i2nc.onrender.com"
 
+# --- ДОБАВЛЕНО: Чтение прокси из переменных окружения ---
+# Формат: socks5://user:pass@host:port или http://host:port
+PROXY_URL = os.environ.get("TELEGRAM_PROXY")
+PROXY = None
+if PROXY_URL:
+    try:
+        parsed = urllib.parse.urlparse(PROXY_URL)
+        # Telethon ожидает кортеж (тип, хост, порт, rdns, юзер, пароль)
+        # В новых версиях Telethon принимает строку, если установлен python-socks
+        PROXY = PROXY_URL 
+        log_msg(f"Используется прокси: {parsed.scheme}://{parsed.hostname}:{parsed.port}")
+    except Exception as e:
+        log_msg(f"Ошибка парсинга прокси: {e}")
+
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(32)
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SECURE=False)
@@ -40,6 +55,7 @@ pending_auth = {}      # flow_token -> (client, phone, hash)
 # =====================================================================
 # БАЗА ДАННЫХ
 # =====================================================================
+# (Без изменений)
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""CREATE TABLE IF NOT EXISTS users (
@@ -120,13 +136,14 @@ async_loop = asyncio.new_event_loop()
 def _run_loop(l): asyncio.set_event_loop(l); l.run_forever()
 threading.Thread(target=_run_loop, args=(async_loop,), daemon=True).start()
 
-def run_async(coro, timeout=25):
+# --- ИЗМЕНЕНО: Увеличен таймаут по умолчанию и текст ошибки ---
+def run_async(coro, timeout=60): 
     try:
         f = asyncio.run_coroutine_threadsafe(coro, async_loop)
         return f.result(timeout=timeout)
     except concurrent.futures.TimeoutError:
-        raise Exception("Таймаут Telegram (IP Render заблокирован)")
-    except Exception: raise
+        raise Exception("Таймаут Telegram. Render блокирует прямые подключения. Настройте TELEGRAM_PROXY.")
+    except Exception as e: raise e
 
 # =====================================================================
 # СПАМ
@@ -134,7 +151,8 @@ def run_async(coro, timeout=25):
 active_spam_engines = {}
 
 async def spam_worker(uid, target, templates, max_delay, session_str):
-    client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+    # --- ИЗМЕНЕНО: Добавлен прокси и таймауты ---
+    client = TelegramClient(StringSession(session_str), API_ID, API_HASH, proxy=PROXY, connection_retries=5, timeout=30)
     await client.connect()
     active_spam_engines[uid] = True
     log_msg(f"Спам {uid} -> {target}")
@@ -145,15 +163,18 @@ async def spam_worker(uid, target, templates, max_delay, session_str):
                 await client.send_message(target, text)
                 await asyncio.sleep(random.uniform(3.0, max_delay))
             except FloodWaitError as e: await asyncio.sleep(e.seconds + 5)
-            except Exception: break
+            except Exception as e: 
+                log_msg(f"Ошибка спама: {e}")
+                break
     finally:
         await client.disconnect()
         if uid in active_spam_engines: del active_spam_engines[uid]
 
 # =====================================================================
-# БОТ (корректный запуск через общий цикл)
+# БОТ
 # =====================================================================
-bot = TelegramClient("bot_saas", API_ID, API_HASH)
+# --- ИЗМЕНЕНО: Добавлен прокси ---
+bot = TelegramClient("bot_saas", API_ID, API_HASH, proxy=PROXY, connection_retries=5, timeout=30)
 
 @bot.on(events.NewMessage(pattern="/start"))
 async def bot_start(event):
@@ -206,7 +227,7 @@ def bot_runner():
 threading.Thread(target=bot_runner, daemon=True).start()
 
 # =====================================================================
-# UI
+# UI (Без изменений)
 # =====================================================================
 BASE_HTML = r"""
 <!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -243,7 +264,7 @@ def _admins(): return {"admins": ADMIN_IDS}
 def render_page(title, content, user=None):
     return render_template_string(BASE_HTML, title=title, content=content, user=user)
 
-# --- LOGIN ---
+# (Остальные HTML шаблоны без изменений, они корректны)
 HOME = r"""
 <div class="panel" style="max-width:520px;margin:8vh auto">
 <h1>Вход в TITAN</h1><p class="sub">Подключение Telegram-аккаунта.</p>
@@ -267,7 +288,7 @@ async function post(url,obj){
 async function sendCode(){
     let p=document.getElementById('phone').value.trim();
     if(!p){msg.textContent='Введите номер';return}
-    msg.className='ok'; msg.textContent='Отправляю код в Telegram (до 20 сек)...';
+    msg.className='ok'; msg.textContent='Отправляю код в Telegram (до 60 сек)...';
     try {
         let d=await post('/api/send-code',{phone:p});
         if(d.status==='ok'){flow=d.flow;codebox.style.display='block';msg.className='ok';msg.textContent='Код отправлен! Проверьте Telegram.';}
@@ -281,7 +302,6 @@ async function verify(){
 </script>
 """
 
-# --- WAITING ---
 WAITING = r"""
 <div class="panel" style="max-width:520px;margin:8vh auto;text-align:center">
 <h1>⏳ Ожидание доступа</h1>
@@ -292,7 +312,6 @@ WAITING = r"""
 </div>
 """
 
-# --- DASHBOARD ---
 DASHBOARD = r"""
 <h1>Панель управления</h1><p class="sub">Аккаунт подключён.</p>
 <div class="grid">
@@ -322,7 +341,6 @@ async function stopSpam(){await post('/api/spam/stop',{});document.getElementByI
 </script>
 """
 
-# --- ADMIN ---
 ADMIN_PAGE = r"""
 <h1>Админ-панель</h1>
 
@@ -415,7 +433,7 @@ def admin_gen_invite():
 def admin_action():
     try: target = int(request.form.get("uid"))
     except: abort(400)
-    if is_admin(target): abort(403)  # нельзя банить/отзывать других админов
+    if is_admin(target): abort(403)
     action = request.form.get("action")
     if action == "approve": approve_user(target)
     elif action == "revoke": revoke_user(target)
@@ -433,13 +451,15 @@ def api_send_code():
     flow = secrets.token_urlsafe(16)
     
     async def _send():
-        c = TelegramClient(StringSession(), API_ID, API_HASH)
+        # --- ИЗМЕНЕНО: Добавлен прокси, таймауты и ретраи ---
+        c = TelegramClient(StringSession(), API_ID, API_HASH, proxy=PROXY, connection_retries=5, retry_delay=2, timeout=60)
         await c.connect()
         req = await c.send_code_request(phone)
         return c, req.phone_code_hash
 
     try:
-        client, code_hash = run_async(_send(), timeout=20)
+        # --- ИЗМЕНЕНО: Таймаут увеличен до 60 секунд ---
+        client, code_hash = run_async(_send(), timeout=60)
         pending_auth[flow] = (client, phone, code_hash)
         return jsonify(status="ok", flow=flow)
     except Exception as e:
@@ -467,7 +487,8 @@ def api_verify_code():
         return {"uid": me.id, "sess": client.session.save()}
 
     try:
-        res = run_async(_verify(), timeout=20)
+        # --- ИЗМЕНЕНО: Таймаут увеличен до 60 секунд ---
+        res = run_async(_verify(), timeout=60)
         if isinstance(res, dict) and res.get("need_password"):
             return jsonify(status="error", error="Нужен пароль 2FA (введите и нажмите Войти)")
         save_user(res["uid"], phone=phone, session_str=res["sess"])
