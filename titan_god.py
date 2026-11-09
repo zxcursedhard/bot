@@ -30,6 +30,9 @@ ADMIN_IDS = {int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").split(",") 
 DB_PATH = "titan_saas.db"
 BASE_URL = "https://bot-1-i2nc.onrender.com"
 
+# =====================================================================
+# АВТОЗАГРУЗКА БЕСПЛАТНЫХ ПРОКСИ
+# =====================================================================
 PROXY_SOURCES = {
     "socks5": [
         "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
@@ -44,7 +47,7 @@ PROXY_SOURCES = {
 VALID_PROXIES = {"socks5": [], "mtproto": []}
 LAST_PROXY_UPDATE = 0
 
-def fetch_and_validate_proxies():
+def fetch_proxies():
     global VALID_PROXIES, LAST_PROXY_UPDATE
     log_msg("🔄 Начинаю обновление списка бесплатных прокси...")
     new_valid = {"socks5": [], "mtproto": []}
@@ -86,7 +89,7 @@ def fetch_and_validate_proxies():
 def get_random_proxy():
     global LAST_PROXY_UPDATE
     if time.time() - LAST_PROXY_UPDATE > 3600 or (not VALID_PROXIES["socks5"] and not VALID_PROXIES["mtproto"]):
-        threading.Thread(target=fetch_and_validate_proxies, daemon=True).start()
+        threading.Thread(target=fetch_proxies, daemon=True).start()
         if not VALID_PROXIES["socks5"] and not VALID_PROXIES["mtproto"]:
             return None
 
@@ -98,6 +101,9 @@ def get_random_proxy():
         return random.choice(VALID_PROXIES["socks5"])
     return None
 
+# =====================================================================
+# БАЗА И FLASK
+# =====================================================================
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(32)
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SECURE=False)
@@ -178,6 +184,9 @@ def admin_required(fn):
         return fn(*args, **kwargs)
     return wrapped
 
+# =====================================================================
+# ЦИКЛ СОБЫТИЙ И ТЕЛЕТОН
+# =====================================================================
 async_loop = asyncio.new_event_loop()
 def _run_loop(l): asyncio.set_event_loop(l); l.run_forever()
 threading.Thread(target=_run_loop, args=(async_loop,), daemon=True).start()
@@ -187,12 +196,12 @@ def run_async(coro, timeout=60):
         f = asyncio.run_coroutine_threadsafe(coro, async_loop)
         return f.result(timeout=timeout)
     except concurrent.futures.TimeoutError:
-        raise Exception("Таймаут Telegram. Все бесплатные прокси, возможно, мертвы. Подожди обновления списка.")
+        raise Exception("Таймаут Telegram. Все прокси мертвы. Подожди обновления.")
     except Exception as e: raise e
 
 def create_telegram_client(session=None, is_bot=False):
     proxy = get_random_proxy()
-    kwargs = {"connection_retries": 3, "retry_delay": 2, "timeout": 30}
+    kwargs = {"connection_retries": 2, "retry_delay": 1, "timeout": 20}
     
     if is_bot:
         session_obj = "bot_saas"
@@ -202,14 +211,14 @@ def create_telegram_client(session=None, is_bot=False):
     if proxy:
         if isinstance(proxy, str) and proxy.startswith("socks5://"):
             kwargs["proxy"] = proxy
-            log_msg(f"🌐 Использую SOCKS5 прокси: {proxy.split('@')[-1] if '@' in proxy else proxy}")
+            log_msg(f"🌐 Использую SOCKS5: {proxy}")
         elif isinstance(proxy, tuple) and len(proxy) == 3:
             host, port, secret = proxy
             kwargs["connection"] = connection.ConnectionTcpMTProxyRandomizedIntermediate
             kwargs["proxy"] = (host, port, secret)
-            log_msg(f"🌐 Использую MTProto прокси: {host}:{port}")
+            log_msg(f"🌐 Использую MTProto: {host}:{port}")
     else:
-        log_msg("⚠️ Прокси не найден, пробую прямое подключение (может упасть).")
+        log_msg("⚠️ Прокси не найден, пробую напрямую.")
 
     return TelegramClient(session_obj, API_ID, API_HASH, **kwargs)
 
@@ -234,6 +243,9 @@ async def spam_worker(uid, target, templates, max_delay, session_str):
         await client.disconnect()
         if uid in active_spam_engines: del active_spam_engines[uid]
 
+# =====================================================================
+# БОТ
+# =====================================================================
 bot = None
 
 @events.register(events.NewMessage(pattern="/start"))
@@ -266,33 +278,49 @@ async def bot_cb(event):
         pending_invites[token] = time.time()
         link = f"{BASE_URL}/login?invite={token}"
         await event.reply(
-            f"🔗 **Ссылка-приглашение (одноразовая):**\n`{link}`\n\nПосле входа через неё аккаунт автоматически получит доступ.",
+            f"🔗 **Ссылка-приглашение:**\n`{link}`",
             parse_mode='md'
         )
 
 def bot_runner():
     global bot
     if not BOT_TOKEN:
-        log_msg("BOT_TOKEN отсутствует")
+        log_msg("❌ BOT_TOKEN отсутствует")
         return
-    log_msg(">>> ЗАПУСК БОТА...")
+    
+    log_msg(">>> ФОНОВЫЙ ПОТОК БОТА ЗАПУЩЕН")
+    
     async def _run():
         global bot
         while True:
             try:
                 if bot is None or not bot.is_connected():
+                    log_msg(">>> СОЗДАЮ КЛИЕНТА...")
                     bot = create_telegram_client(is_bot=True)
                     bot.add_event_handler(bot_start)
                     bot.add_event_handler(bot_cb)
-                    await bot.start(bot_token=BOT_TOKEN)
-                    log_msg(">>> БОТ УСПЕШНО ЗАПУЩЕН!")
+                    
+                    log_msg(">>> ПОДКЛЮЧАЮСЬ К TELEGRAM...")
+                    # Ждем не более 30 секунд на коннект (если прокси мертв - выкинет ошибку)
+                    await asyncio.wait_for(bot.start(bot_token=BOT_TOKEN), timeout=30.0)
+                    log_msg(">>> 🟢 БОТ УСПЕШНО ЗАПУЩЕН И СЛУШАЕТ СООБЩЕНИЯ! 🟢")
+                
                 await bot.run_until_disconnected()
-            except Exception as e:
-                log_msg(f">>> ОШИБКА БОТА: {e}")
-                await asyncio.sleep(15)
+            except asyncio.TimeoutError:
+                log_msg(">>> ❌ ТАЙМАУТ ПОДКЛЮЧЕНИЯ (прокси мертв). Жду 5 сек и беру новый...")
                 bot = None
+                await asyncio.sleep(5)
+            except Exception as e:
+                log_msg(f">>> ❌ ОШИБКА БОТА: {e}")
+                bot = None
+                await asyncio.sleep(10)
+                
     asyncio.run_coroutine_threadsafe(_run(), async_loop)
 
+
+# =====================================================================
+# UI ШАБЛОНЫ
+# =====================================================================
 BASE_HTML = r"""
 <!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{ title }} · TITAN</title>
@@ -349,55 +377,31 @@ async function sendCode(){
     let msg = document.getElementById('msg');
     let codebox = document.getElementById('codebox');
     if(!p){msg.textContent='Введите номер';return}
-    msg.className='ok'; msg.textContent='Отправляю код в Telegram (до 60 сек)...';
+    msg.className='ok'; msg.textContent='Отправляю код (до 60 сек)...';
     
     try {
         let r = await fetch('/api/send-code', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({phone:p})});
-        
         if (!r.ok) {
             let errText = "Ошибка сервера";
-            try {
-                let errJson = await r.json();
-                errText = errJson.error || errText;
-            } catch(e) { errText = "Ошибка 500: Сервер упал (проверь логи)"; }
+            try { let errJson = await r.json(); errText = errJson.error || errText; } catch(e) {}
             throw new Error(errText);
         }
-
         let d = await r.json();
-        if(d.status==='ok'){
-            flow=d.flow; 
-            codebox.style.display='block';
-            msg.className='ok';
-            msg.textContent='Код отправлен! Проверьте Telegram.';
-        } else {
-            msg.className='error';
-            msg.textContent = d.error;
-        }
-    } catch(e) { 
-        msg.className='error'; 
-        msg.textContent='Сбой: ' + e.message; 
-    }
+        if(d.status==='ok'){ flow=d.flow; codebox.style.display='block'; msg.className='ok'; msg.textContent='Код отправлен! Проверьте Telegram.'; } 
+        else { msg.className='error'; msg.textContent = d.error; }
+    } catch(e) { msg.className='error'; msg.textContent='Сбой: ' + e.message; }
 }
 
 async function verify(){
     let msg = document.getElementById('msg');
     try {
         let r = await fetch('/api/verify-code', {
-            method:'POST', 
-            headers:{'Content-Type':'application/json'}, 
-            body:JSON.stringify({
-                flow:flow,
-                code:document.getElementById('code').value.trim(),
-                password:document.getElementById('password').value,
-                invite:inviteToken
-            })
+            method:'POST', headers:{'Content-Type':'application/json'}, 
+            body:JSON.stringify({flow:flow, code:document.getElementById('code').value.trim(), password:document.getElementById('password').value, invite:inviteToken})
         });
         let d = await r.json();
-        if(d.status==='ok'){ location.href='/dashboard'; } 
-        else { msg.className='error'; msg.textContent=d.error; }
-    } catch(e) {
-        msg.className='error'; msg.textContent='Сбой сети: '+e.message;
-    }
+        if(d.status==='ok'){ location.href='/dashboard'; } else { msg.className='error'; msg.textContent=d.error; }
+    } catch(e) { msg.className='error'; msg.textContent='Сбой сети: '+e.message; }
 }
 </script>
 """
@@ -449,14 +453,12 @@ async function stopSpam(){
 
 ADMIN_PAGE = r"""
 <h1>Админ-панель</h1>
-
 <div class="panel">
 <h2>🔗 Ссылки-приглашения</h2>
-<p class="sub" style="font-size:13px">Создайте ссылку и отправьте другу. После входа через неё аккаунт автоматически получит доступ.</p>
+<p class="sub" style="font-size:13px">Создайте ссылку и отправьте другу.</p>
 <button class="btn primary" onclick="genInvite()">Создать ссылку-доступ</button>
 <div id="invite_link" style="margin-top:12px;word-break:break-all"></div>
 </div>
-
 <div class="panel">
 <h2>👥 Пользователи</h2>
 <table>
@@ -485,7 +487,6 @@ ADMIN_PAGE = r"""
 {% endfor %}
 </table>
 </div>
-
 <script>
 async function genInvite(){
     let r=await fetch('/admin/gen_invite',{method:'POST'});
@@ -496,7 +497,7 @@ async function genInvite(){
 """
 
 # =====================================================================
-# МАРШРУТЫ
+# МАРШРУТЫ FLASK
 # =====================================================================
 @app.route("/")
 @app.route("/login")
@@ -655,9 +656,10 @@ def api_spam_stop():
 def health(): return "OK", 200
 
 # =====================================================================
-# ЗАПУСК ФОНОВЫХ ЗАДАЧ НА УРОВНЕ МОДУЛЯ (ДЛЯ GUNICORN)
+# ЗАПУСК ФОНОВЫХ ЗАДАЧ (ДЛЯ GUNICORN)
 # =====================================================================
-threading.Thread(target=fetch_and_validate_proxies, daemon=True).start()
+# Запускаем потоки ЗДЕСЬ, а не в if __name__
+threading.Thread(target=fetch_proxies, daemon=True).start()
 threading.Thread(target=bot_runner, daemon=True).start()
 
 if __name__ == "__main__":
