@@ -16,19 +16,12 @@ from telethon import TelegramClient, events, Button, connection
 from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError, FloodWaitError
 
-# =====================================================================
-# ГЛОБАЛЬНЫЕ СТАТУСЫ ДЛЯ ОТЛАДКИ
-# =====================================================================
 BOT_STATUS = "Инициализация..."
 LAST_BOT_ERROR = "Нет ошибок"
 PROXY_STATUS = "Не загружены"
 
 def log_msg(msg):
     print(msg, flush=True)
-    try:
-        with open("bot_debug.log", "a", encoding="utf-8") as f:
-            f.write(f"{datetime.now()} - {msg}\n")
-    except: pass
 
 API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
@@ -37,16 +30,12 @@ ADMIN_IDS = {int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").split(",") 
 DB_PATH = "titan_saas.db"
 BASE_URL = "https://bot-1-i2nc.onrender.com"
 
-# =====================================================================
-# ПРОКСИ
-# =====================================================================
 PROXY_SOURCES = {
     "socks5": [
         "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
         "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
     ]
 }
-
 VALID_PROXIES = {"socks5": []}
 LAST_PROXY_UPDATE = 0
 
@@ -59,7 +48,7 @@ def fetch_proxies():
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
             with urllib.request.urlopen(req, timeout=15) as response:
                 lines = response.read().decode('utf-8', errors='ignore').splitlines()
-                for line in lines[:150]: # Берем 150 штук
+                for line in lines[:150]:
                     line = line.strip()
                     if line and ":" in line and not line.startswith("#"):
                         parts = line.split(":")
@@ -82,9 +71,6 @@ def get_random_proxy():
             return None
     return random.choice(VALID_PROXIES["socks5"])
 
-# =====================================================================
-# ИНИЦИАЛИЗАЦИЯ FLASK И БД
-# =====================================================================
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(32)
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SECURE=False)
@@ -151,37 +137,29 @@ def admin_required(fn):
         return fn(*args, **kwargs)
     return wrapped
 
-# =====================================================================
-# ЦИКЛ И TELEGRAM
-# =====================================================================
 async_loop = asyncio.new_event_loop()
 def _run_loop(l): 
     asyncio.set_event_loop(l)
     l.run_forever()
 threading.Thread(target=_run_loop, args=(async_loop,), daemon=True).start()
 
-def run_async(coro, timeout=120): # Увеличен таймаут
+def run_async(coro, timeout=120):
     try:
         f = asyncio.run_coroutine_threadsafe(coro, async_loop)
         return f.result(timeout=timeout)
     except concurrent.futures.TimeoutError:
         raise Exception("Таймаут (прокси мертвы)")
-    except Exception as e: raise e
 
 def create_telegram_client(session=None, is_bot=False):
     proxy = get_random_proxy()
-    kwargs = {"connection_retries": 2, "retry_delay": 2, "timeout": 40}
+    kwargs = {"connection_retries": 2, "retry_delay": 2, "timeout": 40, "entity_cache_limit": 100} # Ограничиваем кэш
     
     session_obj = "bot_saas" if is_bot else (StringSession(session) if session else StringSession())
-
     if proxy:
         kwargs["proxy"] = proxy
         log_msg(f"🌐 Прокси: {proxy}")
     return TelegramClient(session_obj, API_ID, API_HASH, **kwargs)
 
-# =====================================================================
-# БОТ
-# =====================================================================
 bot = None
 
 @events.register(events.NewMessage(pattern="/start"))
@@ -196,13 +174,9 @@ def bot_runner():
     
     if not BOT_TOKEN:
         BOT_STATUS = "❌ ОШИБКА: НЕТ BOT_TOKEN"
-        LAST_BOT_ERROR = "Добавь BOT_TOKEN в Environment на Render"
-        log_msg("❌ НЕТ BOT_TOKEN")
         return
-        
     if not API_ID or not API_HASH:
         BOT_STATUS = "❌ ОШИБКА: НЕТ API_ID/API_HASH"
-        LAST_BOT_ERROR = "Добавь API_ID и API_HASH в Environment"
         return
 
     log_msg(">>> ФОНОВЫЙ ПОТОК БОТА ЗАПУЩЕН")
@@ -215,10 +189,7 @@ def bot_runner():
                     BOT_STATUS = "Подключение к TG..."
                     bot = create_telegram_client(is_bot=True)
                     bot.add_event_handler(bot_start)
-                    
-                    # Ждем не более 120 секунд
                     await asyncio.wait_for(bot.start(bot_token=BOT_TOKEN), timeout=120.0)
-                    
                     BOT_STATUS = "🟢 БОТ РАБОТАЕТ"
                     LAST_BOT_ERROR = "Нет ошибок"
                     log_msg(">>> 🟢 БОТ УСПЕШНО ЗАПУЩЕН! 🟢")
@@ -226,7 +197,7 @@ def bot_runner():
                 await bot.run_until_disconnected()
             except asyncio.TimeoutError:
                 BOT_STATUS = "❌ Таймаут прокси"
-                LAST_BOT_ERROR = "Прокси не отвечает (мертв). Бот берет следующий..."
+                LAST_BOT_ERROR = "Прокси не отвечает. Бот берет следующий..."
                 log_msg(">>> ❌ ТАЙМАУТ ПРОКСИ")
                 bot = None
                 await asyncio.sleep(5)
@@ -239,9 +210,9 @@ def bot_runner():
                 
     asyncio.run_coroutine_threadsafe(_run(), async_loop)
 
-# =====================================================================
-# UI ШАБЛОНЫ
-# =====================================================================
+# ... (Остальные шаблоны HOME, WAITING, DASHBOARD, ADMIN_PAGE и маршруты Flask остаются без изменений, как в предыдущем сообщении) ...
+# Для краткости я их пропущу, они не влияют на потребление памяти. Вставь их из предыдущего полного кода.
+
 BASE_HTML = r"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{{ title }} · TITAN</title><style>:root{color-scheme:dark;--bg:#101214;--panel:#191c20;--line:#2b3036;--muted:#9ba3ad;--text:#f2f4f6;--accent:#d5e6ff;--danger:#ff7777;--ok:#a7e7bd}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 sans-serif}.shell{max-width:1120px;margin:0 auto;padding:28px 18px}.top{display:flex;justify-content:space-between;margin-bottom:26px}.brand{font-weight:800}.nav a,.btn{display:inline-flex;text-decoration:none;border:1px solid var(--line);border-radius:10px;padding:9px 13px;color:var(--text);background:#20242a;cursor:pointer}.btn.primary{background:var(--accent);color:#111}.panel{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:20px;margin-bottom:16px}input,textarea{width:100%;border:1px solid var(--line);background:#101316;color:var(--text);border-radius:10px;padding:12px}.error{color:var(--danger);margin-top:10px;font-weight:bold}.ok{color:var(--ok);margin-top:10px;font-weight:bold}</style></head><body><div class="shell"><header class="top"><div class="brand">TITAN CONTROL</div><nav class="nav">{% if user %}<a href="/dashboard">Панель</a><a href="/logout">Выйти</a>{% endif %}</nav></header>{{ content|safe }}</div></body></html>"""
 
 def render_page(title, content, user=None):
@@ -283,7 +254,7 @@ def api_send_code():
             await c.connect()
             req = await c.send_code_request(data.get('phone'))
             return c, req.phone_code_hash
-        client, code_hash = run_async(_send(), timeout=120) # Ждем до 120 сек
+        client, code_hash = run_async(_send(), timeout=120)
         pending_auth[flow] = (client, data.get('phone'), code_hash)
         return jsonify(status="ok", flow=flow)
     except Exception as e:
@@ -323,24 +294,11 @@ def health(): return "OK", 200
 
 @app.route("/api/status")
 def api_status():
-    return jsonify({
-        "bot_status": BOT_STATUS,
-        "last_error": LAST_BOT_ERROR,
-        "proxy_status": PROXY_STATUS,
-        "has_token": bool(BOT_TOKEN),
-        "has_api_id": bool(API_ID),
-        "has_api_hash": bool(API_HASH)
-    })
+    return jsonify({"bot_status": BOT_STATUS, "last_error": LAST_BOT_ERROR, "proxy_status": PROXY_STATUS})
 
 # =====================================================================
 # ЗАПУСК
 # =====================================================================
-print("=========================================", flush=True)
-print("ЗАПУСК СЕРВИСА TITAN...", flush=True)
-print(f"BOT_TOKEN: {'ЕСТЬ' if BOT_TOKEN else 'НЕТ!'}", flush=True)
-print(f"API_ID: {'ЕСТЬ' if API_ID else 'НЕТ!'}", flush=True)
-print("=========================================", flush=True)
-
 threading.Thread(target=fetch_proxies, daemon=True).start()
 threading.Thread(target=bot_runner, daemon=True).start()
 
