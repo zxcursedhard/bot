@@ -33,7 +33,6 @@ BASE_URL = "https://bot-1-i2nc.onrender.com"
 # =====================================================================
 # АВТОЗАГРУЗКА БЕСПЛАТНЫХ ПРОКСИ
 # =====================================================================
-# Список публичных источников (SOCKS5 и MTProto)
 PROXY_SOURCES = {
     "socks5": [
         "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
@@ -45,26 +44,22 @@ PROXY_SOURCES = {
     ]
 }
 
-# Хранилище для проверенных прокси
 VALID_PROXIES = {"socks5": [], "mtproto": []}
 LAST_PROXY_UPDATE = 0
 
 def fetch_and_validate_proxies():
-    """Загружает списки и проверяет их на работоспособность (упрощенно)."""
     global VALID_PROXIES, LAST_PROXY_UPDATE
     log_msg("🔄 Начинаю обновление списка бесплатных прокси...")
     new_valid = {"socks5": [], "mtproto": []}
 
-    # --- SOCKS5 ---
     for url in PROXY_SOURCES["socks5"]:
         try:
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
             with urllib.request.urlopen(req, timeout=15) as response:
                 lines = response.read().decode('utf-8', errors='ignore').splitlines()
-                for line in lines[:200]: # Берем первые 200 для проверки
+                for line in lines[:200]:
                     line = line.strip()
                     if line and ":" in line and not line.startswith("#"):
-                        # Формат: ip:port
                         parts = line.split(":")
                         if len(parts) == 2:
                             ip, port = parts
@@ -74,8 +69,6 @@ def fetch_and_validate_proxies():
         except Exception as e:
             log_msg(f"❌ Ошибка загрузки SOCKS5 с {url}: {e}")
 
-    # --- MTProto ---
-    # MTProto парсится сложнее, здесь упрощенно, только если есть готовые строки
     for url in PROXY_SOURCES["mtproto"]:
         try:
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
@@ -83,7 +76,6 @@ def fetch_and_validate_proxies():
                 lines = response.read().decode('utf-8', errors='ignore').splitlines()
                 for line in lines[:100]:
                     line = line.strip()
-                    # Ожидаем формат host:port:secret или tg://proxy?...
                     if line and ":" in line and not line.startswith("#"):
                         parts = line.split(":")
                         if len(parts) >= 3 and parts[1].isdigit():
@@ -93,25 +85,18 @@ def fetch_and_validate_proxies():
         except Exception as e:
             log_msg(f"❌ Ошибка загрузки MTProto: {e}")
 
-    # Простая валидация (на самом деле нужно проверять реальным подключением, но для скорости пропускаем)
-    # В реальном бою тут нужно пробовать подключиться, но это долго. Положимся на авось.
     VALID_PROXIES = new_valid
     LAST_PROXY_UPDATE = time.time()
     log_msg(f"✅ Обновление завершено. SOCKS5: {len(VALID_PROXIES['socks5'])}, MTProto: {len(VALID_PROXIES['mtproto'])}")
 
 def get_random_proxy():
-    """Возвращает случайный прокси (SOCKS5 или MTProto кортеж)."""
     global LAST_PROXY_UPDATE
-    # Обновляем раз в час
     if time.time() - LAST_PROXY_UPDATE > 3600 or (not VALID_PROXIES["socks5"] and not VALID_PROXIES["mtproto"]):
-        # Запускаем в фоне, чтобы не блокировать запрос
         threading.Thread(target=fetch_and_validate_proxies, daemon=True).start()
-        # Если список пуст, возвращаем None (прямое подключение)
         if not VALID_PROXIES["socks5"] and not VALID_PROXIES["mtproto"]:
             return None
 
-    # Приоритет: сначала SOCKS5 (их проще использовать), потом MTProto
-    if VALID_PROXIES["socks5"] and random.random() < 0.7: # 70% шанс взять SOCKS5
+    if VALID_PROXIES["socks5"] and random.random() < 0.7:
         return random.choice(VALID_PROXIES["socks5"])
     elif VALID_PROXIES["mtproto"]:
         return random.choice(VALID_PROXIES["mtproto"])
@@ -119,9 +104,6 @@ def get_random_proxy():
         return random.choice(VALID_PROXIES["socks5"])
     return None
 
-# =====================================================================
-# TELEGRAM КЛИЕНТЫ С АВТО-ПРОКСИ
-# =====================================================================
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(32)
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SECURE=False)
@@ -129,7 +111,6 @@ app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SECURE=False)
 pending_invites = {}
 pending_auth = {}
 
-# ... (код базы данных и вспомогательных функций без изменений) ...
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""CREATE TABLE IF NOT EXISTS users (
@@ -203,9 +184,6 @@ def admin_required(fn):
         return fn(*args, **kwargs)
     return wrapped
 
-# =====================================================================
-# ЦИКЛ СОБЫТИЙ
-# =====================================================================
 async_loop = asyncio.new_event_loop()
 def _run_loop(l): asyncio.set_event_loop(l); l.run_forever()
 threading.Thread(target=_run_loop, args=(async_loop,), daemon=True).start()
@@ -218,30 +196,20 @@ def run_async(coro, timeout=60):
         raise Exception("Таймаут Telegram. Все бесплатные прокси, возможно, мертвы. Подожди обновления списка.")
     except Exception as e: raise e
 
-# =====================================================================
-# ФУНКЦИЯ СОЗДАНИЯ КЛИЕНТА С ПРОКСИ
-# =====================================================================
 def create_telegram_client(session=None, is_bot=False):
-    """Создает клиент Telethon, автоматически подбирая рабочий прокси."""
     proxy = get_random_proxy()
-    kwargs = {
-        "connection_retries": 3,
-        "retry_delay": 2,
-        "timeout": 30,
-    }
+    kwargs = {"connection_retries": 3, "retry_delay": 2, "timeout": 30}
     
     if is_bot:
-        session_obj = "bot_saas" # Имя файла сессии для бота
+        session_obj = "bot_saas"
     else:
         session_obj = StringSession(session) if session else StringSession()
 
     if proxy:
         if isinstance(proxy, str) and proxy.startswith("socks5://"):
-            # SOCKS5
             kwargs["proxy"] = proxy
             log_msg(f"🌐 Использую SOCKS5 прокси: {proxy.split('@')[-1] if '@' in proxy else proxy}")
         elif isinstance(proxy, tuple) and len(proxy) == 3:
-            # MTProto
             host, port, secret = proxy
             kwargs["connection"] = connection.ConnectionTcpMTProxyRandomizedIntermediate
             kwargs["proxy"] = (host, port, secret)
@@ -251,9 +219,6 @@ def create_telegram_client(session=None, is_bot=False):
 
     return TelegramClient(session_obj, API_ID, API_HASH, **kwargs)
 
-# =====================================================================
-# СПАМ
-# =====================================================================
 active_spam_engines = {}
 
 async def spam_worker(uid, target, templates, max_delay, session_str):
@@ -275,10 +240,7 @@ async def spam_worker(uid, target, templates, max_delay, session_str):
         await client.disconnect()
         if uid in active_spam_engines: del active_spam_engines[uid]
 
-# =====================================================================
-# БОТ
-# =====================================================================
-bot = None # Инициализируем позже
+bot = None
 
 @events.register(events.NewMessage(pattern="/start"))
 async def bot_start(event):
@@ -321,7 +283,7 @@ def bot_runner():
         return
     log_msg(">>> ЗАПУСК БОТА...")
     async def _run():
-        nonlocal bot
+        global bot
         while True:
             try:
                 if bot is None or not bot.is_connected():
@@ -333,13 +295,10 @@ def bot_runner():
                 await bot.run_until_disconnected()
             except Exception as e:
                 log_msg(f">>> ОШИБКА БОТА: {e}")
-                await asyncio.sleep(15) # Ждем и пробуем снова, возможно, прокси сменится
+                await asyncio.sleep(15)
                 bot = None
     asyncio.run_coroutine_threadsafe(_run(), async_loop)
 
-# =====================================================================
-# UI И МАРШРУТЫ (Без изменений в логике, только шаблоны)
-# =====================================================================
 BASE_HTML = r"""
 ... (тот же BASE_HTML) ...
 """
@@ -415,9 +374,6 @@ def admin_action():
     elif action == "unban": ban_user(target, 0)
     return redirect("/admin")
 
-# =====================================================================
-# API (Создание клиентов через create_telegram_client)
-# =====================================================================
 @app.route("/api/send-code", methods=["POST"])
 def api_send_code():
     try:
@@ -526,8 +482,6 @@ def api_spam_stop():
 def health(): return "OK", 200
 
 if __name__ == "__main__":
-    # Запускаем первичную загрузку прокси в фоне при старте
     threading.Thread(target=fetch_and_validate_proxies, daemon=True).start()
-    # Запускаем бота
     threading.Thread(target=bot_runner, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
