@@ -29,27 +29,25 @@ API_ID = 2040
 API_HASH = 'b18441a1ff607e10a989891a5462e627'
 BOT_TOKEN = '8732669492:AAF6lfPEgcOp9iKzo74UGnPIPw9wfVa7YGo'
 
-# Создатели (всегда ULTIMATE + админ)
 SUPER_ADMINS = {8655682794, 8773171051}
 SUPPORT_CONTACT = "@apemiru"
 
 DB_FILE = 'titan_database.db'
 BACKUP_DIR = 'database_backups'
 
-# Глобальные рамки (абсолютный максимум/минимум для всей системы)
 MIN_DELAY_LIMIT = 1
 MAX_DELAY_LIMIT = 60
 
-# Лимиты по тарифам (в секундах)
+# Теперь добавили max_targets — сколько целей можно запустить одновременно
 PLAN_LIMITS = {
-    'FREE':     {'templates': 10,  'min_delay': 50, 'max_delay': 60},
-    'PRO':      {'templates': 100, 'min_delay': 30, 'max_delay': 60},
-    'ULTIMATE': {'templates': 9999,'min_delay': 1,  'max_delay': 60},
+    'FREE':     {'templates': 10,  'min_delay': 50, 'max_delay': 60, 'max_targets': 1},
+    'PRO':      {'templates': 100, 'min_delay': 30, 'max_delay': 60, 'max_targets': 2},
+    'ULTIMATE': {'templates': 9999,'min_delay': 1,  'max_delay': 60, 'max_targets': 4},
 }
 
 active_clients = {}
 user_steps = {}
-spam_engines = {}
+spam_engines = {}  # {uid: SpamEngine} — один движок на пользователя, внутри может быть несколько целей
 
 system_metrics = {
     "total_messages_sent": 0,
@@ -96,11 +94,12 @@ class TitanDB:
                     is_approved INTEGER DEFAULT 0,
                     is_admin INTEGER DEFAULT 0,
                     plan TEXT DEFAULT 'FREE',
+                    accepted_rules INTEGER DEFAULT 0,
                     registered_at TEXT
                 )
             ''')
             try:
-                await db.execute("ALTER TABLE users ADD COLUMN plan TEXT DEFAULT 'FREE'")
+                await db.execute("ALTER TABLE users ADD COLUMN accepted_rules INTEGER DEFAULT 0")
             except:
                 pass
             await db.execute('''
@@ -134,7 +133,7 @@ class TitanDB:
 async def get_user(uid):
     async with aiosqlite.connect(DB_FILE) as db:
         async with db.execute(
-            "SELECT session_string, templates, min_delay, max_delay, is_approved, is_admin, plan FROM users WHERE user_id = ?",
+            "SELECT session_string, templates, min_delay, max_delay, is_approved, is_admin, plan, accepted_rules FROM users WHERE user_id = ?",
             (uid,)
         ) as cursor:
             row = await cursor.fetchone()
@@ -147,10 +146,11 @@ async def get_user(uid):
                     'is_approved': row[4],
                     'is_admin': row[5],
                     'plan': row[6] or 'FREE',
+                    'accepted_rules': row[7] or 0,
                 }
     return None
 
-async def save_user(uid, session=None, templates=None, min_d=None, max_d=None, approved=None, admin=None, plan=None):
+async def save_user(uid, session=None, templates=None, min_d=None, max_d=None, approved=None, admin=None, plan=None, accepted_rules=None):
     cur = await get_user(uid)
     s = session if session is not None else (cur['session'] if cur else None)
     t = templates if templates is not None else (cur['templates'] if cur else [])
@@ -159,17 +159,18 @@ async def save_user(uid, session=None, templates=None, min_d=None, max_d=None, a
     a = approved if approved is not None else (cur['is_approved'] if cur else 0)
     adm = admin if admin is not None else (cur['is_admin'] if cur else 0)
     pl = plan if plan is not None else (cur['plan'] if cur else 'FREE')
+    ar = accepted_rules if accepted_rules is not None else (cur['accepted_rules'] if cur else 0)
 
-    # Создатели — всегда админ + ULTIMATE
     if uid in SUPER_ADMINS:
         a = 1
         adm = 1
         pl = 'ULTIMATE'
+        ar = 1
 
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute('''
-            INSERT INTO users (user_id, session_string, templates, min_delay, max_delay, is_approved, is_admin, plan, registered_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO users (user_id, session_string, templates, min_delay, max_delay, is_approved, is_admin, plan, accepted_rules, registered_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
             session_string=excluded.session_string,
             templates=excluded.templates,
@@ -177,8 +178,9 @@ async def save_user(uid, session=None, templates=None, min_d=None, max_d=None, a
             max_delay=excluded.max_delay,
             is_approved=excluded.is_approved,
             is_admin=excluded.is_admin,
-            plan=excluded.plan
-        ''', (uid, s, json.dumps(t), mind, maxd, a, adm, pl, str(datetime.datetime.now())))
+            plan=excluded.plan,
+            accepted_rules=excluded.accepted_rules
+        ''', (uid, s, json.dumps(t), mind, maxd, a, adm, pl, ar, str(datetime.datetime.now())))
         await db.commit()
 
 def is_super(uid):
@@ -204,24 +206,25 @@ async def resolve_client(uid):
     return None
 
 # =====================================================================
-# 5. СПАМ-ДВИЖОК
+# 5. СПАМ-ДВИЖОК (МУЛЬТИ-ЦЕЛЬ)
 # =====================================================================
 class SpamEngine:
     def __init__(self, client, user_id):
         self.client = client
         self.user_id = user_id
         self.is_active = False
-        self.counter = 0
+        self.tasks = []  # список корутин/задач для каждой цели
 
-    async def attack(self, target, templates, min_delay, max_delay):
-        self.is_active = True
-        self.counter = 0
+    async def attack_single(self, target, templates, min_delay, max_delay):
+        """Атака одного чата. Используется внутри gather."""
+        counter = 0
         start_time = str(datetime.datetime.now())
 
+        # Приводим цель к нормальному виду
         if "t.me/" in target:
             target = "@" + target.split("t.me/")[-1].split("/")[0].split("?")[0]
+        target = target.strip()
 
-        # Жёстко ограничиваем задержку глобальными лимитами (1-60 сек)
         current_min = max(MIN_DELAY_LIMIT * 1000, min(min_delay, MAX_DELAY_LIMIT * 1000))
         current_max = max(MIN_DELAY_LIMIT * 1000, min(max_delay, MAX_DELAY_LIMIT * 1000))
         if current_max < current_min:
@@ -233,51 +236,88 @@ class SpamEngine:
             try:
                 if not templates:
                     break
+                if not self.is_active:
+                    break
+
                 msg = random.choice(templates)
                 await self.client.send_message(target, msg)
-                self.counter += 1
+                counter += 1
                 system_metrics["total_messages_sent"] += 1
-                TitanLogger.log("SPAM", f"[{self.user_id}] #{self.counter} -> {target}", Fore.BLUE)
+                TitanLogger.log("SPAM", f"[{self.user_id}] -> {target} #{counter}", Fore.BLUE)
 
                 async with aiosqlite.connect(DB_FILE) as db:
                     await db.execute('''
                         INSERT INTO spam_history (user_id, target, sent_messages_count, status, started_at, ended_at)
                         VALUES (?, ?, ?, ?, ?, ?)
-                    ''', (self.user_id, str(target), self.counter, 'RUNNING', start_time, str(datetime.datetime.now())))
+                    ''', (self.user_id, str(target), counter, 'RUNNING', start_time, str(datetime.datetime.now())))
                     await db.commit()
 
                 delay = random.randint(current_min, current_max) / 1000.0
-                await asyncio.sleep(delay)
+                slept = 0
+                while slept < delay and self.is_active:
+                    chunk = min(1.0, delay - slept)
+                    await asyncio.sleep(chunk)
+                    slept += chunk
 
             except FloodWaitError as e:
                 system_metrics["total_flood_wait_events"] += 1
-                TitanLogger.warning(f"FloodWait {e.seconds} сек.")
+                TitanLogger.warning(f"[{self.user_id}] FloodWait {e.seconds} сек ({target}).")
                 await asyncio.sleep(e.seconds + 5)
             except ChatWriteForbiddenError:
                 system_metrics["total_errors_caught"] += 1
-                TitanLogger.error(f"Нет прав писать в {target}.")
-                self.is_active = False
+                TitanLogger.error(f"[{self.user_id}] Нет прав писать в {target}.")
                 break
             except Exception as e:
                 system_metrics["total_errors_caught"] += 1
-                TitanLogger.error(f"Сбой [{self.user_id}]: {e}")
-                self.is_active = False
+                TitanLogger.error(f"[{self.user_id}] Сбой {target}: {e}")
                 break
 
+        TitanLogger.info(f"Стоп цели {target} [{self.user_id}]. Отправлено: {counter}")
+
+    async def attack(self, targets, templates, min_delay, max_delay):
+        self.is_active = True
+        tasks = [self.attack_single(t, templates, min_delay, max_delay) for t in targets]
+        await asyncio.gather(*tasks, return_exceptions=True)
         self.is_active = False
-        TitanLogger.info(f"Стоп [{self.user_id}]. Отправлено: {self.counter}")
+        TitanLogger.info(f"Движок [{self.user_id}] полностью остановлен.")
+
+    def stop(self):
+        self.is_active = False
 
 # =====================================================================
 # 6. БОТ
 # =====================================================================
 bot = TelegramClient('bot_master', API_ID, API_HASH)
 
+RULES_TEXT = (
+    "<b>📜 ПРАВИЛА ПОЛЬЗОВАНИЯ</b>\n"
+    "━━━━━━━━━━━━━━━━━━━━\n\n"
+    "Перед использованием бота ознакомьтесь с правилами:\n\n"
+    "<b>1. Запрещено:</b>\n"
+    "• Массовая рассылка без согласия получателей\n"
+    "• Спам, флуд, мошенничество\n"
+    "• Использование бота для незаконных целей\n"
+    "• Передача доступа к боту третьим лицам\n\n"
+    "<b>2. Ответственность:</b>\n"
+    "• Администрация не несёт ответственности за блокировки ваших аккаунтов Telegram\n"
+    "• Все действия вы совершаете на свой страх и риск\n"
+    "• При нарушении правил доступ будет заблокирован без возврата средств\n\n"
+    "<b>3. Оплата:</b>\n"
+    f"• Оплата подписок и аккаунтов через {SUPPORT_CONTACT}\n"
+    "• Возврат средств не предусмотрен\n\n"
+    "<b>4. Конфиденциальность:</b>\n"
+    "• Сессии аккаунтов хранятся локально и не передаются третьим лицам\n\n"
+    "━━━━━━━━━━━━━━━━━━━━\n"
+    "Нажимая «✅ Принимаю», вы соглашаетесь с правилами."
+)
+
 def main_menu(is_admin):
     menu = [
         [Button.inline("👤 Аккаунт", b"nav_account"), Button.inline("📝 Шаблоны", b"nav_templates")],
         [Button.inline("⚙️ Задержка", b"nav_delay"), Button.inline("🚀 Запуск", b"nav_spam")],
         [Button.inline("🛑 Остановить", b"nav_stop")],
-        [Button.inline("💎 Подписка", b"nav_sub"), Button.inline("ℹ️ Помощь", b"nav_help")],
+        [Button.inline("💎 Подписка", b"nav_sub"), Button.inline("🛒 Купить аккаунт", b"nav_buy_acc")],
+        [Button.inline("ℹ️ Помощь", b"nav_help")],
     ]
     if is_admin:
         menu.append([Button.inline("👑 Админ-панель", b"nav_admin")])
@@ -292,6 +332,7 @@ def main_text(uid, p):
     crown = "👑 " if is_super(uid) else ""
     plan = p.get('plan', 'FREE') if p else 'FREE'
     plan_emoji = {'FREE': '⚪', 'PRO': '💎', 'ULTIMATE': '👑'}.get(plan, '⚪')
+    limits = plan_limits(plan)
 
     return (
         f"<b>⚡ TITAN Enterprise</b>\n"
@@ -300,6 +341,7 @@ def main_text(uid, p):
         f"📱 <b>Аккаунт:</b> {status}\n"
         f"📝 <b>Шаблонов:</b> {tpl}\n"
         f"⚙️ <b>Задержка:</b> {mind}–{maxd} сек\n"
+        f"🎯 <b>Лимит целей:</b> {limits['max_targets']}\n"
         f"🚀 <b>Статус:</b> {active}\n"
         f"💎 <b>Тариф:</b> {plan_emoji} <b>{plan}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -330,8 +372,38 @@ async def cmd_start(e):
         )
         return
 
+    if not p or p.get('accepted_rules') != 1:
+        await e.reply(
+            RULES_TEXT,
+            buttons=[
+                [Button.inline("✅ Принимаю", b"accept_rules")],
+                [Button.inline("❌ Отказываюсь", b"decline_rules")],
+            ],
+            parse_mode='html'
+        )
+        return
+
     user_steps[uid] = "IDLE"
     await e.reply(main_text(uid, p), buttons=main_menu(is_admin), parse_mode='html')
+
+@bot.on(events.CallbackQuery(data="accept_rules"))
+async def cb_accept_rules(e):
+    uid = e.sender_id
+    await save_user(uid, accepted_rules=1)
+    await e.answer("✅ Правила приняты")
+    p = await get_user(uid)
+    is_admin = p.get('is_admin') == 1 or is_super(uid)
+    await e.edit(main_text(uid, p), buttons=main_menu(is_admin), parse_mode='html')
+
+@bot.on(events.CallbackQuery(data="decline_rules"))
+async def cb_decline_rules(e):
+    await e.edit(
+        "❌ <b>Вы отказались от правил</b>\n\n"
+        "Без принятия правил использование бота невозможно.\n"
+        f"Если передумаете — напишите /start\n\n"
+        f"По вопросам: {SUPPORT_CONTACT}",
+        parse_mode='html'
+    )
 
 @bot.on(events.CallbackQuery(data="nav_account"))
 async def cb_account(e):
@@ -438,6 +510,9 @@ async def cb_handler(e):
     if not is_admin and not is_approved:
         return await e.answer("⛔ Доступ закрыт", alert=True)
 
+    if not p.get('accepted_rules') and action not in ("accept_rules", "decline_rules"):
+        return await e.answer("⚠️ Сначала примите правила", alert=True)
+
     back = [[Button.inline("🔙 Назад", b"nav_home")]]
 
     if action == "nav_home":
@@ -495,53 +570,87 @@ async def cb_handler(e):
             return await e.answer("❌ Нет сессии", alert=True)
         if not p.get('templates'):
             return await e.answer("❌ Нет шаблонов", alert=True)
+        limits = plan_limits(p.get('plan', 'FREE'))
         user_steps[uid] = "ST_TARGET"
         await e.edit(
-            "🚀 <b>Запуск</b>\n\n"
-            "Цель: <code>@username</code> / <code>https://t.me/username</code> / <code>123456789</code>",
+            f"🚀 <b>Запуск (до {limits['max_targets']} целей)</b>\n\n"
+            f"Отправьте список целей — <b>каждая с новой строки</b>.\n"
+            f"Например:\n"
+            f"<code>@chat1\n@chat2\n@chat3</code>\n\n"
+            f"Или ссылки: <code>https://t.me/chat1</code>\n"
+            f"Или ID: <code>123456789</code>",
             buttons=back, parse_mode='html'
         )
 
     elif action == "nav_stop":
         if uid in spam_engines:
-            spam_engines[uid].is_active = False
+            spam_engines[uid].stop()
             del spam_engines[uid]
-        await e.edit("🛑 <b>Остановлено</b>", buttons=back, parse_mode='html')
+            await e.edit(
+                "🛑 <b>Процесс остановлен</b>\n\n"
+                "Все активные рассылки завершены.",
+                buttons=back, parse_mode='html'
+            )
+        else:
+            await e.answer("⚠️ Активных рассылок не найдено", alert=True)
 
     elif action == "nav_sub":
         plan = p.get('plan', 'FREE')
         await e.edit(
             f"💎 <b>Тарифные планы</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"⚪ <b>FREE</b> — базовый\n"
+            f"⚪ <b>FREE</b> — 0 ₽\n"
             f"• До 10 шаблонов\n"
-            f"• Задержка 50–60 сек\n\n"
-            f"💎 <b>PRO</b> — расширенный\n"
+            f"• Задержка 50–60 сек\n"
+            f"• Одновременно: 1 цель\n\n"
+            f"💎 <b>PRO</b> — 490 ₽/мес\n"
             f"• До 100 шаблонов\n"
             f"• Задержка 30–60 сек\n"
+            f"• Одновременно: 2 цели\n"
             f"• Приоритетная поддержка\n\n"
-            f"👑 <b>ULTIMATE</b> — максимум\n"
+            f"👑 <b>ULTIMATE</b> — 1 490 ₽/мес\n"
             f"• Без лимитов шаблонов\n"
             f"• Задержка 1–60 сек\n"
+            f"• Одновременно: 4 цели\n"
             f"• Персональный менеджер\n\n"
+            f"🛒 <b>Доп. аккаунт (слот)</b> — 300 ₽/мес\n\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"Ваш тариф: <b>{plan}</b>\n\n"
-            f"📩 Активация: {SUPPORT_CONTACT}",
+            f"📩 <b>Для покупки:</b> {SUPPORT_CONTACT}",
+            buttons=back, parse_mode='html'
+        )
+
+    elif action == "nav_buy_acc":
+        await e.edit(
+            f"🛒 <b>Покупка аккаунта</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Мы предоставляем готовые аккаунты для работы с ботом.\n\n"
+            f"<b>Что нужно знать:</b>\n"
+            f"• Аккаунт передаётся вручную\n"
+            f"• Оплата обсуждается индивидуально\n"
+            f"• Все детали — в личных сообщениях\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📩 <b>Для покупки пишите:</b> {SUPPORT_CONTACT}",
             buttons=back, parse_mode='html'
         )
 
     elif action == "nav_help":
         await e.edit(
-            f"ℹ️ <b>Помощь</b>\n"
+            f"ℹ️ <b>Помощь и инструкция</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"<b>Не приходит код?</b>\n"
-            f"• Введите номер → выберите QR-код\n"
-            f"• Или запросите звонок вместо SMS\n"
-            f"• Проверьте, что Telegram активен на номере\n\n"
-            f"<b>Задержка:</b> зависит от тарифа (1–60 сек)\n\n"
-            f"<b>Цель:</b> @username / ссылка / ID\n\n"
+            f"<b>🔑 ВАЖНО: Как правильно заходить в аккаунт</b>\n"
+            f"Если вы заходите со своего <b>основного</b> номера (на котором уже есть Telegram), Telegram может заблокировать вход бота и не прислать код.\n\n"
+            f"✅ <b>Что делать:</b>\n"
+            f"1. Используйте <b>другой (дополнительный)</b> аккаунт/номер для создания сессии.\n"
+            f"2. Или заходите через <b>QR-код</b> (кнопка появляется после ввода номера).\n"
+            f"3. Если код не приходит — попробуйте запросить <b>звонок</b> вместо SMS.\n\n"
+            f"<b>💎 Тарифы и цены</b>\n"
+            f"• ⚪ FREE — 0 ₽ (1 цель, 10 шаблонов)\n"
+            f"• 💎 PRO — 490 ₽/мес (2 цели, 100 шаблонов)\n"
+            f"• 👑 ULTIMATE — 1 490 ₽/мес (4 цели, без лимита шаблонов)\n"
+            f"• 🛒 Доп. аккаунт (слот) — 300 ₽/мес\n\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📩 <b>По всем вопросам:</b> {SUPPORT_CONTACT}",
+            f"📩 <b>По всем вопросам и покупкам:</b> {SUPPORT_CONTACT}",
             buttons=back, parse_mode='html'
         )
 
@@ -568,7 +677,6 @@ async def text_handler(e):
     is_admin = p.get('is_admin') == 1 or is_super(uid)
     is_approved = p.get('is_approved') == 1 or is_super(uid)
 
-    # --- АДМИН-КОМАНДЫ ---
     if is_admin:
         if text.startswith('.approve'):
             try:
@@ -613,6 +721,9 @@ async def text_handler(e):
             return
 
     if not is_admin and not is_approved:
+        return
+
+    if not p.get('accepted_rules'):
         return
 
     step = user_steps.get(uid, "IDLE")
@@ -686,17 +797,48 @@ async def text_handler(e):
 
     elif step == "ST_TARGET":
         user_steps[uid] = "IDLE"
+        limits = plan_limits(p.get('plan', 'FREE'))
+
+        # Разбиваем ввод на цели
+        raw_targets = [line.strip() for line in text.split('\n') if line.strip()]
+        if not raw_targets:
+            await e.reply("❌ Вы не указали ни одной цели.")
+            return
+
+        # Проверка лимита
+        if len(raw_targets) > limits['max_targets']:
+            await e.reply(
+                f"⚠️ Ваш тариф <b>{p.get('plan','FREE')}</b> разрешает максимум <b>{limits['max_targets']}</b> целей одновременно.\n"
+                f"Вы указали: <b>{len(raw_targets)}</b>.\n\n"
+                f"Уберите лишние строки или повысьте тариф: /start → 💎 Подписка",
+                parse_mode='html'
+            )
+            return
+
+        # Проверка, что нет активной рассылки
+        if uid in spam_engines:
+            spam_engines[uid].stop()
+            try:
+                await spam_engines[uid].client.disconnect()
+            except:
+                pass
+            del spam_engines[uid]
+
         c = await resolve_client(uid)
         if not c:
             await e.reply("❌ Сессия потеряна.")
             return
+
         eng = SpamEngine(c, uid)
         spam_engines[uid] = eng
-        asyncio.create_task(eng.attack(text, p['templates'], p['min_delay'], p['max_delay']))
+        asyncio.create_task(eng.attack(raw_targets, p['templates'], p['min_delay'], p['max_delay']))
+
+        targets_str = "\n".join([f"• <code>{t}</code>" for t in raw_targets])
         await e.reply(
-            f"🚀 <b>Запущено</b>\n"
-            f"Цель: <code>{text}</code>\n"
-            f"Задержка: {int(p['min_delay']/1000)}–{int(p['max_delay']/1000)} сек",
+            f"🚀 <b>Запущено</b>\n\n"
+            f"<b>Цели ({len(raw_targets)}):</b>\n{targets_str}\n\n"
+            f"Задержка: {int(p['min_delay']/1000)}–{int(p['max_delay']/1000)} сек\n\n"
+            f"Остановить: /start → 🛑 Остановить",
             parse_mode='html'
         )
 
