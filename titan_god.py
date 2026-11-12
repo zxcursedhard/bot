@@ -1,5 +1,5 @@
 # =====================================================================
-# TITAN Enterprise v6.1 — монолит для Render
+# TITAN Enterprise v6.2 — монолит для Render
 # =====================================================================
 import os
 import sys
@@ -37,7 +37,7 @@ API_ID = int(os.getenv("API_ID", "2040"))
 API_HASH = os.getenv("API_HASH", "b18441a1ff607e10a989891a5462e627")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8732669492:AAF6lfPEgcOp9iKzo74UGnPIPw9wfVa7YGo")
 DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "titan_super_secret_change_me_12345")
-PUBLIC_URL = os.getenv("PUBLIC_URL", "")  # например https://titan-xxxx.onrender.com
+PUBLIC_URL = os.getenv("PUBLIC_URL", "")
 
 SUPER_ADMINS = {8655682794, 8773171051}
 OWNER_CONTACT = "@apemiru"
@@ -405,7 +405,7 @@ class SpamEngine:
         self.user_id = user_id
         self.db_path = db_path
         self.pacer = AdaptivePacer(min_ms, max_ms, protection)
-        self._stop_event = asyncio.Event()   # взводится через stop()
+        self._stop_event = asyncio.Event()
         self._tasks = set()
         self.started_at = datetime.datetime.now()
         self.sent = 0
@@ -442,7 +442,6 @@ class SpamEngine:
         return msg
 
     async def _sleep_until(self, seconds):
-        """Спит N секунд, но прерывается мгновенно при stop()."""
         if seconds <= 0:
             return
         try:
@@ -475,7 +474,6 @@ class SpamEngine:
             log.warning("history: %s", e)
 
     async def _attack_one(self, target, templates):
-        """Бесконечный цикл на одну цель, пока не stop() или не сработает auto_pause."""
         counter = 0
         while not self._stop_event.is_set():
             if self.schedule and not is_valid_schedule(self.schedule):
@@ -507,7 +505,6 @@ class SpamEngine:
                 if counter % 10 == 0:
                     await self._write_history(target, counter, "RUNNING")
 
-                # ← ГЛАВНОЕ ИСПРАВЛЕНИЕ: реальная задержка между сообщениями
                 delay = self.pacer.next_delay()
                 log.info("[%s] → %s | отправлено=%d | ждём %.1fс", self.user_id, target, self.sent, delay)
                 await self._sleep_until(delay)
@@ -534,7 +531,6 @@ class SpamEngine:
                 self.metrics["total_errors_caught"] += 1
                 self._consecutive_errors += 1
                 log.warning("[%s] ошибка отправки в %s: %s", self.user_id, target, str(e)[:120])
-                # короткая пауза даже при ошибке, чтобы не долбить в цикле
                 await self._sleep_until(self.pacer.next_delay())
                 if self.auto_pause and self._consecutive_errors >= self._error_threshold:
                     break
@@ -884,7 +880,16 @@ async def cb_handler(e):
         p = await repo.get(uid) or {}
         if not p.get("session"):
             user_steps[uid] = "ST_PHONE"
-            await e.edit("📱 <b>Авторизация</b>\nОтправьте номер: <code>+79991234567</code>\n\n💡 Код не приходит? Войдите по QR.", buttons=back, parse_mode="html")
+            await e.edit(
+                "📱 <b>Авторизация</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "Отправь номер: <code>+79991234567</code>\n\n"
+                "💡 <b>Код не приходит?</b>\n"
+                "• Жми «📷 Войти по QR» — надёжнее всего\n"
+                "• Если номер «сожгли» — жди 12–24ч или другой номер",
+                buttons=[[Button.inline("📷 Войти по QR", b"qr_start")], [Button.inline("🔙 Назад", b"nav_home")]],
+                parse_mode="html",
+            )
         else:
             await e.edit("✅ <b>Аккаунт подключён</b>", buttons=back, parse_mode="html")
     elif action == "nav_templates":
@@ -1097,6 +1102,11 @@ async def cb_handler(e):
         lines.append(f"💰 Выручка: <b>{total_sum} ₽</b>")
         await e.edit("\n".join(lines), buttons=back, parse_mode="html")
     elif action == "qr_start":
+        last_qr = active_clients.get(f"qr_last_{uid}", 0)
+        if time.time() - last_qr < 15:
+            return await e.answer(f"⏳ Подожди {int(15 - (time.time() - last_qr))} сек перед новым QR", alert=True)
+        active_clients[f"qr_last_{uid}"] = time.time()
+
         await e.edit("🔄 Генерирую QR...")
         try:
             c = TelegramClient(StringSession(), API_ID, API_HASH)
@@ -1126,27 +1136,60 @@ async def cb_handler(e):
                 active_clients.pop(f"qr_{uid}", None)
                 user_steps[uid] = "IDLE"
                 await e.edit("⏱ QR истёк. /start")
+            except SessionPasswordNeededError:
+                active_clients[f"qr2fa_{uid}"] = c
+                active_clients.pop(f"qr_{uid}", None)
+                user_steps[uid] = "ST_QR_PASS"
+                await e.edit(
+                    "🔐 <b>Включена 2FA</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    "QR отсканирован, но на аккаунте включён облачный пароль.\n\n"
+                    "Введи пароль 2FA в чат:",
+                    buttons=[[Button.inline("🔙 Отмена", b"qr_cancel")]], parse_mode="html",
+                )
         except Exception as ex:
             user_steps[uid] = "IDLE"
-            await e.edit(f"❌ Ошибка QR: <code>{str(ex)[:200]}</code>", parse_mode="html")
+            msg = str(ex)[:200]
+            if "all available options" in msg.lower() or "flood" in msg.lower():
+                await e.edit(
+                    "❌ <b>Слишком много запросов кода</b>\n"
+                    "Telegram временно заблокировал отправку кода на этот номер.\n\n"
+                    "⏳ Подожди <b>12–24 часа</b> и попробуй снова,\n"
+                    "или используй <b>другой номер</b>.",
+                    parse_mode="html",
+                )
+            else:
+                await e.edit(f"❌ Ошибка QR: <code>{msg}</code>", parse_mode="html")
     elif action == "qr_cancel":
-        b = active_clients.pop(f"qr_{uid}", None)
-        if b:
-            try:
-                await b["client"].disconnect()
-            except Exception:
-                pass
+        for key in (f"qr_{uid}", f"qr2fa_{uid}"):
+            b = active_clients.pop(key, None)
+            if b:
+                cl = b["client"] if isinstance(b, dict) else b
+                try:
+                    await cl.disconnect()
+                except Exception:
+                    pass
         user_steps[uid] = "IDLE"
         await e.edit("❌ Отменено", buttons=back)
     elif action == "resend_call":
         b = active_clients.get(f"temp_{uid}")
         if not b:
             return await e.answer("❌ Нет активной попытки", alert=True)
+        last_call = active_clients.get(f"call_last_{uid}", 0)
+        if time.time() - last_call < 60:
+            return await e.answer(f"⏳ Подожди {int(60 - (time.time() - last_call))} сек", alert=True)
+        active_clients[f"call_last_{uid}"] = time.time()
         try:
             await b["client"].send_code_request(b["phone"], force_sms=False)
-            await e.answer("📞 Повторный запрос", alert=True)
+            await e.answer("📞 Запрос звонка отправлен", alert=True)
+        except FloodWaitError as ex:
+            await e.answer(f"⏳ FloodWait: подожди {ex.seconds} сек", alert=True)
         except Exception as ex:
-            await e.answer(f"❌ {str(ex)[:100]}", alert=True)
+            msg = str(ex)[:150]
+            if "all available options" in msg.lower():
+                await e.answer("❌ Варианты исчерпаны. Жди 12–24ч или другой номер.", alert=True)
+            else:
+                await e.answer(f"❌ {msg}", alert=True)
     else:
         await e.answer("⚠️ Неизвестное действие", alert=True)
 
@@ -1285,9 +1328,29 @@ async def text_handler(e):
             req = await c.send_code_request(text)
             active_clients[f"temp_{uid}"] = {"client": c, "phone": text, "hash": req.phone_code_hash}
             user_steps[uid] = "ST_CODE"
-            await e.reply("📩 <b>Код отправлен</b>\nВведите код:", buttons=[[Button.inline("📷 Войти по QR", b"qr_start")], [Button.inline("📞 Запросить звонок", b"resend_call")], [Button.inline("🔙 Отмена", b"nav_home")]], parse_mode="html")
+            await e.reply(
+                "📩 <b>Код отправлен</b>\nВведите код:",
+                buttons=[[Button.inline("📷 Войти по QR", b"qr_start")], [Button.inline("📞 Запросить звонок", b"resend_call")], [Button.inline("🔙 Отмена", b"nav_home")]],
+                parse_mode="html",
+            )
+        except FloodWaitError as ex:
+            await e.reply(
+                f"⏳ <b>FloodWait</b>\nTelegram: подожди <b>{ex.seconds} сек</b> перед повторной попыткой.",
+                parse_mode="html",
+            )
+            user_steps[uid] = "IDLE"
         except Exception as ex:
-            await e.reply(f"❌ <code>{str(ex)[:200]}</code>", parse_mode="html")
+            msg = str(ex)[:200]
+            if "all available options" in msg.lower():
+                await e.reply(
+                    "❌ <b>Слишком много запросов кода</b>\n"
+                    "Telegram временно заблокировал отправку кода на этот номер.\n\n"
+                    "⏳ Подожди <b>12–24 часа</b> и попробуй снова,\n"
+                    "или используй <b>другой номер</b>.",
+                    parse_mode="html",
+                )
+            else:
+                await e.reply(f"❌ <code>{msg}</code>", parse_mode="html")
             user_steps[uid] = "IDLE"
 
     elif step == "ST_CODE":
@@ -1326,6 +1389,21 @@ async def text_handler(e):
             await e.reply("✅ 2FA пройдена! /start")
         except Exception as ex:
             await e.reply(f"❌ <code>{str(ex)[:200]}</code>", parse_mode="html")
+
+    elif step == "ST_QR_PASS":
+        c = active_clients.get(f"qr2fa_{uid}")
+        if not c:
+            user_steps[uid] = "IDLE"
+            return await e.reply("❌ Сессия QR потеряна, /start")
+        try:
+            await c.sign_in(password=text)
+            await repo.save(uid, session=c.session.save())
+            active_clients[uid] = c
+            active_clients.pop(f"qr2fa_{uid}", None)
+            user_steps[uid] = "IDLE"
+            await e.reply("✅ <b>2FA пройдена, вход по QR успешен!</b>\n\n/start", parse_mode="html")
+        except Exception as ex:
+            await e.reply(f"❌ Неверный пароль: <code>{str(ex)[:150]}</code>", parse_mode="html")
 
     elif step == "ST_TARGET":
         user_steps[uid] = "IDLE"
@@ -1368,7 +1446,7 @@ async def text_handler(e):
         msg = "🚀 <b>Запущено (бесконечный цикл)</b>\n\n<b>Цели:</b>\n" + "\n".join(f"• <code>{t}</code>" for t in targets)
         if bad:
             msg += f"\n\n⚠️ Не распознано: {len(bad)}"
-        msg += f"\n\n⚙️ Задержка: {int(p['min_delay']/1000)}–{int(p['max_delay']/1000)}с\n🛑 Остановить → кнопка «🛑 Остановить»"
+        msg += f"\n\n⚙️ Задержка: {int(p['min_delay']/1000)}–{int(p['max_delay']/1000)}с\n🛑 Остановить → «🛑 Остановить»"
         await e.reply(msg, parse_mode="html")
 
     elif step == "ST_DELAY":
@@ -1811,7 +1889,7 @@ async def main():
 
 if __name__ == "__main__":
     log.info("=" * 50)
-    log.info("  TITAN Enterprise v6.1 — старт")
+    log.info("  TITAN Enterprise v6.2 — старт")
     log.info("=" * 50)
     try:
         asyncio.run(main())
