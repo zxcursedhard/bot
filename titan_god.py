@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TITAN Enterprise v7.2 (Spam Edition) — single-file Telegram manager.
-Добавлен бесконечный цикл рассылки с честной задержкой и поддержкой закрытых чатов.
-Дизайн веб-панели оставлен без изменений (v7.1).
+TITAN Enterprise v7.3 — single-file, safer Telegram community/broadcast manager.
+С поддержкой бесконечного спама и закрытых чатов.
 """
 
 from __future__ import annotations
@@ -38,26 +37,19 @@ from telethon.errors import (
 from flask import Flask, jsonify, request, abort, Response
 
 # ---------------------------------------------------------------------
-# Configuration
+# Configuration (дефолтные значения из старой версии)
 # ---------------------------------------------------------------------
 
-def required_env(name: str) -> str:
-    value = os.getenv(name, "").strip()
-    if not value:
-        raise RuntimeError(f"Не задана обязательная переменная окружения {name}")
-    return value
+API_ID = int(os.getenv("API_ID", "2040"))
+API_HASH = os.getenv("API_HASH", "b18441a1ff607e10a989891a5462e627")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8732669492:AAF6lfPEgcOp9iKzo74UGnPIPw9wfVa7YGo")
+DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "titan_super_secret_change_me_12345")
 
-API_ID = int(required_env("API_ID"))
-API_HASH = required_env("API_HASH")
-BOT_TOKEN = required_env("BOT_TOKEN")
-DASHBOARD_TOKEN = required_env("DASHBOARD_TOKEN")
 SUPER_ADMINS = {
     int(item.strip())
-    for item in os.getenv("SUPER_ADMINS", "").split(",")
+    for item in os.getenv("SUPER_ADMINS", "8655682794,8773171051").split(",")
     if item.strip()
 }
-if not SUPER_ADMINS:
-    raise RuntimeError("SUPER_ADMINS должен содержать хотя бы один Telegram user ID")
 
 PORT = int(os.getenv("PORT", "8080"))
 PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")
@@ -699,7 +691,7 @@ async def callback_handler(event):
         await event.answer("Недоступно", alert=True)
 
 # ---------------------------------------------------------------------
-# Flask dashboard (БЕЗ ИЗМЕНЕНИЙ)
+# Flask dashboard
 # ---------------------------------------------------------------------
 
 app = Flask("titan")
@@ -748,8 +740,8 @@ def dashboard():
 </style></head><body><div class="layout">
 <aside class="side"><div class="brand"><div class="logo">T</div><div><b>TITAN ENTERPRISE</b><small>PRIVATE CONTROL</small></div></div>
 <div class="navlabel">WORKSPACE</div><nav class="nav"><a class="active" href="#overview">◈ &nbsp; Обзор</a><a href="#users-section">♙ &nbsp; Пользователи</a><a href="#activity">◷ &nbsp; Активность</a><a href="#access">⚿ &nbsp; Доступ</a></nav>
-<div class="sidefoot"><span class="online">● SYSTEM ONLINE</span><br>CONTROL CENTER / V7.1<br>SECURE ADMIN INTERFACE</div></aside>
-<main id="overview"><header class="top"><div><div class="crumb">WORKSPACE / OVERVIEW</div><h1>Панель управления</h1></div><div class="topright"><div class="pill">● LIVE MONITORING</div><div class="pill">V7.1</div></div></header>
+<div class="sidefoot"><span class="online">● SYSTEM ONLINE</span><br>CONTROL CENTER / V7.3<br>SECURE ADMIN INTERFACE</div></aside>
+<main id="overview"><header class="top"><div><div class="crumb">WORKSPACE / OVERVIEW</div><h1>Панель управления</h1></div><div class="topright"><div class="pill">● LIVE MONITORING</div><div class="pill">V7.3</div></div></header>
 <section class="hero"><div class="eyebrow">TITAN COMMAND CENTER</div><h2>Полный контроль. Один интерфейс.</h2><p>Мониторинг пользователей, подписок и активности. Данные обновляются автоматически, доступ к API защищён отдельным ключом.</p></section>
 <section class="stats"><article class="card"><div class="kicker">ВСЕГО ПОЛЬЗОВАТЕЛЕЙ</div><div class="num" id="users">—</div></article><article class="card"><div class="kicker">АКТИВНЫЕ ПОДПИСКИ</div><div class="num green" id="subs">—</div></article><article class="card"><div class="kicker">УСПЕШНЫЕ ОТПРАВКИ</div><div class="num red" id="sent">—</div></article><article class="card"><div class="kicker">ОШИБКИ ОТПРАВКИ</div><div class="num" id="failed">—</div></article><article class="card"><div class="kicker">FLOOD WAIT</div><div class="num" id="flood">—</div></article><article class="card"><div class="kicker">ОБОРОТ</div><div class="num" id="revenue">— ₽</div></article></section>
 <section class="lower"><article class="panel" id="users-section"><div class="panelhead"><b>♙ Пользователи</b><span>LAST 500</span></div><div class="tablewrap"><table><thead><tr><th>USER ID</th><th>ТАРИФ</th><th>НОВОСТИ</th><th>ДОСТУП</th></tr></thead><tbody id="userRows"><tr><td colspan="4" class="muted">Подключите панель для загрузки данных</td></tr></tbody></table></div></article>
