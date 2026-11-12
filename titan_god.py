@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TITAN Enterprise v7.3 — single-file, safer Telegram community/broadcast manager.
-С поддержкой бесконечного спама и закрытых чатов.
+TITAN Enterprise v7.3.1 — single-file Telegram manager.
+Исправлена ошибка совместимости aiosqlite + Python 3.14.
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ from telethon.errors import (
 from flask import Flask, jsonify, request, abort, Response
 
 # ---------------------------------------------------------------------
-# Configuration (дефолтные значения из старой версии)
+# Configuration
 # ---------------------------------------------------------------------
 
 API_ID = int(os.getenv("API_ID", "2040"))
@@ -61,7 +61,6 @@ BROADCAST_GAP_SECONDS = max(1.0, float(os.getenv("BROADCAST_GAP_SECONDS", "3")))
 OWNER_CONTACT = os.getenv("OWNER_CONTACT", "@apemiru")
 SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", OWNER_CONTACT)
 
-# Обновленные тарифы с лимитами на цели и задержкой спама
 PLANS = {
     "FREE": {"title": "Новичок", "badge": "⚪", "price": 0, "daily_limit": 50, "max_targets": 1, "min_delay": 50},
     "PRO": {"title": "PRO-юзер", "badge": "💎", "price": 490, "daily_limit": 500, "max_targets": 2, "min_delay": 30},
@@ -131,21 +130,20 @@ class Database:
         self.backup_dir = backup_dir
         self.lock = asyncio.Lock()
 
-    async def connect(self):
-        db = await aiosqlite.connect(str(self.path), timeout=30)
-        db.row_factory = aiosqlite.Row
-        await db.execute("PRAGMA foreign_keys=ON")
-        await db.execute("PRAGMA busy_timeout=30000")
-        return db
+    def connect(self):
+        return aiosqlite.connect(str(self.path), timeout=30)
 
     async def init(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.backup_dir.mkdir(parents=True, exist_ok=True)
-        async with self.connect() as db:
+        # ИСПРАВЛЕНО: добавлен await перед self.connect()
+        async with await self.connect() as db:
+            await db.execute("PRAGMA foreign_keys=ON")
+            await db.execute("PRAGMA busy_timeout=30000")
             await db.execute("PRAGMA journal_mode=WAL")
             await db.executescript(SCHEMA)
             async with db.execute("PRAGMA table_info(users)") as cur:
-                cols = {row["name"] for row in await cur.fetchall()}
+                cols = {row[1] for row in await cur.fetchall()}
             additions = {
                 "subscribed": "INTEGER NOT NULL DEFAULT 0",
                 "last_seen": "TEXT",
@@ -171,7 +169,7 @@ class Database:
 
     async def ensure_user(self, uid: int):
         now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
-        async with self.connect() as db:
+        async with await self.connect() as db:
             await db.execute(
                 """INSERT INTO users(user_id, plan, is_admin, is_approved,
                    subscribed, accepted_rules, balance, registered_at, last_seen)
@@ -187,7 +185,8 @@ class Database:
             await db.commit()
 
     async def get_user(self, uid: int):
-        async with self.connect() as db:
+        async with await self.connect() as db:
+            db.row_factory = aiosqlite.Row
             async with db.execute("SELECT * FROM users WHERE user_id=?", (uid,)) as cur:
                 row = await cur.fetchone()
                 return dict(row) if row else None
@@ -199,32 +198,32 @@ class Database:
             return
         columns = ", ".join(f"{k}=?" for k in fields)
         values = list(fields.values()) + [uid]
-        async with self.connect() as db:
+        async with await self.connect() as db:
             await db.execute(f"UPDATE users SET {columns} WHERE user_id=?", values)
             await db.commit()
 
     async def subscribers(self):
-        async with self.connect() as db:
+        async with await self.connect() as db:
             async with db.execute(
                 "SELECT user_id FROM users WHERE subscribed=1 AND is_approved=1 ORDER BY user_id"
             ) as cur:
-                return [row["user_id"] for row in await cur.fetchall()]
+                return [row[0] for row in await cur.fetchall()]
 
     async def count(self):
-        async with self.connect() as db:
+        async with await self.connect() as db:
             async with db.execute("SELECT COUNT(*) AS n FROM users") as cur:
-                return (await cur.fetchone())["n"]
+                return (await cur.fetchone())[0]
 
     async def payment_stats(self):
-        async with self.connect() as db:
+        async with await self.connect() as db:
             async with db.execute(
                 "SELECT COALESCE(SUM(amount),0) AS total, COUNT(*) AS n FROM payments_log"
             ) as cur:
                 row = await cur.fetchone()
-                return int(row["total"]), int(row["n"])
+                return int(row[0]), int(row[1])
 
     async def log_audit(self, admin_id, action, target_id=None, details=""):
-        async with self.connect() as db:
+        async with await self.connect() as db:
             await db.execute(
                 "INSERT INTO audit_log(admin_id, action, target_id, details, created_at) VALUES(?,?,?,?,?)",
                 (admin_id, action, target_id, details[:1000],
@@ -233,7 +232,7 @@ class Database:
             await db.commit()
 
     async def log_broadcast(self, admin_id, preview, sent, failed):
-        async with self.connect() as db:
+        async with await self.connect() as db:
             await db.execute(
                 "INSERT INTO broadcast_log(admin_id, body_preview, sent, failed, created_at) VALUES(?,?,?,?,?)",
                 (admin_id, preview[:300], sent, failed,
@@ -246,7 +245,8 @@ class Database:
             self.backup_dir.mkdir(parents=True, exist_ok=True)
             stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
             destination = self.backup_dir / f"titan_{stamp}.db"
-            async with self.connect() as source:
+            # ИСПРАВЛЕНО
+            async with await self.connect() as source:
                 target = await aiosqlite.connect(str(destination))
                 try:
                     await source.backup(target)
@@ -281,7 +281,6 @@ broadcast_lock = asyncio.Lock()
 rate_buckets = defaultdict(deque)
 metrics = {"sent": 0, "failed": 0, "flood_wait": 0, "broadcasts": 0}
 
-# Состояние спам-движков для каждого пользователя: {uid: SpamEngine}
 spam_engines = {}
 
 def is_admin(uid: int) -> bool:
@@ -301,7 +300,6 @@ def plan_text(plan: str) -> str:
     item = PLANS.get(plan, PLANS["FREE"])
     return f"{item['badge']} <b>{html.escape(plan)}</b> — {item['price']} ₽/мес"
 
-# Парсер закрытых чатов
 _TG_URL = re.compile(r"(?:https?://)?t\.me/([A-Za-z0-9_]{4,})")
 _TG_RESOLVE = re.compile(r"(?:https?://)?t\.me/c/(\d+)")
 _TG_APP_CHAT = re.compile(r"tg://(?:chat|resolve)\?id=(-?\d+)")
@@ -310,8 +308,7 @@ _NUMERIC = re.compile(r"^-?\d{5,}$")
 
 def parse_target(raw: str):
     raw = raw.strip()
-    if not raw:
-        return None
+    if not raw: return None
     m = _TG_APP_CHAT.search(raw)
     if m: return int(m.group(1))
     m = _TG_APP_OPEN.search(raw)
@@ -324,7 +321,6 @@ def parse_target(raw: str):
     if _NUMERIC.match(raw): return int(raw)
     return None
 
-# --- ДВИЖОК БЕСКОНЕЧНОГО СПАМА ---
 class SpamEngine:
     def __init__(self, client, targets, templates, min_ms, max_ms, metrics):
         self.client = client
@@ -354,8 +350,6 @@ class SpamEngine:
         while not self._stop_event.is_set():
             try:
                 msg = random.choice(self.templates)
-                
-                # Отправка с поддержкой закрытых чатов
                 if isinstance(target, int):
                     try:
                         entity = await self.client.get_entity(target)
@@ -377,7 +371,7 @@ class SpamEngine:
             except (ChatWriteForbiddenError, ChatAdminRequiredError, UserBannedInChannelError):
                 self.errors += 1
                 self.metrics["failed"] += 1
-                break # Остановить именно эту цель
+                break
             except Exception as e:
                 self.errors += 1
                 self.metrics["failed"] += 1
@@ -393,8 +387,6 @@ class SpamEngine:
     def stop(self):
         self._stop_event.set()
         for t in list(self._tasks): t.cancel()
-
-# ---------------------------------
 
 def main_keyboard(uid: int):
     rows = [
@@ -431,8 +423,7 @@ async def show_home(event, uid):
 @bot.on(events.NewMessage(pattern=r"^/start(?:@\w+)?$"))
 async def start_handler(event):
     uid = event.sender_id
-    if not uid or rate_limited(uid):
-        return
+    if not uid or rate_limited(uid): return
     await db.ensure_user(uid)
     user = await db.get_user(uid)
     if not user["accepted_rules"]:
@@ -474,39 +465,28 @@ async def spam_start_handler(event):
         return await event.respond("❌ Формат: <code>/spam_start @user1, -100123 | Текст 1\nТекст 2</code>", parse_mode="html")
     
     targets_raw, templates_raw = raw.split("|", 1)
-    
-    # Парсинг целей
     targets = []
     for t in targets_raw.split(","):
         p = parse_target(t)
         if p: targets.append(p)
     
-    if not targets:
-        return await event.respond("❌ Не удалось распознать цели.")
-    
+    if not targets: return await event.respond("❌ Не удалось распознать цели.")
     if len(targets) > limits["max_targets"]:
         return await event.respond(f"⚠️ Тариф <b>{user['plan']}</b> разрешает до <b>{limits['max_targets']}</b> целей.", parse_mode="html")
 
-    # Парсинг шаблонов
     templates = [line.strip() for line in templates_raw.split("\n") if line.strip()]
-    if not templates:
-        return await event.respond("❌ Нет шаблонов для отправки.")
+    if not templates: return await event.respond("❌ Нет шаблонов для отправки.")
 
-    # Остановка предыдущего
     if uid in spam_engines:
         spam_engines[uid].stop()
         await asyncio.sleep(0.3)
 
-    min_delay = limits["min_delay"] * 1000
-    max_delay = 60 * 1000 # Максимум всегда 60 сек
-
-    engine = SpamEngine(bot, targets, templates, min_delay, max_delay, metrics)
+    engine = SpamEngine(bot, targets, templates, limits["min_delay"] * 1000, 60 * 1000, metrics)
     spam_engines[uid] = engine
     asyncio.create_task(engine.start())
 
     msg = "🚀 <b>БЕСКОНЕЧНЫЙ СПАМ ЗАПУЩЕН</b>\n\n<b>Цели:</b>\n"
-    for t in targets:
-        msg += f"• <code>{t}</code>\n"
+    for t in targets: msg += f"• <code>{t}</code>\n"
     msg += f"\n⚙️ Задержка: {limits['min_delay']}–60с\n🛑 Остановить: /spam_stop"
     await event.respond(msg, parse_mode="html")
 
@@ -536,17 +516,13 @@ async def profile_handler(event):
 @bot.on(events.NewMessage(pattern=r"^/broadcast(?:@\w+)?(?:\s+([\s\S]+))?$"))
 async def broadcast_handler(event):
     uid = event.sender_id
-    if not is_admin(uid):
-        return await event.respond("⛔ Недостаточно прав.")
+    if not is_admin(uid): return await event.respond("⛔ Недостаточно прав.")
     body = (event.pattern_match.group(1) or "").strip()
-    if not body:
-        return await event.respond("Формат: <code>/broadcast Текст сообщения</code>", parse_mode="html")
-    if broadcast_lock.locked():
-        return await event.respond("⚠️ Рассылка уже выполняется.")
+    if not body: return await event.respond("Формат: <code>/broadcast Текст сообщения</code>", parse_mode="html")
+    if broadcast_lock.locked(): return await event.respond("⚠️ Рассылка уже выполняется.")
     async with broadcast_lock:
         targets = await db.subscribers()
-        if not targets:
-            return await event.respond("Нет пользователей с активной подпиской.")
+        if not targets: return await event.respond("Нет пользователей с активной подпиской.")
         sent = failed = 0
         status = await event.respond(f"📨 Начинаю отправку подписчикам: {len(targets)}")
         for index, target in enumerate(targets, 1):
@@ -586,7 +562,6 @@ async def callback_handler(event):
         limits = PLANS.get(user["plan"], PLANS["FREE"])
         is_active = uid in spam_engines and spam_engines[uid].is_active
         status_text = "🟢 <b>РАБОТАЕТ</b>" if is_active else "⚪ <b>ОСТАНОВЛЕН</b>"
-        
         text = (
             "<b>🚀  СПАМ-ДВИЖОК</b>\n"
             "<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
@@ -777,7 +752,7 @@ def api_stats():
 def api_users():
     check_dashboard_auth()
     async def fetch():
-        async with db.connect() as conn:
+        async with await db.connect() as conn:
             async with conn.execute(
                 "SELECT user_id, plan, subscribed, is_admin, is_approved, balance FROM users ORDER BY user_id DESC LIMIT 500"
             ) as cur:
@@ -788,7 +763,7 @@ def api_users():
 def api_audit():
     check_dashboard_auth()
     async def fetch():
-        async with db.connect() as conn:
+        async with await db.connect() as conn:
             async with conn.execute(
                 "SELECT created_at, admin_id, action, target_id, details FROM audit_log ORDER BY id DESC LIMIT 100"
             ) as cur:
