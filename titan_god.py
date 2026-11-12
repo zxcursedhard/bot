@@ -1,5 +1,5 @@
 # =====================================================================
-# TITAN Enterprise v6.0 — монолит для Render
+# TITAN Enterprise v6.1 — монолит для Render
 # =====================================================================
 import os
 import sys
@@ -37,6 +37,7 @@ API_ID = int(os.getenv("API_ID", "2040"))
 API_HASH = os.getenv("API_HASH", "b18441a1ff607e10a989891a5462e627")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8732669492:AAF6lfPEgcOp9iKzo74UGnPIPw9wfVa7YGo")
 DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "titan_super_secret_change_me_12345")
+PUBLIC_URL = os.getenv("PUBLIC_URL", "")  # например https://titan-xxxx.onrender.com
 
 SUPER_ADMINS = {8655682794, 8773171051}
 OWNER_CONTACT = "@apemiru"
@@ -45,9 +46,6 @@ SUPPORT_CONTACT = "@apemiru"
 DB_FILE = os.getenv("DB_FILE", "titan_database.db")
 BACKUP_DIR = os.getenv("BACKUP_DIR", "database_backups")
 PORT = int(os.getenv("PORT", "8080"))
-
-MIN_DELAY_LIMIT = 1
-MAX_DELAY_LIMIT = 60
 
 if os.path.isdir("/var/data") and not os.getenv("DB_FILE"):
     DB_FILE = "/var/data/titan_database.db"
@@ -383,6 +381,8 @@ class AdaptivePacer:
 
     def next_delay(self):
         lo, hi = self.base_min + self.penalty, self.base_max + self.penalty
+        if hi <= lo:
+            return max(1, lo) / 1000.0
         return random.randint(lo, hi) / 1000.0
 
     def on_flood(self, seconds):
@@ -392,13 +392,20 @@ class AdaptivePacer:
         return seconds + 5
 
 class SpamEngine:
-    def __init__(self, client, user_id, db_path, min_ms, max_ms, metrics, protection="basic", auto_pause=True, repo=None, schedule=None, blacklist=None, whitelist=None, stop_words=None, random_targets=False, ab_test=False, webhook_url=None):
+    """
+    Движок рассылки. КАЖДАЯ цель — бесконечный цикл, пока не stop().
+    Задержка честная: между отправками sleeps delay секунд, прерывается
+    мгновенно при stop().
+    """
+    def __init__(self, client, user_id, db_path, min_ms, max_ms, metrics,
+                 protection="basic", auto_pause=True, repo=None,
+                 schedule=None, blacklist=None, whitelist=None, stop_words=None,
+                 random_targets=False, ab_test=False, webhook_url=None):
         self.client = client
         self.user_id = user_id
         self.db_path = db_path
         self.pacer = AdaptivePacer(min_ms, max_ms, protection)
-        self._active = asyncio.Event()
-        self._active.set()
+        self._stop_event = asyncio.Event()   # взводится через stop()
         self._tasks = set()
         self.started_at = datetime.datetime.now()
         self.sent = 0
@@ -419,7 +426,7 @@ class SpamEngine:
 
     @property
     def is_active(self):
-        return self._active.is_set()
+        return not self._stop_event.is_set()
 
     def _is_allowed(self, target):
         if self.whitelist and target not in self.whitelist:
@@ -433,6 +440,15 @@ class SpamEngine:
             if w and w.lower() in msg.lower():
                 return None
         return msg
+
+    async def _sleep_until(self, seconds):
+        """Спит N секунд, но прерывается мгновенно при stop()."""
+        if seconds <= 0:
+            return
+        try:
+            await asyncio.wait_for(self._stop_event.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            pass
 
     async def _send_webhook(self, status, target, count):
         if not self.webhook_url:
@@ -450,17 +466,20 @@ class SpamEngine:
             async with aiosqlite.connect(self.db_path) as db:
                 await db.execute(
                     "INSERT INTO spam_history (user_id, target, sent_messages_count, status, started_at, ended_at) VALUES (?,?,?,?,?,?)",
-                    (self.user_id, target, count, status, self.started_at.isoformat(timespec="seconds"), datetime.datetime.now().isoformat(timespec="seconds")),
+                    (self.user_id, target, count, status,
+                     self.started_at.isoformat(timespec="seconds"),
+                     datetime.datetime.now().isoformat(timespec="seconds")),
                 )
                 await db.commit()
         except Exception as e:
             log.warning("history: %s", e)
 
     async def _attack_one(self, target, templates):
+        """Бесконечный цикл на одну цель, пока не stop() или не сработает auto_pause."""
         counter = 0
-        while self.is_active:
+        while not self._stop_event.is_set():
             if self.schedule and not is_valid_schedule(self.schedule):
-                await asyncio.sleep(60)
+                await self._sleep_until(60)
                 continue
             if not self._is_allowed(target):
                 break
@@ -468,12 +487,15 @@ class SpamEngine:
                 raw = random.choice(templates)
                 msg = self._filter_msg(raw)
                 if msg is None:
+                    await self._sleep_until(1)
                     continue
+
                 await self.client.send_message(target, msg)
                 counter += 1
                 self.sent += 1
                 self._consecutive_errors = 0
                 self.metrics["total_messages_sent"] += 1
+
                 if self.repo:
                     try:
                         await self.repo.log_daily(self.user_id, 1)
@@ -481,17 +503,20 @@ class SpamEngine:
                             await self.repo.log_ab_test(self.user_id, raw, sent=1)
                     except Exception:
                         pass
+
                 if counter % 10 == 0:
                     await self._write_history(target, counter, "RUNNING")
 
+                # ← ГЛАВНОЕ ИСПРАВЛЕНИЕ: реальная задержка между сообщениями
                 delay = self.pacer.next_delay()
-                try:
-                    await asyncio.wait_for(self._active.wait(), timeout=delay)
-                except asyncio.TimeoutError:
-                    pass
+                log.info("[%s] → %s | отправлено=%d | ждём %.1fс", self.user_id, target, self.sent, delay)
+                await self._sleep_until(delay)
+
             except FloodWaitError as e:
                 self.metrics["total_flood_wait_events"] += 1
-                await asyncio.sleep(self.pacer.on_flood(e.seconds))
+                wait_for = self.pacer.on_flood(e.seconds)
+                log.warning("[%s] FloodWait %sс → ждём %.0fс", self.user_id, e.seconds, wait_for)
+                await self._sleep_until(wait_for)
             except (ChatWriteForbiddenError, ChatAdminRequiredError, UserBannedInChannelError):
                 self.errors += 1
                 self.metrics["total_errors_caught"] += 1
@@ -499,29 +524,37 @@ class SpamEngine:
             except (SlowModeWaitError, PeerFloodError) as e:
                 self.errors += 1
                 self._consecutive_errors += 1
-                await asyncio.sleep(getattr(e, "seconds", 30) + 5)
+                await self._sleep_until(getattr(e, "seconds", 30) + 5)
                 if self.auto_pause and self._consecutive_errors >= self._error_threshold:
                     break
-            except Exception:
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
                 self.errors += 1
                 self.metrics["total_errors_caught"] += 1
                 self._consecutive_errors += 1
+                log.warning("[%s] ошибка отправки в %s: %s", self.user_id, target, str(e)[:120])
+                # короткая пауза даже при ошибке, чтобы не долбить в цикле
+                await self._sleep_until(self.pacer.next_delay())
                 if self.auto_pause and self._consecutive_errors >= self._error_threshold:
                     break
+
         await self._write_history(target, counter, "STOPPED")
         await self._send_webhook("stopped", target, counter)
 
     async def start(self, targets, templates):
-        self._active.set()
+        if not targets or not templates:
+            return
+        self._stop_event.clear()
         tasks = [asyncio.create_task(self._attack_one(t, templates)) for t in targets]
         self._tasks.update(tasks)
         for t in tasks:
             t.add_done_callback(self._tasks.discard)
         await asyncio.gather(*tasks, return_exceptions=True)
-        self._active.clear()
+        log.info("[%s] рассылка завершена (sent=%d, errors=%d)", self.user_id, self.sent, self.errors)
 
     def stop(self):
-        self._active.clear()
+        self._stop_event.set()
         for t in list(self._tasks):
             t.cancel()
 
@@ -582,7 +615,7 @@ def main_menu(is_admin):
         [Button.inline("ℹ️ Помощь", b"nav_help")],
     ]
     if is_admin:
-        menu.append([Button.inline("👑 Админ-панель", b"nav_admin")])
+        menu.append([Button.inline("👑 Админ-панель", b"nav_admin"), Button.inline("🌐 Дашборд", b"nav_dashboard")])
     return menu
 
 def main_text(uid, p):
@@ -598,8 +631,9 @@ def main_text(uid, p):
     badge = custom if custom else limits["badge"]
     max_t = limits['templates'] if limits['templates'] < 9999 else '∞'
     day_l = limits['daily_limit'] if limits['daily_limit'] < 999999 else '∞'
+    active = "🟢" if uid in spam_engines and spam_engines[uid].is_active else "⚪"
     return (
-        f"<b>⚡ TITAN Enterprise</b>\n"
+        f"<b>⚡ TITAN Enterprise</b> {active}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🆔 <b>ID:</b> <code>{uid}</code> {crown}\n"
         f"🏅 <b>Статус:</b> {badge} {limits['title']}\n"
@@ -665,6 +699,9 @@ def help_text():
         f"<b>📝 Шаблоны</b>\n"
         f"Каждая строка = отдельный шаблон.\n"
         f"Отправляется <b>ровно как ты ввёл</b>.\n\n"
+        f"<b>🚀 Рассылка</b>\n"
+        f"Работает <b>бесконечно</b> по каждой цели,\n"
+        f"пока ты не нажмёшь «🛑 Остановить».\n\n"
         f"<b>💎 Тарифы</b>\n"
         f"• FREE — 0 ₽\n"
         f"• PRO — 490 ₽/мес\n"
@@ -834,6 +871,15 @@ async def cb_handler(e):
         user_steps[uid] = "IDLE"
         p = await repo.get(uid)
         await e.edit(main_text(uid, p), buttons=main_menu(is_admin), parse_mode="html")
+    elif action == "nav_dashboard" and is_admin:
+        base = PUBLIC_URL or f"http://localhost:{PORT}"
+        link = f"{base}/?token={DASHBOARD_TOKEN}"
+        await e.edit(
+            f"🌐 <b>Веб-дашборд</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"<a href='{link}'>{link}</a>",
+            buttons=back, parse_mode="html",
+        )
     elif action == "nav_account":
         p = await repo.get(uid) or {}
         if not p.get("session"):
@@ -885,6 +931,7 @@ async def cb_handler(e):
             f"🚀 <b>Запуск (до {limits['max_targets']} целей)</b>\n\n"
             f"Список целей — <b>каждая с новой строки</b>:\n"
             f"<code>@chat1\n@chat2\nhttps://t.me/chat3\n123456789</code>\n\n"
+            f"♾ Рассылка работает <b>бесконечно</b> до «🛑 Остановить».\n"
             f"📈 Сегодня: {daily_count}/{limits['daily_limit']}",
             buttons=back, parse_mode="html",
         )
@@ -1299,7 +1346,7 @@ async def text_handler(e):
             return await e.reply(f"⚠️ Дневной лимит {limits['daily_limit']} исчерпан", parse_mode="html")
         if uid in spam_engines:
             spam_engines[uid].stop()
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.3)
         c = await resolve_client(uid)
         if not c:
             return await e.reply("❌ Сессия потеряна, /start → Аккаунт")
@@ -1318,10 +1365,10 @@ async def text_handler(e):
         )
         spam_engines[uid] = eng
         asyncio.create_task(eng.start(targets, p["templates"]))
-        msg = "🚀 <b>Запущено</b>\n\n<b>Цели:</b>\n" + "\n".join(f"• <code>{t}</code>" for t in targets)
+        msg = "🚀 <b>Запущено (бесконечный цикл)</b>\n\n<b>Цели:</b>\n" + "\n".join(f"• <code>{t}</code>" for t in targets)
         if bad:
             msg += f"\n\n⚠️ Не распознано: {len(bad)}"
-        msg += f"\n\nЗадержка: {int(p['min_delay']/1000)}–{int(p['max_delay']/1000)}с"
+        msg += f"\n\n⚙️ Задержка: {int(p['min_delay']/1000)}–{int(p['max_delay']/1000)}с\n🛑 Остановить → кнопка «🛑 Остановить»"
         await e.reply(msg, parse_mode="html")
 
     elif step == "ST_DELAY":
@@ -1764,7 +1811,7 @@ async def main():
 
 if __name__ == "__main__":
     log.info("=" * 50)
-    log.info("  TITAN Enterprise v6.0 — старт")
+    log.info("  TITAN Enterprise v6.1 — старт")
     log.info("=" * 50)
     try:
         asyncio.run(main())
