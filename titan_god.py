@@ -1,5 +1,5 @@
 # =====================================================================
-# TITAN Enterprise v6.2 — монолит для Render
+# TITAN Enterprise v6.3 — монолит для Render
 # =====================================================================
 import os
 import sys
@@ -25,6 +25,7 @@ from telethon.errors import (
     FloodWaitError, SessionPasswordNeededError, PhoneCodeInvalidError,
     PhoneCodeExpiredError, ChatWriteForbiddenError, ChatAdminRequiredError,
     UserBannedInChannelError, SlowModeWaitError, PeerFloodError,
+    ChannelPrivateError, ChatForbiddenError,
 )
 from telethon.errors.rpcerrorlist import AccessTokenInvalidError
 from flask import Flask, jsonify, request, abort, Response
@@ -78,7 +79,7 @@ PLAN_LIMITS = {
     },
     "ULTIMATE": {
         "templates": 9999, "min_delay": 1, "max_delay": 60,
-        "max_targets": 4, "stats": True, "export": True,
+        "max_targets": 10, "stats": True, "export": True,
         "schedule": True, "ab_test": True, "media": 5,
         "auto_pause": True, "priority_support": True,
         "custom_badge": True, "templates_backup": True,
@@ -95,7 +96,7 @@ PRICES = {"FREE": 0, "PRO": 490, "ULTIMATE": 1490}
 PLAN_FEATURES = {
     "FREE": ["10 шаблонов", "1 цель", "Задержка 50–60 сек", "Лимит 1000 сообщ/день"],
     "PRO": ["100 шаблонов", "2 цели", "Задержка 30–60 сек", "📊 Live-статистика", "📤 Экспорт CSV", "💾 Бэкап шаблонов", "🚫 Ч/Б списки", "🛑 Стоп-слова", "Лимит 10 000 сообщ/день"],
-    "ULTIMATE": ["∞ шаблонов", "4 цели", "Задержка 1–60 сек", "🎯 Всё из PRO", "🧪 A/B-тесты", "🕐 Расписание", "🎲 Рандом целей", "🔔 Webhooks", "♾ Без лимита"],
+    "ULTIMATE": ["∞ шаблонов", "10 целей", "Задержка 1–60 сек", "🎯 Всё из PRO", "🧪 A/B-тесты", "🕐 Расписание", "🎲 Рандом целей", "🔔 Webhooks", "♾ Без лимита"],
 }
 
 def plan_limits(plan: str) -> dict:
@@ -339,22 +340,50 @@ class UserRepo:
             async with db.execute("SELECT template, SUM(sent), SUM(errors) FROM ab_tests WHERE user_id=? GROUP BY template ORDER BY SUM(sent) DESC", (uid,)) as cur:
                 return await cur.fetchall()
 
+# =====================================================================
+# Парсер целей
+# =====================================================================
 _TG_URL = re.compile(r"(?:https?://)?t\.me/([A-Za-z0-9_]{4,})")
+_TG_RESOLVE = re.compile(r"(?:https?://)?t\.me/c/(\d+)")
+_TG_APP_CHAT = re.compile(r"tg://(?:chat|resolve)\?id=(-?\d+)")
+_TG_APP_OPEN = re.compile(r"tg://openmessage\?user_id=(-?\d+)")
 _NUMERIC = re.compile(r"^-?\d{5,}$")
 
 def normalize_target(raw):
+    """
+    Возвращает:
+      • "@username"  — для публичных
+      • int          — для закрытых чатов/каналов по ID
+      • None         — не распознано
+    """
     raw = raw.strip()
     if not raw:
         return None
+
+    m = _TG_APP_CHAT.search(raw)
+    if m:
+        return int(m.group(1))
+    m = _TG_APP_OPEN.search(raw)
+    if m:
+        return int(m.group(1))
+
+    m = _TG_RESOLVE.search(raw)
+    if m:
+        return int("-100" + m.group(1))
+
     m = _TG_URL.search(raw)
     if m:
         return "@" + m.group(1)
+
     if raw.startswith("@") and len(raw) > 1:
         return raw
+
     if _NUMERIC.match(raw):
-        return raw
+        return int(raw)
+
     if raw.startswith("+"):
         return raw
+
     return None
 
 def is_valid_schedule(schedule):
@@ -393,9 +422,8 @@ class AdaptivePacer:
 
 class SpamEngine:
     """
-    Движок рассылки. КАЖДАЯ цель — бесконечный цикл, пока не stop().
-    Задержка честная: между отправками sleeps delay секунд, прерывается
-    мгновенно при stop().
+    КАЖДАЯ цель — бесконечный цикл до stop().
+    Задержка честная, прерывается стопом.
     """
     def __init__(self, client, user_id, db_path, min_ms, max_ms, metrics,
                  protection="basic", auto_pause=True, repo=None,
@@ -454,7 +482,7 @@ class SpamEngine:
             return
         try:
             import urllib.request
-            data = json.dumps({"user_id": self.user_id, "target": target, "sent": count, "status": status}).encode("utf-8")
+            data = json.dumps({"user_id": self.user_id, "target": str(target), "sent": count, "status": status}).encode("utf-8")
             req = urllib.request.Request(self.webhook_url, data=data, headers={"Content-Type": "application/json"})
             urllib.request.urlopen(req, timeout=5)
         except Exception:
@@ -465,7 +493,7 @@ class SpamEngine:
             async with aiosqlite.connect(self.db_path) as db:
                 await db.execute(
                     "INSERT INTO spam_history (user_id, target, sent_messages_count, status, started_at, ended_at) VALUES (?,?,?,?,?,?)",
-                    (self.user_id, target, count, status,
+                    (self.user_id, str(target), count, status,
                      self.started_at.isoformat(timespec="seconds"),
                      datetime.datetime.now().isoformat(timespec="seconds")),
                 )
@@ -488,7 +516,16 @@ class SpamEngine:
                     await self._sleep_until(1)
                     continue
 
-                await self.client.send_message(target, msg)
+                # Отправка: int → get_entity для закрытых чатов
+                if isinstance(target, int):
+                    try:
+                        entity = await self.client.get_entity(target)
+                        await self.client.send_message(entity, msg)
+                    except (ValueError, ChannelPrivateError, ChatForbiddenError):
+                        raise ChatWriteForbiddenError(request=None)
+                else:
+                    await self.client.send_message(target, msg)
+
                 counter += 1
                 self.sent += 1
                 self._consecutive_errors = 0
@@ -672,7 +709,7 @@ def buy_text(uid):
         "• Стоп-слова\n"
         "• Приоритетная поддержка\n\n"
         "<b>👑 ULTIMATE — 1 490 ₽/мес</b>\n"
-        "• ∞ шаблонов, 4 цели\n"
+        "• ∞ шаблонов, 10 целей\n"
         "• Задержка 1–60 сек\n"
         "• A/B-тесты шаблонов\n"
         "• Расписание работы\n"
@@ -698,6 +735,10 @@ def help_text():
         f"<b>🚀 Рассылка</b>\n"
         f"Работает <b>бесконечно</b> по каждой цели,\n"
         f"пока ты не нажмёшь «🛑 Остановить».\n\n"
+        f"<b>🎯 Цели</b>\n"
+        f"Публичные: <code>@username</code> или <code>https://t.me/username</code>\n"
+        f"Закрытые: <code>tg://chat?id=…</code>, <code>https://t.me/c/…</code>, <code>-100…</code>\n"
+        f"⚠️ Аккаунт должен состоять в закрытом чате.\n\n"
         f"<b>💎 Тарифы</b>\n"
         f"• FREE — 0 ₽\n"
         f"• PRO — 490 ₽/мес\n"
@@ -933,10 +974,15 @@ async def cb_handler(e):
             return await e.answer(f"⚠️ Дневной лимит {limits['daily_limit']} исчерпан", alert=True)
         user_steps[uid] = "ST_TARGET"
         await e.edit(
-            f"🚀 <b>Запуск (до {limits['max_targets']} целей)</b>\n\n"
-            f"Список целей — <b>каждая с новой строки</b>:\n"
-            f"<code>@chat1\n@chat2\nhttps://t.me/chat3\n123456789</code>\n\n"
-            f"♾ Рассылка работает <b>бесконечно</b> до «🛑 Остановить».\n"
+            f"🚀 <b>Запуск (до {limits['max_targets']} целей)</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Список целей — <b>каждая с новой строки</b>.\n\n"
+            f"<b>Публичные:</b>\n"
+            f"<code>@chat\nhttps://t.me/chat</code>\n\n"
+            f"<b>Закрытые (по ID):</b>\n"
+            f"<code>tg://chat?id=3723738334\nhttps://t.me/c/1234567890\n-1001234567890\n3723738334</code>\n\n"
+            f"💡 Закрытые чаты: аккаунт <b>должен состоять</b> в чате.\n"
+            f"♾ Работает <b>бесконечно</b> до «🛑 Остановить».\n"
             f"📈 Сегодня: {daily_count}/{limits['daily_limit']}",
             buttons=back, parse_mode="html",
         )
@@ -1207,7 +1253,6 @@ async def text_handler(e):
     plan = p.get("plan", "FREE")
     limits = plan_limits(plan)
 
-    # Админ-команды
     if is_admin:
         try:
             if text.startswith(".approve"):
@@ -1411,12 +1456,21 @@ async def text_handler(e):
         targets, bad = [], []
         for r in raw:
             n = normalize_target(r)
-            if n:
+            if n is not None:
                 targets.append(n)
             else:
                 bad.append(r)
         if not targets:
-            return await e.reply("❌ Не удалось распознать цели")
+            return await e.reply(
+                "❌ Не удалось распознать цели.\n\n"
+                "Форматы:\n"
+                "<code>@username</code>\n"
+                "<code>https://t.me/username</code>\n"
+                "<code>tg://chat?id=3723738334</code>\n"
+                "<code>https://t.me/c/1234567890</code>\n"
+                "<code>-1001234567890</code>",
+                parse_mode="html",
+            )
         if len(targets) > limits["max_targets"]:
             return await e.reply(f"⚠️ Тариф <b>{plan}</b> разрешает <b>{limits['max_targets']}</b> целей. У тебя: {len(targets)}.\n\nПовысь тариф: /start → 💎", parse_mode="html")
         daily_count = await repo.get_daily_count(uid)
@@ -1443,9 +1497,14 @@ async def text_handler(e):
         )
         spam_engines[uid] = eng
         asyncio.create_task(eng.start(targets, p["templates"]))
-        msg = "🚀 <b>Запущено (бесконечный цикл)</b>\n\n<b>Цели:</b>\n" + "\n".join(f"• <code>{t}</code>" for t in targets)
+        msg = "🚀 <b>Запущено (бесконечный цикл)</b>\n\n<b>Цели:</b>\n"
+        for t in targets:
+            if isinstance(t, int):
+                msg += f"• <code>{t}</code> <i>(закрытый)</i>\n"
+            else:
+                msg += f"• <code>{t}</code>\n"
         if bad:
-            msg += f"\n\n⚠️ Не распознано: {len(bad)}"
+            msg += f"\n⚠️ Не распознано: {len(bad)}"
         msg += f"\n\n⚙️ Задержка: {int(p['min_delay']/1000)}–{int(p['max_delay']/1000)}с\n🛑 Остановить → «🛑 Остановить»"
         await e.reply(msg, parse_mode="html")
 
@@ -1480,7 +1539,7 @@ async def text_handler(e):
         added = 0
         for line in text.split("\n"):
             n = normalize_target(line)
-            if n and n not in cur:
+            if n is not None and n not in cur:
                 cur.add(n)
                 added += 1
         await repo.save(uid, blacklist=list(cur))
@@ -1491,7 +1550,7 @@ async def text_handler(e):
         added = 0
         for line in text.split("\n"):
             n = normalize_target(line)
-            if n and n not in cur:
+            if n is not None and n not in cur:
                 cur.add(n)
                 added += 1
         await repo.save(uid, whitelist=list(cur))
@@ -1889,7 +1948,7 @@ async def main():
 
 if __name__ == "__main__":
     log.info("=" * 50)
-    log.info("  TITAN Enterprise v6.2 — старт")
+    log.info("  TITAN Enterprise v6.3 — старт")
     log.info("=" * 50)
     try:
         asyncio.run(main())
