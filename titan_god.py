@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TITAN Enterprise v7.3.1 — single-file Telegram manager.
-Исправлена ошибка совместимости aiosqlite + Python 3.14.
+TITAN Enterprise v7.4 — single-file Telegram manager.
+Исправлен запуск БД на Python 3.14. Добавлено авто-возобновление после снятия мута.
 """
 
 from __future__ import annotations
@@ -131,13 +131,15 @@ class Database:
         self.lock = asyncio.Lock()
 
     def connect(self):
+        # Возвращает контекстный менеджер. Никаких async def здесь не нужно.
         return aiosqlite.connect(str(self.path), timeout=30)
 
     async def init(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.backup_dir.mkdir(parents=True, exist_ok=True)
-        # ИСПРАВЛЕНО: добавлен await перед self.connect()
-        async with await self.connect() as db:
+        # ИСПРАВЛЕНО: убран await перед self.connect()
+        async with self.connect() as db:
+            db.row_factory = aiosqlite.Row
             await db.execute("PRAGMA foreign_keys=ON")
             await db.execute("PRAGMA busy_timeout=30000")
             await db.execute("PRAGMA journal_mode=WAL")
@@ -169,7 +171,7 @@ class Database:
 
     async def ensure_user(self, uid: int):
         now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
-        async with await self.connect() as db:
+        async with self.connect() as db:
             await db.execute(
                 """INSERT INTO users(user_id, plan, is_admin, is_approved,
                    subscribed, accepted_rules, balance, registered_at, last_seen)
@@ -185,7 +187,7 @@ class Database:
             await db.commit()
 
     async def get_user(self, uid: int):
-        async with await self.connect() as db:
+        async with self.connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute("SELECT * FROM users WHERE user_id=?", (uid,)) as cur:
                 row = await cur.fetchone()
@@ -198,32 +200,35 @@ class Database:
             return
         columns = ", ".join(f"{k}=?" for k in fields)
         values = list(fields.values()) + [uid]
-        async with await self.connect() as db:
+        async with self.connect() as db:
             await db.execute(f"UPDATE users SET {columns} WHERE user_id=?", values)
             await db.commit()
 
     async def subscribers(self):
-        async with await self.connect() as db:
+        async with self.connect() as db:
+            db.row_factory = aiosqlite.Row
             async with db.execute(
                 "SELECT user_id FROM users WHERE subscribed=1 AND is_approved=1 ORDER BY user_id"
             ) as cur:
-                return [row[0] for row in await cur.fetchall()]
+                return [row["user_id"] for row in await cur.fetchall()]
 
     async def count(self):
-        async with await self.connect() as db:
+        async with self.connect() as db:
             async with db.execute("SELECT COUNT(*) AS n FROM users") as cur:
-                return (await cur.fetchone())[0]
+                row = await cur.fetchone()
+                return row["n"] if row else 0
 
     async def payment_stats(self):
-        async with await self.connect() as db:
+        async with self.connect() as db:
+            db.row_factory = aiosqlite.Row
             async with db.execute(
                 "SELECT COALESCE(SUM(amount),0) AS total, COUNT(*) AS n FROM payments_log"
             ) as cur:
                 row = await cur.fetchone()
-                return int(row[0]), int(row[1])
+                return (int(row["total"]), int(row["n"])) if row else (0, 0)
 
     async def log_audit(self, admin_id, action, target_id=None, details=""):
-        async with await self.connect() as db:
+        async with self.connect() as db:
             await db.execute(
                 "INSERT INTO audit_log(admin_id, action, target_id, details, created_at) VALUES(?,?,?,?,?)",
                 (admin_id, action, target_id, details[:1000],
@@ -232,7 +237,7 @@ class Database:
             await db.commit()
 
     async def log_broadcast(self, admin_id, preview, sent, failed):
-        async with await self.connect() as db:
+        async with self.connect() as db:
             await db.execute(
                 "INSERT INTO broadcast_log(admin_id, body_preview, sent, failed, created_at) VALUES(?,?,?,?,?)",
                 (admin_id, preview[:300], sent, failed,
@@ -245,8 +250,7 @@ class Database:
             self.backup_dir.mkdir(parents=True, exist_ok=True)
             stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
             destination = self.backup_dir / f"titan_{stamp}.db"
-            # ИСПРАВЛЕНО
-            async with await self.connect() as source:
+            async with self.connect() as source:
                 target = await aiosqlite.connect(str(destination))
                 try:
                     await source.backup(target)
@@ -367,14 +371,36 @@ class SpamEngine:
 
             except FloodWaitError as e:
                 self.metrics["flood_wait"] += 1
+                log.warning(f"FloodWait в {target}: ждем {e.seconds} сек")
                 await self._sleep(e.seconds + 5)
-            except (ChatWriteForbiddenError, ChatAdminRequiredError, UserBannedInChannelError):
+                
+            except SlowModeWaitError as e:
+                self.metrics["flood_wait"] += 1
+                log.warning(f"SlowMode в {target}: ждем {e.seconds} сек")
+                await self._sleep(e.seconds + 5)
+                continue # После ожидания продолжаем писать
+                
+            except (ChatWriteForbiddenError, ChatAdminRequiredError) as e:
+                # Скорее всего, аккаунт в муте. Ждем 5 минут и пробуем снова.
                 self.errors += 1
                 self.metrics["failed"] += 1
+                log.warning(f"Мут/Запрет в {target}: ждем 5 минут...")
+                await self._sleep(300)
+                continue # Возобновляем после ожидания
+
+            except UserBannedInChannelError:
+                # Жесткий бан, писать дальше нет смысла
+                self.errors += 1
+                self.metrics["failed"] += 1
+                log.warning(f"Аккаунт забанен в {target}. Остановка для этой цели.")
                 break
+
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 self.errors += 1
                 self.metrics["failed"] += 1
+                log.error(f"Ошибка отправки в {target}: {e}")
                 await self._sleep(5)
 
     async def start(self):
@@ -715,8 +741,8 @@ def dashboard():
 </style></head><body><div class="layout">
 <aside class="side"><div class="brand"><div class="logo">T</div><div><b>TITAN ENTERPRISE</b><small>PRIVATE CONTROL</small></div></div>
 <div class="navlabel">WORKSPACE</div><nav class="nav"><a class="active" href="#overview">◈ &nbsp; Обзор</a><a href="#users-section">♙ &nbsp; Пользователи</a><a href="#activity">◷ &nbsp; Активность</a><a href="#access">⚿ &nbsp; Доступ</a></nav>
-<div class="sidefoot"><span class="online">● SYSTEM ONLINE</span><br>CONTROL CENTER / V7.3<br>SECURE ADMIN INTERFACE</div></aside>
-<main id="overview"><header class="top"><div><div class="crumb">WORKSPACE / OVERVIEW</div><h1>Панель управления</h1></div><div class="topright"><div class="pill">● LIVE MONITORING</div><div class="pill">V7.3</div></div></header>
+<div class="sidefoot"><span class="online">● SYSTEM ONLINE</span><br>CONTROL CENTER / V7.4<br>SECURE ADMIN INTERFACE</div></aside>
+<main id="overview"><header class="top"><div><div class="crumb">WORKSPACE / OVERVIEW</div><h1>Панель управления</h1></div><div class="topright"><div class="pill">● LIVE MONITORING</div><div class="pill">V7.4</div></div></header>
 <section class="hero"><div class="eyebrow">TITAN COMMAND CENTER</div><h2>Полный контроль. Один интерфейс.</h2><p>Мониторинг пользователей, подписок и активности. Данные обновляются автоматически, доступ к API защищён отдельным ключом.</p></section>
 <section class="stats"><article class="card"><div class="kicker">ВСЕГО ПОЛЬЗОВАТЕЛЕЙ</div><div class="num" id="users">—</div></article><article class="card"><div class="kicker">АКТИВНЫЕ ПОДПИСКИ</div><div class="num green" id="subs">—</div></article><article class="card"><div class="kicker">УСПЕШНЫЕ ОТПРАВКИ</div><div class="num red" id="sent">—</div></article><article class="card"><div class="kicker">ОШИБКИ ОТПРАВКИ</div><div class="num" id="failed">—</div></article><article class="card"><div class="kicker">FLOOD WAIT</div><div class="num" id="flood">—</div></article><article class="card"><div class="kicker">ОБОРОТ</div><div class="num" id="revenue">— ₽</div></article></section>
 <section class="lower"><article class="panel" id="users-section"><div class="panelhead"><b>♙ Пользователи</b><span>LAST 500</span></div><div class="tablewrap"><table><thead><tr><th>USER ID</th><th>ТАРИФ</th><th>НОВОСТИ</th><th>ДОСТУП</th></tr></thead><tbody id="userRows"><tr><td colspan="4" class="muted">Подключите панель для загрузки данных</td></tr></tbody></table></div></article>
