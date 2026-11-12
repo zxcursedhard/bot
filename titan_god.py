@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TITAN Enterprise v8.3 — Полный функционал + Железобетонная авторизация в веб-панели.
+TITAN Enterprise v8.4 — Полный функционал + Автовход в панель без токена.
 """
 
 import os
@@ -1494,8 +1494,8 @@ DASHBOARD_HTML = r"""<!doctype html>
 </style></head><body><div class="layout">
 <aside class="side"><div class="brand"><div class="logo">T</div><div><b>TITAN ENTERPRISE</b><small>PRIVATE CONTROL</small></div></div>
 <div class="navlabel">WORKSPACE</div><nav class="nav"><a class="active" href="#overview">◈ &nbsp; Обзор</a><a href="#users-section">♙ &nbsp; Пользователи</a><a href="#activity">◷ &nbsp; Активность</a><a href="#access">⚿ &nbsp; Доступ</a></nav>
-<div class="sidefoot"><span class="online">● SYSTEM ONLINE</span><br>CONTROL CENTER / V8.3<br>SECURE ADMIN INTERFACE</div></aside>
-<main id="overview"><header class="top"><div><div class="crumb">WORKSPACE / OVERVIEW</div><h1>Панель управления</h1></div><div class="topright"><div class="pill">● LIVE MONITORING</div><div class="pill">V8.3</div></div></header>
+<div class="sidefoot"><span class="online">● SYSTEM ONLINE</span><br>CONTROL CENTER / V8.4<br>SECURE ADMIN INTERFACE</div></aside>
+<main id="overview"><header class="top"><div><div class="crumb">WORKSPACE / OVERVIEW</div><h1>Панель управления</h1></div><div class="topright"><div class="pill">● LIVE MONITORING</div><div class="pill">V8.4</div></div></header>
 <section class="hero"><div class="eyebrow">TITAN COMMAND CENTER</div><h2>Полный контроль. Один интерфейс.</h2><p>Мониторинг пользователей, подписок и активности. Данные обновляются автоматически, доступ к API защищён отдельным ключом.</p></section>
 <section class="stats"><article class="card"><div class="kicker">ВСЕГО ПОЛЬЗОВАТЕЛЕЙ</div><div class="num" id="users">—</div></article><article class="card"><div class="kicker">АКТИВНЫЕ СЕССИИ</div><div class="num green" id="subs">—</div></article><article class="card"><div class="kicker">УСПЕШНЫЕ ОТПРАВКИ</div><div class="num red" id="sent">—</div></article><article class="card"><div class="kicker">ОШИБКИ ОТПРАВКИ</div><div class="num" id="failed">—</div></article><article class="card"><div class="kicker">FLOOD WAIT</div><div class="num" id="flood">—</div></article><article class="card"><div class="kicker">ОБОРОТ</div><div class="num" id="revenue">— ₽</div></article></section>
 <section class="lower"><article class="panel" id="users-section"><div class="panelhead"><b>♙ Пользователи</b><span>LAST 500</span></div><div class="tablewrap"><table><thead><tr><th>USER ID</th><th>ТАРИФ</th><th>БАЛАНС</th><th>СЕССИЯ</th><th>ДОСТУП</th></tr></thead><tbody id="userRows"><tr><td colspan="5" class="muted">Подключите панель для загрузки данных</td></tr></tbody></table></div></article>
@@ -1510,12 +1510,11 @@ const DEFAULT_TOKEN = 'titan_super_secret_change_me_12345';
 const urlToken = new URLSearchParams(location.search).get('token');
 if (urlToken) {
     sessionStorage.setItem('titan_token', urlToken);
-    document.cookie = "titan_token=" + urlToken + "; path=/; max-age=86400"; // сохраняем в куки на сутки
+    document.cookie = "titan_token=" + urlToken + "; path=/; max-age=86400";
     window.history.replaceState({}, document.title, "/");
 }
 
 function token() {
-    // Приоритет: URL -> sessionStorage -> cookie -> дефолтный токен
     let t = urlToken || sessionStorage.getItem('titan_token');
     if (!t) {
         const match = document.cookie.match(/(^| )titan_token=([^;]+)/);
@@ -1681,7 +1680,7 @@ async def main():
 
 if __name__ == "__main__":
     log.info("=" * 50)
-    log.info("  TITAN Enterprise v8.3 — старт")
+    log.info("  TITAN Enterprise v8.4 — старт")
     log.info("=" * 50)
     try:
         asyncio.run(main())
