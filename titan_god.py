@@ -1182,8 +1182,8 @@ async def cb_handler(e):
             + active_hint,
             buttons=back, parse_mode="html",
         )
-            elif action == "nav_spam":
-        if not p.get("session"):
+        elif action == "nav_spam": 
+    if not p.get("session"):
             return await e.answer("❌ Нет сессии", alert=True)
         if not p.get("templates"):
             return await e.answer("❌ Нет шаблонов", alert=True)
