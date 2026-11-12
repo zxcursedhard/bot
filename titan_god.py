@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TITAN Enterprise v8.1 — Полный функционал v6 + Дизайн v7.1 + Фикс colorama и БД.
+TITAN Enterprise v8.2 — Полный функционал + Фикс авторизации в веб-панели.
 """
 
 import os
@@ -1494,8 +1494,8 @@ DASHBOARD_HTML = r"""<!doctype html>
 </style></head><body><div class="layout">
 <aside class="side"><div class="brand"><div class="logo">T</div><div><b>TITAN ENTERPRISE</b><small>PRIVATE CONTROL</small></div></div>
 <div class="navlabel">WORKSPACE</div><nav class="nav"><a class="active" href="#overview">◈ &nbsp; Обзор</a><a href="#users-section">♙ &nbsp; Пользователи</a><a href="#activity">◷ &nbsp; Активность</a><a href="#access">⚿ &nbsp; Доступ</a></nav>
-<div class="sidefoot"><span class="online">● SYSTEM ONLINE</span><br>CONTROL CENTER / V8.1<br>SECURE ADMIN INTERFACE</div></aside>
-<main id="overview"><header class="top"><div><div class="crumb">WORKSPACE / OVERVIEW</div><h1>Панель управления</h1></div><div class="topright"><div class="pill">● LIVE MONITORING</div><div class="pill">V8.1</div></div></header>
+<div class="sidefoot"><span class="online">● SYSTEM ONLINE</span><br>CONTROL CENTER / V8.2<br>SECURE ADMIN INTERFACE</div></aside>
+<main id="overview"><header class="top"><div><div class="crumb">WORKSPACE / OVERVIEW</div><h1>Панель управления</h1></div><div class="topright"><div class="pill">● LIVE MONITORING</div><div class="pill">V8.2</div></div></header>
 <section class="hero"><div class="eyebrow">TITAN COMMAND CENTER</div><h2>Полный контроль. Один интерфейс.</h2><p>Мониторинг пользователей, подписок и активности. Данные обновляются автоматически, доступ к API защищён отдельным ключом.</p></section>
 <section class="stats"><article class="card"><div class="kicker">ВСЕГО ПОЛЬЗОВАТЕЛЕЙ</div><div class="num" id="users">—</div></article><article class="card"><div class="kicker">АКТИВНЫЕ СЕССИИ</div><div class="num green" id="subs">—</div></article><article class="card"><div class="kicker">УСПЕШНЫЕ ОТПРАВКИ</div><div class="num red" id="sent">—</div></article><article class="card"><div class="kicker">ОШИБКИ ОТПРАВКИ</div><div class="num" id="failed">—</div></article><article class="card"><div class="kicker">FLOOD WAIT</div><div class="num" id="flood">—</div></article><article class="card"><div class="kicker">ОБОРОТ</div><div class="num" id="revenue">— ₽</div></article></section>
 <section class="lower"><article class="panel" id="users-section"><div class="panelhead"><b>♙ Пользователи</b><span>LAST 500</span></div><div class="tablewrap"><table><thead><tr><th>USER ID</th><th>ТАРИФ</th><th>БАЛАНС</th><th>СЕССИЯ</th><th>ДОСТУП</th></tr></thead><tbody id="userRows"><tr><td colspan="5" class="muted">Подключите панель для загрузки данных</td></tr></tbody></table></div></article>
@@ -1503,11 +1503,37 @@ DASHBOARD_HTML = r"""<!doctype html>
 <section class="panel" id="access" style="margin-top:14px"><div class="panelhead"><b>⚿ Защищённое подключение</b><span>API AUTHENTICATION</span></div><div class="muted" id="state">Введите ключ доступа панели. Ключ хранится только в текущей сессии браузера.</div><div class="authrow"><input id="token" type="password" autocomplete="off" placeholder="Ключ доступа панели"><button onclick="saveToken()">ПОДКЛЮЧИТЬ</button><button onclick="logout()" style="background:#252b38;box-shadow:none">ВЫЙТИ</button></div><div id="error"></div></section>
 <div class="foot">TITAN ENTERPRISE · PRIVATE ADMIN INTERFACE · AUTO REFRESH 10 SEC</div></main></div>
 <script>
-const $=id=>document.getElementById(id);function token(){return sessionStorage.getItem('titan_token')||''}
+// Автоматически берем токен из ссылки при загрузке страницы
+const urlToken = new URLSearchParams(location.search).get('token');
+if (urlToken) {
+    sessionStorage.setItem('titan_token', urlToken);
+    window.history.replaceState({}, document.title, "/"); // очищаем URL от токена
+}
+
+const $=id=>document.getElementById(id);
+function token(){return sessionStorage.getItem('titan_token')||''}
 function saveToken(){const v=$('token').value.trim();if(v)sessionStorage.setItem('titan_token',v);$('token').value='';loadAll()}
 function logout(){sessionStorage.removeItem('titan_token');$('state').textContent='Сессия завершена. Введите ключ доступа.';$('userRows').innerHTML='<tr><td colspan="5">Нет подключения</td></tr>';$('auditRows').innerHTML='';}
 async function api(path){const r=await fetch(path,{headers:{'X-Token':token()},cache:'no-store'});if(!r.ok)throw Error(r.status===401?'Неверный ключ доступа':'HTTP '+r.status);return r.json()}
-async function loadAll(){if(!token())return;try{const [d,u,a]=await Promise.all([api('/api/stats'),api('/api/users'),api('/api/audit')]);$('users').textContent=Number(d.users).toLocaleString('ru-RU');$('subs').textContent=Number(d.sessions).toLocaleString('ru-RU');$('sent').textContent=Number(d.messages).toLocaleString('ru-RU');$('failed').textContent=Number(d.errors).toLocaleString('ru-RU');$('flood').textContent=Number(d.flood).toLocaleString('ru-RU');$('revenue').textContent=Number(d.revenue).toLocaleString('ru-RU')+' ₽';$('state').textContent='● Подключено · uptime '+d.uptime;$('error').textContent='';$('userRows').innerHTML=u.users.map(x=>`<tr><td><code>${x.user_id}</code></td><td><span class="tag">${x.plan}</span></td><td>${x.balance} ₽</td><td>${x.has_session ? '🟢 ВКЛ' : '—'}</td><td>${x.is_approved ? '🟢' : '🔴'}</td></tr>`).join('')||'<tr><td colspan="5">Пользователей пока нет</td></tr>';$('auditRows').innerHTML=a.audit.map(x=>`<div class="event"><b>${x.action}</b> · ${x.admin_id}${x.target_id?' → '+x.target_id:''}<br><span class="muted">${x.created_at}</span></div>`).join('')||'<div class="muted">Записей пока нет</div>';}catch(e){$('error').textContent='Ошибка подключения: '+e.message;$('state').textContent='● Нет подключения';}}
+async function loadAll(){
+    if(!token()){ $('state').textContent = 'Введите ключ доступа для загрузки данных.'; return; }
+    try {
+        const [d,u,a]=await Promise.all([api('/api/stats'),api('/api/users'),api('/api/audit')]);
+        $('users').textContent=Number(d.users).toLocaleString('ru-RU');
+        $('subs').textContent=Number(d.sessions).toLocaleString('ru-RU');
+        $('sent').textContent=Number(d.messages).toLocaleString('ru-RU');
+        $('failed').textContent=Number(d.errors).toLocaleString('ru-RU');
+        $('flood').textContent=Number(d.flood).toLocaleString('ru-RU');
+        $('revenue').textContent=Number(d.revenue).toLocaleString('ru-RU')+' ₽';
+        $('state').textContent='● Подключено · uptime '+d.uptime;
+        $('error').textContent='';
+        $('userRows').innerHTML=u.users.map(x=>`<tr><td><code>${x.user_id}</code></td><td><span class="tag">${x.plan}</span></td><td>${x.balance} ₽</td><td>${x.has_session ? '🟢 ВКЛ' : '—'}</td><td>${x.is_approved ? '🟢' : '🔴'}</td></tr>`).join('')||'<tr><td colspan="5">Пользователей пока нет</td></tr>';
+        $('auditRows').innerHTML=a.audit.map(x=>`<div class="event"><b>${x.action}</b> · ${x.admin_id}${x.target_id?' → '+x.target_id:''}<br><span class="muted">${x.created_at}</span></div>`).join('')||'<div class="muted">Записей пока нет</div>';
+    } catch(e) {
+        $('error').textContent='Ошибка подключения: '+e.message;
+        $('state').textContent='● Нет подключения';
+    }
+}
 loadAll();setInterval(loadAll,10000);
 </script></body></html>"""
 
@@ -1622,7 +1648,7 @@ async def main():
 
 if __name__ == "__main__":
     log.info("=" * 50)
-    log.info("  TITAN Enterprise v8.1 — старт")
+    log.info("  TITAN Enterprise v8.2 — старт")
     log.info("=" * 50)
     try:
         asyncio.run(main())
