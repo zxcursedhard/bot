@@ -7,6 +7,7 @@ import random
 import datetime
 import threading
 import shutil
+import urllib.parse
 from colorama import init, Fore, Style
 from flask import Flask, jsonify
 import aiosqlite
@@ -15,7 +16,7 @@ from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
 from telethon.errors import (
     FloodWaitError, SessionPasswordNeededError, PhoneCodeInvalidError,
-    PhoneCodeExpiredError, AuthRestartError
+    PhoneCodeExpiredError
 )
 from telethon.errors.rpcerrorlist import AccessTokenInvalidError, ChatWriteForbiddenError
 
@@ -28,19 +29,27 @@ API_ID = 2040
 API_HASH = 'b18441a1ff607e10a989891a5462e627'
 BOT_TOKEN = '8732669492:AAF6lfPEgcOp9iKzo74UGnPIPw9wfVa7YGo'
 
+# Создатели (всегда ULTIMATE + админ)
 SUPER_ADMINS = {8655682794, 8773171051}
 SUPPORT_CONTACT = "@apemiru"
 
 DB_FILE = 'titan_database.db'
 BACKUP_DIR = 'database_backups'
 
-MIN_DELAY_LIMIT = 3
+# Глобальные рамки (абсолютный максимум/минимум для всей системы)
+MIN_DELAY_LIMIT = 1
 MAX_DELAY_LIMIT = 60
+
+# Лимиты по тарифам (в секундах)
+PLAN_LIMITS = {
+    'FREE':     {'templates': 10,  'min_delay': 50, 'max_delay': 60},
+    'PRO':      {'templates': 100, 'min_delay': 30, 'max_delay': 60},
+    'ULTIMATE': {'templates': 9999,'min_delay': 1,  'max_delay': 60},
+}
 
 active_clients = {}
 user_steps = {}
 spam_engines = {}
-qr_tasks = {}
 
 system_metrics = {
     "total_messages_sent": 0,
@@ -82,8 +91,8 @@ class TitanDB:
                     user_id INTEGER PRIMARY KEY,
                     session_string TEXT,
                     templates TEXT DEFAULT '[]',
-                    min_delay INTEGER DEFAULT 5000,
-                    max_delay INTEGER DEFAULT 15000,
+                    min_delay INTEGER DEFAULT 50000,
+                    max_delay INTEGER DEFAULT 60000,
                     is_approved INTEGER DEFAULT 0,
                     is_admin INTEGER DEFAULT 0,
                     plan TEXT DEFAULT 'FREE',
@@ -145,15 +154,17 @@ async def save_user(uid, session=None, templates=None, min_d=None, max_d=None, a
     cur = await get_user(uid)
     s = session if session is not None else (cur['session'] if cur else None)
     t = templates if templates is not None else (cur['templates'] if cur else [])
-    mind = min_d if min_d is not None else (cur['min_delay'] if cur else 5000)
-    maxd = max_d if max_d is not None else (cur['max_delay'] if cur else 15000)
+    mind = min_d if min_d is not None else (cur['min_delay'] if cur else 50000)
+    maxd = max_d if max_d is not None else (cur['max_delay'] if cur else 60000)
     a = approved if approved is not None else (cur['is_approved'] if cur else 0)
     adm = admin if admin is not None else (cur['is_admin'] if cur else 0)
     pl = plan if plan is not None else (cur['plan'] if cur else 'FREE')
 
+    # Создатели — всегда админ + ULTIMATE
     if uid in SUPER_ADMINS:
         a = 1
         adm = 1
+        pl = 'ULTIMATE'
 
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute('''
@@ -172,6 +183,9 @@ async def save_user(uid, session=None, templates=None, min_d=None, max_d=None, a
 
 def is_super(uid):
     return int(uid) in SUPER_ADMINS
+
+def plan_limits(plan):
+    return PLAN_LIMITS.get(plan, PLAN_LIMITS['FREE'])
 
 async def resolve_client(uid):
     if uid in active_clients:
@@ -207,6 +221,7 @@ class SpamEngine:
         if "t.me/" in target:
             target = "@" + target.split("t.me/")[-1].split("/")[0].split("?")[0]
 
+        # Жёстко ограничиваем задержку глобальными лимитами (1-60 сек)
         current_min = max(MIN_DELAY_LIMIT * 1000, min(min_delay, MAX_DELAY_LIMIT * 1000))
         current_max = max(MIN_DELAY_LIMIT * 1000, min(max_delay, MAX_DELAY_LIMIT * 1000))
         if current_max < current_min:
@@ -271,8 +286,8 @@ def main_menu(is_admin):
 def main_text(uid, p):
     status = "✅ Подключён" if p and p['session'] else "❌ Не подключён"
     tpl = len(p['templates']) if p else 0
-    mind = int(p['min_delay'] / 1000) if p else 5
-    maxd = int(p['max_delay'] / 1000) if p else 15
+    mind = int(p['min_delay'] / 1000) if p else 50
+    maxd = int(p['max_delay'] / 1000) if p else 60
     active = "🟢 Активен" if uid in spam_engines else "⚪ Не запущен"
     crown = "👑 " if is_super(uid) else ""
     plan = p.get('plan', 'FREE') if p else 'FREE'
@@ -297,9 +312,9 @@ async def cmd_start(e):
     p = await get_user(uid)
 
     if is_super(uid):
-        if not p or p['is_admin'] != 1 or p['is_approved'] != 1:
-            await save_user(uid, admin=1, approved=1)
-            TitanLogger.sys(f"Супер-админ авторизован: {uid}")
+        if not p or p['is_admin'] != 1 or p['is_approved'] != 1 or p['plan'] != 'ULTIMATE':
+            await save_user(uid, admin=1, approved=1, plan='ULTIMATE')
+            TitanLogger.sys(f"Создатель авторизован: {uid}")
             p = await get_user(uid)
 
     is_admin = p and p['is_admin'] == 1
@@ -318,7 +333,6 @@ async def cmd_start(e):
     user_steps[uid] = "IDLE"
     await e.reply(main_text(uid, p), buttons=main_menu(is_admin), parse_mode='html')
 
-# ---------- АВТОРИЗАЦИЯ: SMS / ЗВОНОК / QR ----------
 @bot.on(events.CallbackQuery(data="nav_account"))
 async def cb_account(e):
     uid = e.sender_id
@@ -340,7 +354,7 @@ async def cb_account(e):
     else:
         await e.edit(
             f"✅ <b>Аккаунт подключён</b>\n\n"
-            f"Сессия активна и готова к работе.\n\n"
+            f"Сессия активна.\n\n"
             f"По вопросам: {SUPPORT_CONTACT}",
             buttons=[[Button.inline("🔙 Назад", b"nav_home")]],
             parse_mode='html'
@@ -357,8 +371,6 @@ async def cb_qr_start(e):
         active_clients[f"qr_{uid}"] = {'client': c, 'qr': qr}
         user_steps[uid] = "ST_QR"
 
-        # Генерируем картинку QR через Google Chart API (быстрый способ без зависимостей)
-        import urllib.parse
         qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=400x400&data={urllib.parse.quote(qr.url)}"
 
         await e.edit(
@@ -368,12 +380,11 @@ async def cb_qr_start(e):
             "2️⃣ Настройки → Устройства → Подключить устройство\n"
             "3️⃣ Отсканируй QR ниже\n\n"
             f"🔗 <a href='{qr_url}'>Открыть QR-код</a>\n\n"
-            "⏳ Жду сканирования (60 сек)...",
+            "⏳ Жду сканирования (120 сек)...",
             buttons=[[Button.inline("🔙 Отмена", b"qr_cancel")]],
             parse_mode='html'
         )
 
-        # Ждём авторизации
         try:
             await asyncio.wait_for(qr.wait(), timeout=120)
             await save_user(uid, session=c.session.save())
@@ -382,19 +393,14 @@ async def cb_qr_start(e):
                 del active_clients[f"qr_{uid}"]
             user_steps[uid] = "IDLE"
             await e.edit(
-                "✅ <b>Успешно авторизован по QR!</b>\n\n"
-                "Возвращайтесь в меню: /start",
+                "✅ <b>Успешно авторизован по QR!</b>\n\n/start",
                 parse_mode='html'
             )
         except asyncio.TimeoutError:
-            await e.edit("⏱ Время QR истекло. Попробуйте заново: /start")
+            await e.edit("⏱ Время QR истекло. /start")
             user_steps[uid] = "IDLE"
     except Exception as ex:
-        await e.edit(
-            f"❌ Ошибка QR: <code>{str(ex)[:200]}</code>\n\n"
-            f"По вопросам: {SUPPORT_CONTACT}",
-            parse_mode='html'
-        )
+        await e.edit(f"❌ Ошибка QR: <code>{str(ex)[:200]}</code>", parse_mode='html')
         user_steps[uid] = "IDLE"
 
 @bot.on(events.CallbackQuery(data="qr_cancel"))
@@ -417,12 +423,10 @@ async def cb_resend_call(e):
         return await e.answer("❌ Нет активной попытки входа", alert=True)
     try:
         await b['client'].send_code_request(b['phone'], force_sms=False)
-        # force_sms=False → Telegram может выбрать звонок вместо SMS
-        await e.answer("📞 Повторный запрос отправлен (возможно, звонком)", alert=True)
+        await e.answer("📞 Повторный запрос (возможно, звонком)", alert=True)
     except Exception as ex:
         await e.answer(f"❌ {str(ex)[:100]}", alert=True)
 
-# ---------- ГЛАВНЫЕ РОУТЫ ----------
 @bot.on(events.CallbackQuery)
 async def cb_handler(e):
     uid = e.sender_id
@@ -444,6 +448,7 @@ async def cb_handler(e):
 
     elif action == "nav_templates":
         tpls = p.get('templates', [])
+        limits = plan_limits(p.get('plan', 'FREE'))
         preview = "\n".join([f"• {t[:50]}" for t in tpls[:10]])
         if len(tpls) > 10:
             preview += f"\n<i>...и ещё {len(tpls)-10}</i>"
@@ -454,11 +459,11 @@ async def cb_handler(e):
             [Button.inline("🔙 Назад", b"nav_home")],
         ]
         await e.edit(
-            f"📝 <b>Шаблоны ({len(tpls)} шт.)</b>\n"
+            f"📝 <b>Шаблоны ({len(tpls)}/{limits['templates']})</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"{preview}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Отправьте текст — каждая строка станет отдельным шаблоном.",
+            f"Отправьте текст — каждая строка = шаблон.",
             buttons=buttons, parse_mode='html'
         )
 
@@ -466,21 +471,22 @@ async def cb_handler(e):
         await save_user(uid, templates=[])
         await e.answer("✅ Все шаблоны удалены")
         await e.edit(
-            "📝 <b>Шаблоны (0 шт.)</b>\n\n"
-            "<i>Список очищен.</i>",
+            "📝 <b>Шаблоны (0 шт.)</b>\n\n<i>Список очищен.</i>",
             buttons=[[Button.inline("🔙 Назад", b"nav_home")]], parse_mode='html'
         )
 
     elif action == "nav_delay":
         user_steps[uid] = "ST_DELAY"
-        mind = int(p.get('min_delay', 5000) / 1000)
-        maxd = int(p.get('max_delay', 15000) / 1000)
+        limits = plan_limits(p.get('plan', 'FREE'))
+        mind = int(p.get('min_delay', 50000) / 1000)
+        maxd = int(p.get('max_delay', 60000) / 1000)
         await e.edit(
             f"⚙️ <b>Задержка</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Текущая: <b>{mind}–{maxd} сек</b>\n\n"
-            f"Диапазон: <b>{MIN_DELAY_LIMIT}–{MAX_DELAY_LIMIT}</b> сек\n"
-            f"Формат: <code>5-15</code>",
+            f"Текущая: <b>{mind}–{maxd} сек</b>\n"
+            f"Доступный диапазон для тарифа <b>{p.get('plan','FREE')}</b>:\n"
+            f"<b>{limits['min_delay']}–{limits['max_delay']}</b> сек\n\n"
+            f"Формат: <code>{limits['min_delay']}-{limits['max_delay']}</code>",
             buttons=back, parse_mode='html'
         )
 
@@ -508,15 +514,15 @@ async def cb_handler(e):
             f"💎 <b>Тарифные планы</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"⚪ <b>FREE</b> — базовый\n"
-            f"• 1 аккаунт, до 10 шаблонов\n"
-            f"• Задержка 15–60 сек\n\n"
+            f"• До 10 шаблонов\n"
+            f"• Задержка 50–60 сек\n\n"
             f"💎 <b>PRO</b> — расширенный\n"
-            f"• 1 аккаунт, до 100 шаблонов\n"
-            f"• Задержка 5–30 сек\n"
+            f"• До 100 шаблонов\n"
+            f"• Задержка 30–60 сек\n"
             f"• Приоритетная поддержка\n\n"
             f"👑 <b>ULTIMATE</b> — максимум\n"
-            f"• Все функции, без лимитов шаблонов\n"
-            f"• Задержка 3–15 сек\n"
+            f"• Без лимитов шаблонов\n"
+            f"• Задержка 1–60 сек\n"
             f"• Персональный менеджер\n\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"Ваш тариф: <b>{plan}</b>\n\n"
@@ -531,9 +537,8 @@ async def cb_handler(e):
             f"<b>Не приходит код?</b>\n"
             f"• Введите номер → выберите QR-код\n"
             f"• Или запросите звонок вместо SMS\n"
-            f"• Проверьте, что Telegram активен на номере\n"
-            f"• Обратитесь в @smsteam_bot\n\n"
-            f"<b>Задержка:</b> {MIN_DELAY_LIMIT}–{MAX_DELAY_LIMIT} сек\n\n"
+            f"• Проверьте, что Telegram активен на номере\n\n"
+            f"<b>Задержка:</b> зависит от тарифа (1–60 сек)\n\n"
             f"<b>Цель:</b> @username / ссылка / ID\n\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"📩 <b>По всем вопросам:</b> {SUPPORT_CONTACT}",
@@ -546,12 +551,11 @@ async def cb_handler(e):
             "━━━━━━━━━━━━━━━━━━━━\n"
             "<code>.approve &lt;ID&gt;</code> — выдать доступ\n"
             "<code>.revoke &lt;ID&gt;</code> — забрать доступ\n"
-            "<code>.plan &lt;ID&gt; &lt;FREE|PRO|ULTIMATE&gt;</code> — тариф\n"
+            "<code>.sub &lt;ID&gt; &lt;FREE|PRO|ULTIMATE&gt;</code> — тариф\n"
             "<code>.id</code> — свой ID",
             buttons=back, parse_mode='html'
         )
 
-# ---------- ТЕКСТОВЫЙ ОБРАБОТЧИК ----------
 @bot.on(events.NewMessage)
 async def text_handler(e):
     uid = e.sender_id
@@ -564,6 +568,7 @@ async def text_handler(e):
     is_admin = p.get('is_admin') == 1 or is_super(uid)
     is_approved = p.get('is_approved') == 1 or is_super(uid)
 
+    # --- АДМИН-КОМАНДЫ ---
     if is_admin:
         if text.startswith('.approve'):
             try:
@@ -573,18 +578,20 @@ async def text_handler(e):
             except:
                 await e.reply("❌ <code>.approve 1234567</code>", parse_mode='html')
             return
+
         if text.startswith('.revoke'):
             try:
                 t_id = int(text.split(' ')[1])
                 if is_super(t_id):
-                    await e.reply("⚠️ Нельзя забрать доступ у супер-админа.", parse_mode='html')
+                    await e.reply("⚠️ Нельзя забрать доступ у создателя.", parse_mode='html')
                     return
                 await save_user(t_id, approved=0)
                 await e.reply(f"🚫 Доступ забран: <code>{t_id}</code>", parse_mode='html')
             except:
                 await e.reply("❌ <code>.revoke 1234567</code>", parse_mode='html')
             return
-        if text.startswith('.plan'):
+
+        if text.startswith('.sub'):
             try:
                 parts = text.split(' ')
                 t_id = int(parts[1])
@@ -593,10 +600,14 @@ async def text_handler(e):
                     await e.reply("❌ Тарифы: FREE / PRO / ULTIMATE", parse_mode='html')
                     return
                 await save_user(t_id, plan=new_plan)
-                await e.reply(f"✅ Тариф <code>{new_plan}</code> выдан <code>{t_id}</code>", parse_mode='html')
+                await e.reply(
+                    f"✅ Подписка <b>{new_plan}</b> выдана <code>{t_id}</code>",
+                    parse_mode='html'
+                )
             except:
-                await e.reply("❌ <code>.plan 1234567 PRO</code>", parse_mode='html')
+                await e.reply("❌ <code>.sub 1234567 ULTIMATE</code>", parse_mode='html')
             return
+
         if text == '.id':
             await e.reply(f"Ваш ID: <code>{uid}</code>", parse_mode='html')
             return
@@ -627,8 +638,7 @@ async def text_handler(e):
             )
         except Exception as ex:
             await e.reply(
-                f"❌ Ошибка: <code>{str(ex)[:200]}</code>\n\n"
-                f"Попробуйте QR-код:",
+                f"❌ Ошибка: <code>{str(ex)[:200]}</code>",
                 buttons=[
                     [Button.inline("📷 Войти по QR-коду", b"qr_start")],
                     [Button.inline("🔙 Назад", b"nav_home")],
@@ -652,16 +662,12 @@ async def text_handler(e):
             user_steps[uid] = "ST_2FA"
             await e.reply("🔐 Введите пароль 2FA:")
         except PhoneCodeInvalidError:
-            await e.reply("❌ Неверный код. Попробуйте снова или запросите новый:")
+            await e.reply("❌ Неверный код.")
         except PhoneCodeExpiredError:
-            await e.reply("❌ Код истёк. Запросите новый:")
+            await e.reply("❌ Код истёк. Запросите новый.")
             user_steps[uid] = "IDLE"
         except Exception as ex:
-            await e.reply(
-                f"❌ Ошибка: <code>{str(ex)[:200]}</code>\n\n"
-                f"По вопросам: {SUPPORT_CONTACT}",
-                parse_mode='html'
-            )
+            await e.reply(f"❌ Ошибка: <code>{str(ex)[:200]}</code>", parse_mode='html')
             user_steps[uid] = "IDLE"
 
     elif step == "ST_2FA":
@@ -695,31 +701,58 @@ async def text_handler(e):
         )
 
     elif step == "ST_DELAY":
+        limits = plan_limits(p.get('plan', 'FREE'))
         try:
             low, high = map(int, text.split('-'))
-            if low < MIN_DELAY_LIMIT:
-                await e.reply(f"⚠️ Минимум — <b>{MIN_DELAY_LIMIT} сек</b>", parse_mode='html'); return
-            if high > MAX_DELAY_LIMIT:
-                await e.reply(f"⚠️ Максимум — <b>{MAX_DELAY_LIMIT} сек</b>", parse_mode='html'); return
+            if low < limits['min_delay']:
+                await e.reply(
+                    f"⚠️ Минимум для тарифа <b>{p.get('plan','FREE')}</b> — <b>{limits['min_delay']} сек</b>\n"
+                    f"Повысьте тариф: /start → 💎 Подписка",
+                    parse_mode='html'
+                ); return
+            if high > limits['max_delay']:
+                await e.reply(
+                    f"⚠️ Максимум для тарифа <b>{p.get('plan','FREE')}</b> — <b>{limits['max_delay']} сек</b>",
+                    parse_mode='html'
+                ); return
             if high < low:
                 await e.reply("⚠️ Максимум меньше минимума.", parse_mode='html'); return
             await save_user(uid, min_d=low * 1000, max_d=high * 1000)
             user_steps[uid] = "IDLE"
             await e.reply(f"✅ Задержка: <b>{low}–{high} сек</b>", buttons=main_menu(is_admin), parse_mode='html')
         except:
-            await e.reply("❌ Формат: <code>5-15</code>", parse_mode='html')
+            await e.reply(
+                f"❌ Формат: <code>{limits['min_delay']}-{limits['max_delay']}</code>",
+                parse_mode='html'
+            )
 
     elif step == "IDLE":
+        limits = plan_limits(p.get('plan', 'FREE'))
         new_lines = [line.strip() for line in text.split('\n') if line.strip()]
         cur = p.get('templates', [])
         added = 0
+        skipped = 0
         for line in new_lines:
-            if line not in cur:
-                cur.append(line)
-                added += 1
+            if line in cur:
+                continue
+            if len(cur) >= limits['templates']:
+                skipped += 1
+                continue
+            cur.append(line)
+            added += 1
+
         if added > 0:
             await save_user(uid, templates=cur)
-            await e.reply(f"📝 Добавлено: <b>{added}</b>. Всего: <b>{len(cur)}</b>", parse_mode='html')
+            msg = f"📝 Добавлено: <b>{added}</b>. Всего: <b>{len(cur)}/{limits['templates']}</b>"
+            if skipped > 0:
+                msg += f"\n⚠️ Пропущено {skipped} — лимит тарифа."
+            await e.reply(msg, parse_mode='html')
+        elif skipped > 0:
+            await e.reply(
+                f"⚠️ Лимит шаблонов для тарифа <b>{p.get('plan','FREE')}</b> — {limits['templates']}.\n"
+                f"Повысьте тариф: /start → 💎 Подписка",
+                parse_mode='html'
+            )
         else:
             await e.reply("⚠️ Эти шаблоны уже есть.")
 
