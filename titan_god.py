@@ -1,6 +1,6 @@
 # =====================================================================
-# TITAN Enterprise v4.0 — монолит для Render
-# Покупка подписки: через владельца @apemiru
+# TITAN Enterprise v5.0 — монолит для Render
+# Покупка: через владельца @apemiru
 # =====================================================================
 import os
 import sys
@@ -58,7 +58,7 @@ if os.path.isdir("/var/data") and not os.getenv("DB_FILE"):
     BACKUP_DIR = "/var/data/database_backups"
 
 # =====================================================================
-# 2. ТАРИФЫ С ФИШКАМИ
+# 2. ТАРИФЫ
 # =====================================================================
 PLAN_LIMITS = {
     "FREE": {
@@ -106,49 +106,27 @@ PRICES = {"FREE": 0, "PRO": 490, "ULTIMATE": 1490}
 
 PLAN_FEATURES = {
     "FREE": [
-        "10 шаблонов",
-        "1 цель одновременно",
-        "Задержка 50–60 сек",
-        "Базовая защита от FloodWait",
-        "История 3 дня",
-        "Лимит 1000 сообщений/день",
-        "Одна сессия",
+        "10 шаблонов", "1 цель", "Задержка 50–60 сек",
+        "Базовая защита", "История 3 дня",
+        "Лимит 1000 сообщений/день", "Одна сессия",
     ],
     "PRO": [
-        "100 шаблонов",
-        "2 цели одновременно",
-        "Задержка 30–60 сек",
-        "📊 Live-статистика",
-        "🛡 Продвинутая FloodWait-защита",
-        "📤 Экспорт истории в CSV",
-        "💾 Бэкап шаблонов",
-        "🖼 Медиа-вложения (1 шт)",
-        "⏸ Автопауза при ошибках",
-        "🎧 Приоритетная поддержка 24ч",
-        "📜 История 30 дней",
-        "🚫 Чёрный список целей",
-        "✅ Белый список целей",
-        "🛑 Стоп-слова",
-        "🕐 Отложенный старт",
+        "100 шаблонов", "2 цели", "Задержка 30–60 сек",
+        "📊 Live-статистика", "🛡 Продвинутая защита",
+        "📤 Экспорт CSV", "💾 Бэкап шаблонов",
+        "🖼 Медиа (1 шт)", "⏸ Автопауза",
+        "🎧 Приоритетная поддержка", "📜 История 30 дней",
+        "🚫 Чёрный список", "✅ Белый список", "🛑 Стоп-слова",
         "Лимит 10 000 сообщений/день",
     ],
     "ULTIMATE": [
-        "∞ шаблонов",
-        "4 цели одновременно",
-        "Задержка 1–60 сек",
-        "🎯 Всё из PRO +",
-        "🧪 A/B-тесты шаблонов",
-        "🕐 Расписание работы",
-        "🖼 Медиа-вложения (5 шт)",
-        "🏅 Кастомный бейдж",
-        "🛡 Максимальная защита",
-        "🎲 Рандомный выбор целей",
-        "🔌 Прокси-поддержка",
-        "🔔 Webhooks",
-        "👤 Персональный менеджер",
-        "📜 История 1 год",
-        "♾ Без дневного лимита",
-        "🖥 До 4 сессий одновременно",
+        "∞ шаблонов", "4 цели", "Задержка 1–60 сек",
+        "🎯 Всё из PRO +", "🧪 A/B-тесты",
+        "🕐 Расписание", "🖼 Медиа (5 шт)",
+        "🏅 Кастомный бейдж", "🛡 Максимальная защита",
+        "🎲 Рандом целей", "🔌 Прокси", "🔔 Webhooks",
+        "👤 Персональный менеджер", "📜 История 1 год",
+        "♾ Без дневного лимита", "🖥 До 4 сессий",
     ],
 }
 
@@ -182,16 +160,13 @@ CREATE TABLE IF NOT EXISTS users (
     accepted_rules INTEGER DEFAULT 0,
     registered_at TEXT,
     balance INTEGER DEFAULT 0,
-    referred_by INTEGER,
     schedule TEXT,
     custom_badge TEXT,
     notes TEXT,
     blacklist TEXT DEFAULT '[]',
     whitelist TEXT DEFAULT '[]',
     stop_words TEXT DEFAULT '[]',
-    proxies TEXT DEFAULT '[]',
-    webhook_url TEXT,
-    timezone_offset INTEGER DEFAULT 3
+    webhook_url TEXT
 );
 CREATE TABLE IF NOT EXISTS spam_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -239,25 +214,21 @@ CREATE INDEX IF NOT EXISTS idx_daily ON daily_stats(date, user_id);
 
 MIGRATIONS = [
     "ALTER TABLE users ADD COLUMN balance INTEGER DEFAULT 0",
-    "ALTER TABLE users ADD COLUMN referred_by INTEGER",
     "ALTER TABLE users ADD COLUMN schedule TEXT",
     "ALTER TABLE users ADD COLUMN custom_badge TEXT",
     "ALTER TABLE users ADD COLUMN notes TEXT",
     "ALTER TABLE users ADD COLUMN blacklist TEXT DEFAULT '[]'",
     "ALTER TABLE users ADD COLUMN whitelist TEXT DEFAULT '[]'",
     "ALTER TABLE users ADD COLUMN stop_words TEXT DEFAULT '[]'",
-    "ALTER TABLE users ADD COLUMN proxies TEXT DEFAULT '[]'",
     "ALTER TABLE users ADD COLUMN webhook_url TEXT",
-    "ALTER TABLE users ADD COLUMN timezone_offset INTEGER DEFAULT 3",
 ]
 
 USER_DEFAULTS = {
     "session": None, "templates": [], "min_delay": 50000, "max_delay": 60000,
     "is_approved": 0, "is_admin": 0, "plan": "FREE", "accepted_rules": 0,
-    "balance": 0, "referred_by": None, "schedule": None,
-    "custom_badge": None, "notes": None,
+    "balance": 0, "schedule": None, "custom_badge": None, "notes": None,
     "blacklist": [], "whitelist": [], "stop_words": [],
-    "proxies": [], "webhook_url": None, "timezone_offset": 3,
+    "webhook_url": None,
 }
 
 
@@ -312,10 +283,9 @@ class UserRepo:
         async with self.db.conn() as db:
             async with db.execute(
                 "SELECT session_string, templates, min_delay, max_delay, is_approved,"
-                " is_admin, plan, accepted_rules, balance, referred_by,"
-                " schedule, custom_badge, notes, blacklist, whitelist, stop_words,"
-                " proxies, webhook_url, timezone_offset FROM users WHERE user_id=?",
-                (uid,),
+                " is_admin, plan, accepted_rules, balance, schedule, custom_badge,"
+                " notes, blacklist, whitelist, stop_words, webhook_url"
+                " FROM users WHERE user_id=?", (uid,),
             ) as cur:
                 row = await cur.fetchone()
         if not row:
@@ -325,15 +295,13 @@ class UserRepo:
             session=row[0], templates=json.loads(row[1] or "[]"),
             min_delay=row[2], max_delay=row[3], is_approved=row[4],
             is_admin=row[5], plan=row[6] or "FREE", accepted_rules=row[7] or 0,
-            balance=row[8] or 0, referred_by=row[9],
-            schedule=json.loads(row[10]) if row[10] else None,
-            custom_badge=row[11], notes=row[12],
-            blacklist=json.loads(row[13] or "[]"),
-            whitelist=json.loads(row[14] or "[]"),
-            stop_words=json.loads(row[15] or "[]"),
-            proxies=json.loads(row[16] or "[]"),
-            webhook_url=row[17],
-            timezone_offset=row[18] or 3,
+            balance=row[8] or 0,
+            schedule=json.loads(row[9]) if row[9] else None,
+            custom_badge=row[10], notes=row[11],
+            blacklist=json.loads(row[12] or "[]"),
+            whitelist=json.loads(row[13] or "[]"),
+            stop_words=json.loads(row[14] or "[]"),
+            webhook_url=row[15],
         )
         return d
 
@@ -346,9 +314,9 @@ class UserRepo:
             await db.execute(
                 """INSERT INTO users (user_id, session_string, templates, min_delay,
                     max_delay, is_approved, is_admin, plan, accepted_rules, registered_at,
-                    balance, referred_by, schedule, custom_badge, notes,
-                    blacklist, whitelist, stop_words, proxies, webhook_url, timezone_offset)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    balance, schedule, custom_badge, notes,
+                    blacklist, whitelist, stop_words, webhook_url)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(user_id) DO UPDATE SET
                     session_string=excluded.session_string,
                     templates=excluded.templates,
@@ -359,28 +327,24 @@ class UserRepo:
                     plan=excluded.plan,
                     accepted_rules=excluded.accepted_rules,
                     balance=excluded.balance,
-                    referred_by=excluded.referred_by,
                     schedule=excluded.schedule,
                     custom_badge=excluded.custom_badge,
                     notes=excluded.notes,
                     blacklist=excluded.blacklist,
                     whitelist=excluded.whitelist,
                     stop_words=excluded.stop_words,
-                    proxies=excluded.proxies,
-                    webhook_url=excluded.webhook_url,
-                    timezone_offset=excluded.timezone_offset""",
+                    webhook_url=excluded.webhook_url""",
                 (uid, cur["session"], json.dumps(cur["templates"]),
                  cur["min_delay"], cur["max_delay"], cur["is_approved"],
                  cur["is_admin"], cur["plan"], cur["accepted_rules"],
                  datetime.datetime.now().isoformat(timespec="seconds"),
-                 cur["balance"], cur["referred_by"],
+                 cur["balance"],
                  json.dumps(cur["schedule"]) if cur["schedule"] else None,
                  cur["custom_badge"], cur["notes"],
                  json.dumps(cur["blacklist"]),
                  json.dumps(cur["whitelist"]),
                  json.dumps(cur["stop_words"]),
-                 json.dumps(cur["proxies"]),
-                 cur["webhook_url"], cur["timezone_offset"]),
+                 cur["webhook_url"]),
             )
             await db.commit()
 
@@ -504,7 +468,6 @@ def normalize_target(raw):
 
 
 def is_valid_schedule(schedule):
-    """schedule = {"days": [1,2,3,4,5], "from": "09:00", "to": "23:00"}"""
     if not schedule:
         return True
     now = datetime.datetime.now()
@@ -542,6 +505,11 @@ class AdaptivePacer:
     def reset_penalty(self):
         self.penalty = 0
 
+    def update_delay(self, min_ms, max_ms):
+        self.base_min = min_ms
+        self.base_max = max_ms
+        self.penalty = 0
+
 
 class SpamEngine:
     def __init__(self, client, user_id, db_path, min_ms, max_ms, metrics,
@@ -571,16 +539,10 @@ class SpamEngine:
         self.webhook_url = webhook_url
         self._consecutive_errors = 0
         self._error_threshold = 5
-        self._target_cycle = []
 
     @property
     def is_active(self):
         return self._active.is_set()
-
-    def _pick_target(self, targets):
-        if not self.random_targets:
-            return targets[0] if targets else None
-        return random.choice(targets)
 
     def _is_allowed(self, target):
         if self.whitelist and target not in self.whitelist:
@@ -645,7 +607,6 @@ class SpamEngine:
                 raw = random.choice(templates)
                 msg = self._filter_msg(raw)
                 if msg is None:
-                    log.info("[%s] стоп-слово в шаблоне, пропуск", self.user_id)
                     continue
                 await self.client.send_message(target, msg)
                 counter += 1
@@ -694,7 +655,6 @@ class SpamEngine:
                 log.warning("[%s] %s: жду %ss", self.user_id, type(e).__name__, wait)
                 await asyncio.sleep(wait)
                 if self.auto_pause and self._consecutive_errors >= self._error_threshold:
-                    log.error("[%s] автопауза после %s ошибок", self.user_id, self._consecutive_errors)
                     break
             except Exception as e:
                 self.errors += 1
@@ -719,6 +679,12 @@ class SpamEngine:
         self._active.clear()
         for t in list(self._tasks):
             t.cancel()
+
+    def update_delay(self, min_ms, max_ms):
+        """Меняет задержку на лету, без рестарта."""
+        self.pacer.update_delay(min_ms, max_ms)
+        log.info("[%s] задержка обновлена: %d-%d сек",
+                 self.user_id, min_ms // 1000, max_ms // 1000)
 
     def stats_text(self):
         up = datetime.datetime.now() - self.started_at
@@ -843,7 +809,6 @@ def buy_text(uid):
         "• Медиа-вложения (1 шт)\n"
         "• Чёрный/белый список\n"
         "• Стоп-слова\n"
-        "• Отложенный старт\n"
         "• Приоритетная поддержка\n\n"
         "<b>👑 ULTIMATE — 1 490 ₽/мес</b>\n"
         "• ∞ шаблонов, 4 цели\n"
@@ -851,7 +816,6 @@ def buy_text(uid):
         "• A/B-тесты шаблонов\n"
         "• Расписание работы\n"
         "• Кастомный бейдж\n"
-        "• Прокси-поддержка\n"
         "• Webhooks\n"
         "• Рандомный выбор целей\n"
         "• До 4 сессий одновременно\n"
@@ -1014,7 +978,8 @@ def ab_text(rows):
         short = template[:40].replace("\n", " ")
         lines.append(f"• {pct:.1f}% — <code>{short}</code> ({sent})")
     return "\n".join(lines)
-    # =====================================================================
+
+# =====================================================================
 # 7. ГЛОБАЛЬНОЕ СОСТОЯНИЕ
 # =====================================================================
 active_clients = {}
@@ -1065,7 +1030,6 @@ async def resolve_client(uid):
         return None
     active_clients[uid] = c
     return c
-
 
 # =====================================================================
 # 8. ХЕНДЛЕРЫ БОТА
@@ -1129,7 +1093,6 @@ async def cb_handler(e):
 
     back = [[Button.inline("🔙 Назад", b"nav_home")]]
 
-    # ---------- Правила ----------
     if action == "accept_rules":
         await repo.save(uid, accepted_rules=1)
         await e.answer("✅ Принято")
@@ -1149,7 +1112,6 @@ async def cb_handler(e):
         p = await repo.get(uid)
         await e.edit(main_text(uid, p), buttons=main_menu(is_admin), parse_mode="html")
 
-    # ---------- Аккаунт ----------
     elif action == "nav_account":
         p = await repo.get(uid) or {}
         if not p.get("session"):
@@ -1166,16 +1128,13 @@ async def cb_handler(e):
             await e.edit("✅ <b>Аккаунт подключён</b>",
                          buttons=back, parse_mode="html")
 
-    # ---------- Шаблоны ----------
     elif action == "nav_templates":
         tpls = p.get("templates", [])
         max_t = limits['templates'] if limits['templates'] < 9999 else '∞'
         preview = "\n".join(f"• <code>{t[:60]}</code>" for t in tpls[:10]) or "<i>Пусто</i>"
         if len(tpls) > 10:
             preview += f"\n<i>...и ещё {len(tpls) - 10}</i>"
-        buttons = [
-            [Button.inline("🗑 Очистить все", b"nav_tpl_clear")],
-        ]
+        buttons = [[Button.inline("🗑 Очистить все", b"nav_tpl_clear")]]
         if limits["templates_backup"]:
             buttons.append([Button.inline("💾 Бэкап", b"nav_tpl_backup")])
         buttons.append([Button.inline("🔙 Назад", b"nav_home")])
@@ -1206,23 +1165,24 @@ async def cb_handler(e):
         await bot.send_file(uid, buf, caption="💾 Бэкап шаблонов")
         await e.answer("✅ Отправлено")
 
-    # ---------- Задержка ----------
     elif action == "nav_delay":
         user_steps[uid] = "ST_DELAY"
         mind = int(p.get("min_delay", 50000) / 1000)
         maxd = int(p.get("max_delay", 60000) / 1000)
+        active_hint = ""
+        if uid in spam_engines and spam_engines[uid].is_active:
+            active_hint = "\n\n⚡ <b>Сессия активна</b> — задержка применится сразу."
         await e.edit(
             f"⚙️ <b>Задержка</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"Текущая: <b>{mind}–{maxd} сек</b>\n"
             f"Диапазон тарифа <b>{plan}</b>: "
             f"{limits['min_delay']}–{limits['max_delay']} сек\n\n"
-            f"Формат: <code>{limits['min_delay']}-{limits['max_delay']}</code>",
+            f"Формат: <code>{limits['min_delay']}-{limits['max_delay']}</code>"
+            + active_hint,
             buttons=back, parse_mode="html",
         )
-
-    # ---------- Запуск ----------
-    elif action == "nav_spam":
+            elif action == "nav_spam":
         if not p.get("session"):
             return await e.answer("❌ Нет сессии", alert=True)
         if not p.get("templates"):
@@ -1250,7 +1210,6 @@ async def cb_handler(e):
         else:
             await e.answer("⚠️ Активных рассылок нет", alert=True)
 
-    # ---------- Статистика ----------
     elif action == "nav_stats":
         if not limits["stats"]:
             return await e.answer("💎 Доступно на PRO и выше", alert=True)
@@ -1272,7 +1231,6 @@ async def cb_handler(e):
                 buttons=back, parse_mode="html",
             )
 
-    # ---------- Подписка ----------
     elif action == "nav_sub":
         await e.edit(sub_text(plan), buttons=back, parse_mode="html")
 
@@ -1283,7 +1241,6 @@ async def cb_handler(e):
         custom = p.get("custom_badge")
         await e.edit(profile_text(p, plan, custom), buttons=back, parse_mode="html")
 
-    # ---------- История ----------
     elif action == "nav_history":
         if not limits["export"]:
             return await e.answer("💎 Доступно на PRO и выше", alert=True)
@@ -1336,7 +1293,6 @@ async def cb_handler(e):
         await bot.send_file(uid, buf, caption="📤 История в CSV")
         await e.answer("✅ Отправлено")
 
-    # ---------- Чёрный список ----------
     elif action == "nav_blacklist":
         if not limits["blacklist"]:
             return await e.answer("💎 Доступно на PRO и выше", alert=True)
@@ -1359,7 +1315,6 @@ async def cb_handler(e):
             buttons=back, parse_mode="html",
         )
 
-    # ---------- Белый список ----------
     elif action == "nav_whitelist":
         if not limits["whitelist"]:
             return await e.answer("💎 Доступно на PRO и выше", alert=True)
@@ -1382,7 +1337,6 @@ async def cb_handler(e):
             buttons=back, parse_mode="html",
         )
 
-    # ---------- Стоп-слова ----------
     elif action == "nav_stop_words":
         if not limits["stop_words"]:
             return await e.answer("💎 Доступно на PRO и выше", alert=True)
@@ -1405,14 +1359,12 @@ async def cb_handler(e):
             buttons=back, parse_mode="html",
         )
 
-    # ---------- A/B ----------
     elif action == "nav_ab":
         if not limits["ab_test"]:
             return await e.answer("👑 Доступно на ULTIMATE", alert=True)
         rows = await repo.get_ab_stats(uid)
         await e.edit(ab_text(rows), buttons=back, parse_mode="html")
 
-    # ---------- Расписание ----------
     elif action == "nav_schedule":
         if not limits["schedule"]:
             return await e.answer("👑 Доступно на ULTIMATE", alert=True)
@@ -1435,7 +1387,6 @@ async def cb_handler(e):
             buttons=back, parse_mode="html",
         )
 
-    # ---------- Webhook ----------
     elif action == "nav_webhook":
         if not limits["webhooks"]:
             return await e.answer("👑 Доступно на ULTIMATE", alert=True)
@@ -1445,8 +1396,7 @@ async def cb_handler(e):
             f"🔔 <b>Webhook</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"Текущий URL: <code>{url}</code>\n\n"
-            f"При старте/стопе сессии шлём JSON POST:\n"
-            f"<code>{{\"user_id\":..., \"target\":..., \"sent\":..., \"status\":...}}</code>\n\n"
+            f"При старте/стопе сессии шлём JSON POST.\n\n"
             f"Отправь URL или <code>off</code> чтобы отключить.",
             buttons=[
                 [Button.inline("🗑 Убрать", b"nav_webhook_clear")],
@@ -1461,11 +1411,9 @@ async def cb_handler(e):
         await e.answer("✅ Отключено")
         await e.edit("🔔 <b>Webhook убран</b>", buttons=back, parse_mode="html")
 
-    # ---------- Помощь ----------
     elif action == "nav_help":
         await e.edit(help_text(), buttons=back, parse_mode="html")
 
-    # ---------- Админка ----------
     elif action == "nav_admin" and is_admin:
         await e.edit(
             "👑 <b>Админ-панель</b>\n"
@@ -1532,7 +1480,6 @@ async def cb_handler(e):
         lines.append(f"💰 Выручка: <b>{total_sum} ₽</b>")
         await e.edit("\n".join(lines), buttons=back, parse_mode="html")
 
-    # ---------- QR ----------
     elif action == "qr_start":
         await e.edit("🔄 Генерирую QR...")
         try:
@@ -1773,7 +1720,6 @@ async def text_handler(e):
 
     step = user_steps.get(uid, "IDLE")
 
-    # ---------- ST_PHONE ----------
     if step == "ST_PHONE":
         await e.reply("⏳ Запрашиваю код...")
         c = TelegramClient(StringSession(), API_ID, API_HASH)
@@ -1797,7 +1743,6 @@ async def text_handler(e):
             await e.reply(f"❌ <code>{str(ex)[:200]}</code>", parse_mode="html")
             user_steps[uid] = "IDLE"
 
-    # ---------- ST_CODE ----------
     elif step == "ST_CODE":
         b = active_clients.get(f"temp_{uid}")
         if not b: return
@@ -1820,7 +1765,6 @@ async def text_handler(e):
             user_steps[uid] = "IDLE"
             await e.reply(f"❌ <code>{str(ex)[:200]}</code>", parse_mode="html")
 
-    # ---------- ST_2FA ----------
     elif step == "ST_2FA":
         b = active_clients.get(f"temp_{uid}")
         if not b: return
@@ -1834,7 +1778,6 @@ async def text_handler(e):
         except Exception as ex:
             await e.reply(f"❌ <code>{str(ex)[:200]}</code>", parse_mode="html")
 
-    # ---------- ST_TARGET ----------
     elif step == "ST_TARGET":
         user_steps[uid] = "IDLE"
         raw = [line.strip() for line in text.split("\n") if line.strip()]
@@ -1890,7 +1833,6 @@ async def text_handler(e):
         msg += f"\n🛡 Защита: {limits['flood_protection']}"
         await e.reply(msg, parse_mode="html")
 
-    # ---------- ST_DELAY ----------
     elif step == "ST_DELAY":
         try:
             low, high = map(int, text.split("-"))
@@ -1903,10 +1845,17 @@ async def text_handler(e):
                 await e.reply(f"⚠️ Максимум {limits['max_delay']}с"); return
             if high < low:
                 await e.reply("⚠️ Max < Min"); return
-            await repo.save(uid, min_d=low * 1000, max_d=high * 1000)
+            # ⚠️ ФИКС: правильные имена полей min_delay/max_delay
+            await repo.save(uid, min_delay=low * 1000, max_delay=high * 1000)
+            # ⚠️ ФИКС: если сессия активна — обновляем задержку на лету
+            if uid in spam_engines and spam_engines[uid].is_active:
+                spam_engines[uid].update_delay(low * 1000, high * 1000)
+                msg_extra = "\n\n⚡ Применено к активной сессии."
+            else:
+                msg_extra = ""
             user_steps[uid] = "IDLE"
             await e.reply(
-                f"✅ Задержка: <b>{low}–{high}с</b>",
+                f"✅ Задержка: <b>{low}–{high}с</b>" + msg_extra,
                 buttons=main_menu(is_admin), parse_mode="html",
             )
         except (ValueError, AttributeError):
@@ -1915,7 +1864,6 @@ async def text_handler(e):
                 parse_mode="html",
             )
 
-    # ---------- ST_BLACKLIST ----------
     elif step == "ST_BLACKLIST":
         user_steps[uid] = "IDLE"
         cur = set(p.get("blacklist", []))
@@ -1927,13 +1875,11 @@ async def text_handler(e):
                 added += 1
         await repo.save(uid, blacklist=list(cur))
         await e.reply(
-            f"🚫 Добавлено в чёрный список: <b>{added}</b>\n"
-            f"Всего: {len(cur)}",
+            f"🚫 Добавлено: <b>{added}</b>. Всего: {len(cur)}",
             buttons=[[Button.inline("🔙 К списку", b"nav_blacklist")]],
             parse_mode="html",
         )
 
-    # ---------- ST_WHITELIST ----------
     elif step == "ST_WHITELIST":
         user_steps[uid] = "IDLE"
         cur = set(p.get("whitelist", []))
@@ -1945,13 +1891,11 @@ async def text_handler(e):
                 added += 1
         await repo.save(uid, whitelist=list(cur))
         await e.reply(
-            f"✅ Добавлено в белый список: <b>{added}</b>\n"
-            f"Всего: {len(cur)}",
+            f"✅ Добавлено: <b>{added}</b>. Всего: {len(cur)}",
             buttons=[[Button.inline("🔙 К списку", b"nav_whitelist")]],
             parse_mode="html",
         )
 
-    # ---------- ST_STOP_WORDS ----------
     elif step == "ST_STOP_WORDS":
         user_steps[uid] = "IDLE"
         cur = set(p.get("stop_words", []))
@@ -1963,13 +1907,11 @@ async def text_handler(e):
                 added += 1
         await repo.save(uid, stop_words=list(cur))
         await e.reply(
-            f"🛑 Добавлено стоп-слов: <b>{added}</b>\n"
-            f"Всего: {len(cur)}",
+            f"🛑 Добавлено: <b>{added}</b>. Всего: {len(cur)}",
             buttons=[[Button.inline("🔙 К списку", b"nav_stop_words")]],
             parse_mode="html",
         )
 
-    # ---------- ST_SCHEDULE ----------
     elif step == "ST_SCHEDULE":
         user_steps[uid] = "IDLE"
         try:
@@ -2002,7 +1944,6 @@ async def text_handler(e):
                 parse_mode="html",
             )
 
-    # ---------- ST_WEBHOOK ----------
     elif step == "ST_WEBHOOK":
         user_steps[uid] = "IDLE"
         if text.lower() == "off":
@@ -2019,7 +1960,6 @@ async def text_handler(e):
             parse_mode="html",
         )
 
-    # ---------- IDLE (шаблоны) ----------
     elif step == "IDLE":
         new_lines = [line for line in text.split("\n") if line.strip()]
         cur = list(p.get("templates", []))
@@ -2049,52 +1989,205 @@ async def text_handler(e):
             await e.reply("⚠️ Эти шаблоны уже есть")
 
 # =====================================================================
-# 9. WEB DASHBOARD
+# 9. WEB DASHBOARD + API
 # =====================================================================
 DASHBOARD_HTML = r"""<!doctype html>
 <html lang="ru"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>TITAN Enterprise</title>
+<title>TITAN Admin</title>
 <style>
-:root{--bg:#0a0e14;--card:#141a22;--line:#1f2933;--txt:#e8eef5;--muted:#7a8899;--acc:#4ea8de;--ok:#3ddc97;--warn:#ffb703;--err:#ef476f}
+:root{--bg:#0a0e14;--card:#141a22;--line:#1f2933;--txt:#e8eef5;--muted:#7a8899;--acc:#4ea8de;--ok:#3ddc97;--warn:#ffb703;--err:#ef476f;--gold:#f4c542}
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
-.wrap{width:100%;max-width:780px}
+body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;min-height:100vh;padding:20px}
+.wrap{width:100%;max-width:1200px;margin:0 auto}
 .header{text-align:center;margin-bottom:24px}
-.logo{font-size:34px;font-weight:800;letter-spacing:-1px;background:linear-gradient(135deg,#4ea8de,#3ddc97);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
-.sub{color:var(--muted);font-size:13px;margin-top:4px;letter-spacing:1px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:14px;margin-bottom:24px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px;transition:transform .15s,border-color .15s}
-.card:hover{transform:translateY(-2px);border-color:var(--acc)}
+.logo{font-size:36px;font-weight:800;letter-spacing:-1px;background:linear-gradient(135deg,#4ea8de,#3ddc97);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.sub{color:var(--muted);font-size:13px;margin-top:4px;letter-spacing:2px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:24px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px}
 .card .label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:10px}
-.card .value{font-size:32px;font-weight:700;font-variant-numeric:tabular-nums}
+.card .value{font-size:30px;font-weight:700;font-variant-numeric:tabular-nums}
 .card.ok .value{color:var(--ok)}.card.warn .value{color:var(--warn)}
-.card.err .value{color:var(--err)}.card.acc .value{color:var(--acc)}
+.card.err .value{color:var(--err)}.card.acc .value{color:var(--acc)}.card.gold .value{color:var(--gold)}
+.section{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px;margin-bottom:20px}
+.section h2{font-size:16px;text-transform:uppercase;letter-spacing:1.5px;color:var(--muted);margin-bottom:16px;font-weight:600}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;color:var(--muted);font-weight:500;padding:8px;border-bottom:1px solid var(--line);font-size:11px;text-transform:uppercase;letter-spacing:1px}
+td{padding:10px 8px;border-bottom:1px solid var(--line);font-variant-numeric:tabular-nums}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:rgba(78,168,222,.05)}
+.plan{display:inline-block;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:600}
+.plan.FREE{background:#1f2933;color:#8899aa}
+.plan.PRO{background:#1e3a5f;color:#4ea8de}
+.plan.ULTIMATE{background:#3d2f00;color:var(--gold)}
+.ok{color:var(--ok)}.err{color:var(--err)}.muted{color:var(--muted)}
+.tabs{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap}
+.tab{padding:8px 16px;border-radius:8px;background:var(--line);cursor:pointer;font-size:13px}
+.tab.active{background:var(--acc);color:#0a0e14;font-weight:600}
+.hidden{display:none}
 .footer{text-align:center;color:var(--muted);font-size:12px;margin-top:20px}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--ok);margin-right:6px;animation:pulse 1.6s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+.refresh-btn{background:var(--acc);color:#0a0e14;border:none;padding:6px 14px;border-radius:8px;font-weight:600;cursor:pointer;font-size:12px;margin-left:8px}
 </style></head><body><div class="wrap">
-<div class="header"><div class="logo">TITAN Enterprise</div><div class="sub">CONTROL PANEL</div></div>
+<div class="header"><div class="logo">TITAN Enterprise</div><div class="sub">ADMIN CONTROL PANEL</div></div>
 <div class="grid">
-<div class="card acc"><div class="label">Отправлено</div><div class="value" id="m">0</div></div>
-<div class="card ok"><div class="label">Сессий</div><div class="value" id="s">0</div></div>
-<div class="card err"><div class="label">Ошибок</div><div class="value" id="e">0</div></div>
-<div class="card warn"><div class="label">FloodWait</div><div class="value" id="f">0</div></div>
+  <div class="card acc"><div class="label">Отправлено</div><div class="value" id="m">0</div></div>
+  <div class="card ok"><div class="label">Активных сессий</div><div class="value" id="s">0</div></div>
+  <div class="card gold"><div class="label">Выручка</div><div class="value" id="r">0 ₽</div></div>
+  <div class="card warn"><div class="label">Юзеров</div><div class="value" id="u">0</div></div>
+  <div class="card err"><div class="label">Ошибок</div><div class="value" id="e">0</div></div>
+  <div class="card"><div class="label">FloodWait</div><div class="value" id="f">0</div></div>
 </div>
-<div class="footer"><span class="dot"></span>Uptime: <span id="u">—</span></div>
-</div><script>
+<div class="tabs">
+  <div class="tab active" data-tab="users">👥 Юзеры</div>
+  <div class="tab" data-tab="payments">💰 Платежи</div>
+  <div class="tab" data-tab="sessions">🔴 Сессии</div>
+  <div class="tab" data-tab="audit">📜 Аудит</div>
+</div>
+<div class="section" id="tab-users">
+  <h2>👥 Все юзеры <button class="refresh-btn" onclick="loadUsers()">🔄</button></h2>
+  <table><thead><tr>
+    <th>ID</th><th>Тариф</th><th>Баланс</th><th>Шаблонов</th><th>Сессия</th><th>Доступ</th><th>Admin</th>
+  </tr></thead><tbody id="users-tbody"><tr><td colspan="7" class="muted">Загрузка...</td></tr></tbody></table>
+</div>
+<div class="section hidden" id="tab-payments">
+  <h2>💰 Платежи <button class="refresh-btn" onclick="loadPayments()">🔄</button></h2>
+  <table><thead><tr>
+    <th>Дата</th><th>Юзер</th><th>Тариф</th><th>Сумма</th><th>Метод</th>
+  </tr></thead><tbody id="payments-tbody"><tr><td colspan="5" class="muted">Загрузка...</td></tr></tbody></table>
+</div>
+<div class="section hidden" id="tab-sessions">
+  <h2>🔴 Активные сессии <button class="refresh-btn" onclick="loadSessions()">🔄</button></h2>
+  <table><thead><tr>
+    <th>Юзер</th><th>Отправлено</th><th>Ошибок</th><th>Flood</th><th>Задержка</th><th>Работает</th>
+  </tr></thead><tbody id="sessions-tbody"><tr><td colspan="6" class="muted">Загрузка...</td></tr></tbody></table>
+</div>
+<div class="section hidden" id="tab-audit">
+  <h2>📜 Аудит <button class="refresh-btn" onclick="loadAudit()">🔄</button></h2>
+  <table><thead><tr>
+    <th>Дата</th><th>Админ</th><th>Действие</th><th>Цель</th><th>Детали</th>
+  </tr></thead><tbody id="audit-tbody"><tr><td colspan="5" class="muted">Загрузка...</td></tr></tbody></table>
+</div>
+<div class="footer"><span class="dot"></span>Uptime: <span id="up">—</span></div>
+<script>
 const TOKEN = new URLSearchParams(location.search).get('token') || '';
-async function refresh(){
-  try{
-    const r = await fetch('/api/stats?token=' + encodeURIComponent(TOKEN));
-    if(!r.ok) return;
-    const d = await r.json();
-    for(const [id,key] of [['m','messages'],['s','sessions'],['e','errors'],['f','flood'],['u','uptime']]){
-      document.getElementById(id).textContent = d[key];
-    }
-  }catch(e){}
+const API = (path) => fetch(path + '?token=' + encodeURIComponent(TOKEN)).then(r => r.ok ? r.json() : null);
+
+async function loadStats(){
+  const d = await API('/api/stats');
+  if(!d) return;
+  document.getElementById('m').textContent = d.messages;
+  document.getElementById('s').textContent = d.sessions;
+  document.getElementById('r').textContent = d.revenue + ' ₽';
+  document.getElementById('u').textContent = d.users;
+  document.getElementById('e').textContent = d.errors;
+  document.getElementById('f').textContent = d.flood;
+  document.getElementById('up').textContent = d.uptime;
 }
-refresh(); setInterval(refresh, 3000);
+
+async function loadUsers(){
+  const tbody = document.getElementById('users-tbody');
+  tbody.innerHTML = '<tr><td colspan="7" class="muted">Загрузка...</td></tr>';
+  const d = await API('/api/users');
+  if(!d || !d.users.length){
+    tbody.innerHTML = '<tr><td colspan="7" class="muted">Пусто</td></tr>';
+    return;
+  }
+  tbody.innerHTML = d.users.map(u => `
+    <tr>
+      <td><code>${u.user_id}</code></td>
+      <td><span class="plan ${u.plan}">${u.plan}</span></td>
+      <td>${u.balance} ₽</td>
+      <td>${u.templates}</td>
+      <td>${u.has_session ? '<span class="ok">✅</span>' : '<span class="muted">—</span>'}</td>
+      <td>${u.is_approved ? '<span class="ok">✅</span>' : '<span class="err">❌</span>'}</td>
+      <td>${u.is_admin ? '👑' : ''}</td>
+    </tr>
+  `).join('');
+}
+
+async function loadPayments(){
+  const tbody = document.getElementById('payments-tbody');
+  tbody.innerHTML = '<tr><td colspan="5" class="muted">Загрузка...</td></tr>';
+  const d = await API('/api/payments');
+  if(!d || !d.payments.length){
+    tbody.innerHTML = '<tr><td colspan="5" class="muted">Пока нет платежей</td></tr>';
+    return;
+  }
+  tbody.innerHTML = d.payments.map(p => `
+    <tr>
+      <td>${p.created_at}</td>
+      <td><code>${p.user_id}</code></td>
+      <td><span class="plan ${p.plan}">${p.plan}</span></td>
+      <td><b>${p.amount} ₽</b></td>
+      <td class="muted">${p.method}</td>
+    </tr>
+  `).join('');
+}
+
+async function loadSessions(){
+  const tbody = document.getElementById('sessions-tbody');
+  tbody.innerHTML = '<tr><td colspan="6" class="muted">Загрузка...</td></tr>';
+  const d = await API('/api/sessions');
+  if(!d || !d.sessions.length){
+    tbody.innerHTML = '<tr><td colspan="6" class="muted">Нет активных рассылок</td></tr>';
+    return;
+  }
+  tbody.innerHTML = d.sessions.map(s => `
+    <tr>
+      <td><code>${s.user_id}</code></td>
+      <td><b>${s.sent}</b></td>
+      <td>${s.errors}</td>
+      <td>${s.flood}</td>
+      <td>${s.min_s}–${s.max_s}с</td>
+      <td>${s.uptime}</td>
+    </tr>
+  `).join('');
+}
+
+async function loadAudit(){
+  const tbody = document.getElementById('audit-tbody');
+  tbody.innerHTML = '<tr><td colspan="5" class="muted">Загрузка...</td></tr>';
+  const d = await API('/api/audit');
+  if(!d || !d.audit.length){
+    tbody.innerHTML = '<tr><td colspan="5" class="muted">Пока пусто</td></tr>';
+    return;
+  }
+  tbody.innerHTML = d.audit.map(a => `
+    <tr>
+      <td>${a.created_at}</td>
+      <td><code>${a.admin_id}</code></td>
+      <td><b>${a.action}</b></td>
+      <td><code>${a.target_id || '—'}</code></td>
+      <td class="muted">${a.details || '—'}</td>
+    </tr>
+  `).join('');
+}
+
+document.querySelectorAll('.tab').forEach(t => {
+  t.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+    document.querySelectorAll('.section').forEach(x => x.classList.add('hidden'));
+    t.classList.add('active');
+    document.getElementById('tab-' + t.dataset.tab).classList.remove('hidden');
+    const tab = t.dataset.tab;
+    if(tab === 'users') loadUsers();
+    if(tab === 'payments') loadPayments();
+    if(tab === 'sessions') loadSessions();
+    if(tab === 'audit') loadAudit();
+  });
+});
+
+loadStats();
+loadUsers();
+setInterval(loadStats, 5000);
+setInterval(() => {
+  const active = document.querySelector('.tab.active');
+  if(!active) return;
+  if(active.dataset.tab === 'sessions') loadSessions();
+  if(active.dataset.tab === 'users') loadUsers();
+}, 5000);
 </script></body></html>"""
 
 app = Flask("titan")
@@ -2118,13 +2211,103 @@ def health():
 @app.route("/api/stats")
 def stats_api():
     _check_auth()
+    async def _fetch():
+        async with repo.db.conn() as db:
+            async with db.execute("SELECT COUNT(*) FROM users") as cur:
+                users = (await cur.fetchone())[0]
+            async with db.execute("SELECT COALESCE(SUM(amount),0) FROM payments_log") as cur:
+                revenue = (await cur.fetchone())[0]
+        return users, revenue
+    users, revenue = asyncio.run_coroutine_threadsafe(_fetch(), bot.loop).result()
     return jsonify(
         messages=system_metrics["total_messages_sent"],
-        sessions=len([k for k in active_clients if isinstance(k, int)]),
+        sessions=len(spam_engines),
         errors=system_metrics["total_errors_caught"],
         flood=system_metrics["total_flood_wait_events"],
         uptime=str(datetime.datetime.now() - START_TIME).split(".")[0],
+        users=users,
+        revenue=int(revenue),
     )
+
+
+@app.route("/api/users")
+def api_users():
+    _check_auth()
+    async def _fetch():
+        async with repo.db.conn() as db:
+            async with db.execute(
+                "SELECT user_id, plan, balance, templates, session_string,"
+                " is_approved, is_admin FROM users ORDER BY user_id LIMIT 500"
+            ) as cur:
+                return await cur.fetchall()
+    rows = asyncio.run_coroutine_threadsafe(_fetch(), bot.loop).result()
+    return jsonify(users=[
+        {
+            "user_id": r[0],
+            "plan": r[1] or "FREE",
+            "balance": r[2] or 0,
+            "templates": len(json.loads(r[3] or "[]")),
+            "has_session": bool(r[4]),
+            "is_approved": r[5],
+            "is_admin": r[6],
+        }
+        for r in rows
+    ])
+
+
+@app.route("/api/payments")
+def api_payments():
+    _check_auth()
+    async def _fetch():
+        async with repo.db.conn() as db:
+            async with db.execute(
+                "SELECT created_at, user_id, plan, amount, method"
+                " FROM payments_log ORDER BY id DESC LIMIT 100"
+            ) as cur:
+                return await cur.fetchall()
+    rows = asyncio.run_coroutine_threadsafe(_fetch(), bot.loop).result()
+    return jsonify(payments=[
+        {"created_at": r[0], "user_id": r[1], "plan": r[2],
+         "amount": r[3], "method": r[4]}
+        for r in rows
+    ])
+
+
+@app.route("/api/sessions")
+def api_sessions():
+    _check_auth()
+    items = []
+    for uid, eng in spam_engines.items():
+        up = datetime.datetime.now() - eng.started_at
+        h, m, s = up.seconds // 3600, up.seconds % 3600 // 60, up.seconds % 60
+        items.append({
+            "user_id": uid,
+            "sent": eng.sent,
+            "errors": eng.errors,
+            "flood": eng.pacer.flood_count,
+            "min_s": eng.pacer.base_min // 1000,
+            "max_s": eng.pacer.base_max // 1000,
+            "uptime": f"{h:02d}:{m:02d}:{s:02d}",
+        })
+    return jsonify(sessions=items)
+
+
+@app.route("/api/audit")
+def api_audit():
+    _check_auth()
+    async def _fetch():
+        async with repo.db.conn() as db:
+            async with db.execute(
+                "SELECT created_at, admin_id, action, target_id, details"
+                " FROM audit_log ORDER BY id DESC LIMIT 100"
+            ) as cur:
+                return await cur.fetchall()
+    rows = asyncio.run_coroutine_threadsafe(_fetch(), bot.loop).result()
+    return jsonify(audit=[
+        {"created_at": r[0], "admin_id": r[1], "action": r[2],
+         "target_id": r[3], "details": r[4]}
+        for r in rows
+    ])
 
 
 @app.route("/")
@@ -2176,7 +2359,7 @@ async def main():
 
 if __name__ == "__main__":
     log.info("=" * 50)
-    log.info("  TITAN Enterprise v4.0 — старт")
+    log.info("  TITAN Enterprise v5.0 — старт")
     log.info("=" * 50)
     try:
         asyncio.run(main())
