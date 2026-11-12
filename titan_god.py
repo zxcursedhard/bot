@@ -188,14 +188,18 @@ class TitanDB:
                 await asyncio.to_thread(shutil.copyfile, self.path, dst)
                 files = sorted(f for f in os.listdir(self.backup_dir) if f.startswith("backup_"))
                 for old in files[:-10]:
-                    try: os.remove(os.path.join(self.backup_dir, old))
-                    except OSError: pass
+                    try:
+                        os.remove(os.path.join(self.backup_dir, old))
+                    except OSError:
+                        pass
 
     async def backup_loop(self, hours=6):
         while True:
             await asyncio.sleep(hours * 3600)
-            try: await self.backup()
-            except Exception: pass
+            try:
+                await self.backup()
+            except Exception:
+                pass
 
 class UserRepo:
     def __init__(self, db: TitanDB):
@@ -342,25 +346,33 @@ _NUMERIC = re.compile(r"^-?\d{5,}$")
 
 def normalize_target(raw):
     raw = raw.strip()
-    if not raw: return None
+    if not raw:
+        return None
     m = _TG_URL.search(raw)
-    if m: return "@" + m.group(1)
-    if raw.startswith("@") and len(raw) > 1: return raw
-    if _NUMERIC.match(raw): return raw
-    if raw.startswith("+"): return raw
+    if m:
+        return "@" + m.group(1)
+    if raw.startswith("@") and len(raw) > 1:
+        return raw
+    if _NUMERIC.match(raw):
+        return raw
+    if raw.startswith("+"):
+        return raw
     return None
 
 def is_valid_schedule(schedule):
-    if not schedule: return True
+    if not schedule:
+        return True
     now = datetime.datetime.now()
     days = schedule.get("days", list(range(7)))
-    if now.weekday() not in days: return False
+    if now.weekday() not in days:
+        return False
     try:
         fh, fm = map(int, schedule.get("from", "00:00").split(":"))
         th, tm = map(int, schedule.get("to", "23:59").split(":"))
         current = now.hour * 60 + now.minute
         return fh * 60 + fm <= current <= th * 60 + tm
-    except: return True
+    except Exception:
+        return True
 
 class AdaptivePacer:
     def __init__(self, min_ms, max_ms, protection="basic"):
@@ -410,23 +422,28 @@ class SpamEngine:
         return self._active.is_set()
 
     def _is_allowed(self, target):
-        if self.whitelist and target not in self.whitelist: return False
-        if target in self.blacklist: return False
+        if self.whitelist and target not in self.whitelist:
+            return False
+        if target in self.blacklist:
+            return False
         return True
 
     def _filter_msg(self, msg):
         for w in self.stop_words:
-            if w and w.lower() in msg.lower(): return None
+            if w and w.lower() in msg.lower():
+                return None
         return msg
 
     async def _send_webhook(self, status, target, count):
-        if not self.webhook_url: return
+        if not self.webhook_url:
+            return
         try:
             import urllib.request
             data = json.dumps({"user_id": self.user_id, "target": target, "sent": count, "status": status}).encode("utf-8")
             req = urllib.request.Request(self.webhook_url, data=data, headers={"Content-Type": "application/json"})
             urllib.request.urlopen(req, timeout=5)
-        except: pass
+        except Exception:
+            pass
 
     async def _write_history(self, target, count, status):
         try:
@@ -445,11 +462,13 @@ class SpamEngine:
             if self.schedule and not is_valid_schedule(self.schedule):
                 await asyncio.sleep(60)
                 continue
-            if not self._is_allowed(target): break
+            if not self._is_allowed(target):
+                break
             try:
                 raw = random.choice(templates)
                 msg = self._filter_msg(raw)
-                if msg is None: continue
+                if msg is None:
+                    continue
                 await self.client.send_message(target, msg)
                 counter += 1
                 self.sent += 1
@@ -458,25 +477,37 @@ class SpamEngine:
                 if self.repo:
                     try:
                         await self.repo.log_daily(self.user_id, 1)
-                        if self.ab_test: await self.repo.log_ab_test(self.user_id, raw, sent=1)
-                    except: pass
-                if counter % 10 == 0: await self._write_history(target, counter, "RUNNING")
-                
+                        if self.ab_test:
+                            await self.repo.log_ab_test(self.user_id, raw, sent=1)
+                    except Exception:
+                        pass
+                if counter % 10 == 0:
+                    await self._write_history(target, counter, "RUNNING")
+
                 delay = self.pacer.next_delay()
-                try: await asyncio.wait_for(self._active.wait(), timeout=delay)
-                except asyncio.TimeoutError: pass
+                try:
+                    await asyncio.wait_for(self._active.wait(), timeout=delay)
+                except asyncio.TimeoutError:
+                    pass
             except FloodWaitError as e:
                 self.metrics["total_flood_wait_events"] += 1
                 await asyncio.sleep(self.pacer.on_flood(e.seconds))
             except (ChatWriteForbiddenError, ChatAdminRequiredError, UserBannedInChannelError):
-                self.errors += 1; self.metrics["total_errors_caught"] += 1; break
+                self.errors += 1
+                self.metrics["total_errors_caught"] += 1
+                break
             except (SlowModeWaitError, PeerFloodError) as e:
-                self.errors += 1; self._consecutive_errors += 1
+                self.errors += 1
+                self._consecutive_errors += 1
                 await asyncio.sleep(getattr(e, "seconds", 30) + 5)
-                if self.auto_pause and self._consecutive_errors >= self._error_threshold: break
-            except Exception as e:
-                self.errors += 1; self.metrics["total_errors_caught"] += 1; self._consecutive_errors += 1
-                if self.auto_pause and self._consecutive_errors >= self._error_threshold: break
+                if self.auto_pause and self._consecutive_errors >= self._error_threshold:
+                    break
+            except Exception:
+                self.errors += 1
+                self.metrics["total_errors_caught"] += 1
+                self._consecutive_errors += 1
+                if self.auto_pause and self._consecutive_errors >= self._error_threshold:
+                    break
         await self._write_history(target, counter, "STOPPED")
         await self._send_webhook("stopped", target, counter)
 
@@ -484,13 +515,15 @@ class SpamEngine:
         self._active.set()
         tasks = [asyncio.create_task(self._attack_one(t, templates)) for t in targets]
         self._tasks.update(tasks)
-        for t in tasks: t.add_done_callback(self._tasks.discard)
+        for t in tasks:
+            t.add_done_callback(self._tasks.discard)
         await asyncio.gather(*tasks, return_exceptions=True)
         self._active.clear()
 
     def stop(self):
         self._active.clear()
-        for t in list(self._tasks): t.cancel()
+        for t in list(self._tasks):
+            t.cancel()
 
     def update_delay(self, min_ms, max_ms):
         self.pacer.base_min = min_ms
@@ -512,8 +545,9 @@ class SpamEngine:
             f"🛡 FloodWait: {self.pacer.flood_count}\n"
             f"⚙️ Задержка: {self.pacer.base_min // 1000}–{self.pacer.base_max // 1000}с"
             + (f" (+{self.pacer.penalty // 1000}с)" if self.pacer.penalty else "")
-)
-        # =====================================================================
+        )
+
+# =====================================================================
 # 6. UI
 # =====================================================================
 RULES_TEXT = (
@@ -547,7 +581,8 @@ def main_menu(is_admin):
         [Button.inline("🕐 Расписание", b"nav_schedule"), Button.inline("🔔 Webhook", b"nav_webhook")],
         [Button.inline("ℹ️ Помощь", b"nav_help")],
     ]
-    if is_admin: menu.append([Button.inline("👑 Админ-панель", b"nav_admin")])
+    if is_admin:
+        menu.append([Button.inline("👑 Админ-панель", b"nav_admin")])
     return menu
 
 def main_text(uid, p):
@@ -586,7 +621,8 @@ def sub_text(current_plan):
         price_str = f"{price} ₽/мес" if price else "0 ₽"
         marker = " ← <b>твой</b>" if plan_name == current_plan else ""
         lines.append(f"{limits['emoji']} <b>{plan_name}</b> — {price_str}{marker}")
-        for feat in PLAN_FEATURES[plan_name]: lines.append(f"  • {feat}")
+        for feat in PLAN_FEATURES[plan_name]:
+            lines.append(f"  • {feat}")
         lines.append("")
     lines.append("━━━━━━━━━━━━━━━━━━━━")
     lines.append(f"📩 <b>Для покупки:</b> {OWNER_CONTACT}")
@@ -680,12 +716,14 @@ def stop_words_text(p):
 
 def schedule_text(p):
     sch = p.get("schedule")
-    if not sch: return "🕐 <b>Расписание</b>\n━━━━━━━━━━━━━━━━━━━━\n<i>Не настроено — работаем всегда.</i>\n\nФормат: <code>1-5 09:00 23:00</code>"
+    if not sch:
+        return "🕐 <b>Расписание</b>\n━━━━━━━━━━━━━━━━━━━━\n<i>Не настроено — работаем всегда.</i>\n\nФормат: <code>1-5 09:00 23:00</code>"
     days = ",".join(str(d) for d in sch.get("days", []))
     return f"🕐 <b>Расписание</b>\n━━━━━━━━━━━━━━━━━━━━\nДни: <code>{days}</code>\nЧасы: <code>{sch.get('from')} — {sch.get('to')}</code>"
 
 def ab_text(rows):
-    if not rows: return "🧪 <b>A/B-тесты</b>\n━━━━━━━━━━━━━━━━━━━━\n<i>Пока нет данных.</i>"
+    if not rows:
+        return "🧪 <b>A/B-тесты</b>\n━━━━━━━━━━━━━━━━━━━━\n<i>Пока нет данных.</i>"
     lines = ["🧪 <b>A/B-тесты</b>", "━━━━━━━━━━━━━━━━━━━━"]
     total = sum(r[1] or 0 for r in rows) or 1
     for template, sent, errors in rows[:15]:
@@ -706,7 +744,8 @@ system_metrics = {"total_messages_sent": 0, "total_flood_wait_events": 0, "total
 bot = TelegramClient("bot_master", API_ID, API_HASH)
 repo = None
 
-def is_super(uid): return int(uid) in SUPER_ADMINS
+def is_super(uid):
+    return int(uid) in SUPER_ADMINS
 
 def is_rate_limited(uid, max_per_sec=3):
     now = time.time()
@@ -718,13 +757,18 @@ async def resolve_client(uid):
     c = active_clients.get(uid)
     if c is not None:
         try:
-            if await c.is_user_authorized(): return c
-        except: pass
+            if await c.is_user_authorized():
+                return c
+        except Exception:
+            pass
         active_clients.pop(uid, None)
-        try: await c.disconnect()
-        except: pass
+        try:
+            await c.disconnect()
+        except Exception:
+            pass
     p = await repo.get(uid)
-    if not p or not p["session"]: return None
+    if not p or not p["session"]:
+        return None
     c = TelegramClient(StringSession(p["session"]), API_ID, API_HASH)
     await c.connect()
     if not await c.is_user_authorized():
@@ -739,7 +783,8 @@ async def resolve_client(uid):
 @bot.on(events.NewMessage(pattern="/start"))
 async def cmd_start(e):
     uid = e.sender_id
-    if is_rate_limited(uid): return
+    if is_rate_limited(uid):
+        return
 
     p = await repo.get(uid)
     if is_super(uid):
@@ -771,7 +816,8 @@ async def cb_handler(e):
     plan = p.get("plan", "FREE")
     limits = plan_limits(plan)
 
-    if not is_admin and not is_approved: return await e.answer("⛔ Доступ закрыт", alert=True)
+    if not is_admin and not is_approved:
+        return await e.answer("⛔ Доступ закрыт", alert=True)
     if not p.get("accepted_rules") and action not in ("accept_rules", "decline_rules"):
         return await e.answer("⚠️ Сначала примите правила", alert=True)
 
@@ -783,7 +829,7 @@ async def cb_handler(e):
         p = await repo.get(uid)
         await e.edit(main_text(uid, p), buttons=main_menu(is_admin), parse_mode="html")
     elif action == "decline_rules":
-        await e.edit(f"❌ Вы отказались от правил.\n\nНапишите /start, если передумаете.", parse_mode="html")
+        await e.edit("❌ Вы отказались от правил.\n\nНапишите /start, если передумаете.", parse_mode="html")
     elif action == "nav_home":
         user_steps[uid] = "IDLE"
         p = await repo.get(uid)
@@ -799,9 +845,11 @@ async def cb_handler(e):
         tpls = p.get("templates", [])
         max_t = limits['templates'] if limits['templates'] < 9999 else '∞'
         preview = "\n".join(f"• <code>{t[:60]}</code>" for t in tpls[:10]) or "<i>Пусто</i>"
-        if len(tpls) > 10: preview += f"\n<i>...и ещё {len(tpls) - 10}</i>"
+        if len(tpls) > 10:
+            preview += f"\n<i>...и ещё {len(tpls) - 10}</i>"
         buttons = [[Button.inline("🗑 Очистить все", b"nav_tpl_clear")]]
-        if limits["templates_backup"]: buttons.append([Button.inline("💾 Бэкап", b"nav_tpl_backup")])
+        if limits["templates_backup"]:
+            buttons.append([Button.inline("💾 Бэкап", b"nav_tpl_backup")])
         buttons.append([Button.inline("🔙 Назад", b"nav_home")])
         await e.edit(f"📝 <b>Шаблоны ({len(tpls)}/{max_t})</b>\n━━━━━━━━━━━━━━━━━━━━\n{preview}\n━━━━━━━━━━━━━━━━━━━━\nОтправь текст (каждая строка = шаблон).", buttons=buttons, parse_mode="html")
     elif action == "nav_tpl_clear":
@@ -809,9 +857,11 @@ async def cb_handler(e):
         await e.answer("✅ Очищено")
         await e.edit("📝 <b>Шаблоны (0)</b>", buttons=back, parse_mode="html")
     elif action == "nav_tpl_backup":
-        if not limits["templates_backup"]: return await e.answer("💎 Доступно на PRO и выше", alert=True)
+        if not limits["templates_backup"]:
+            return await e.answer("💎 Доступно на PRO и выше", alert=True)
         tpls = p.get("templates", [])
-        if not tpls: return await e.answer("⚠️ Нет шаблонов", alert=True)
+        if not tpls:
+            return await e.answer("⚠️ Нет шаблонов", alert=True)
         buf = io.BytesIO("\n---\n".join(tpls).encode("utf-8"))
         buf.name = f"templates_{uid}.txt"
         await bot.send_file(uid, buf, caption="💾 Бэкап шаблонов")
@@ -822,7 +872,7 @@ async def cb_handler(e):
         maxd = int(p.get("max_delay", 60000) / 1000)
         active_hint = "\n\n⚡ <b>Сессия активна</b> — задержка применится сразу." if uid in spam_engines and spam_engines[uid].is_active else ""
         await e.edit(f"⚙️ <b>Задержка</b>\n━━━━━━━━━━━━━━━━━━━━\nТекущая: <b>{mind}–{maxd} сек</b>\nФормат: <code>{limits['min_delay']}-{limits['max_delay']}</code>{active_hint}", buttons=back, parse_mode="html")
-            elif action == "nav_spam":
+    elif action == "nav_spam":
         if not p.get("session"):
             return await e.answer("❌ Нет сессии", alert=True)
         if not p.get("templates"):
@@ -876,11 +926,13 @@ async def cb_handler(e):
             lines.append(f"{icon} <code>{target}</code> — {count} сообщ.")
         await e.edit("\n".join(lines), buttons=[[Button.inline("📤 Экспорт CSV", b"nav_export_csv")], [Button.inline("🔙 Назад", b"nav_home")]], parse_mode="html")
     elif action == "nav_export_csv":
-        if not limits["export"]: return await e.answer("💎 Доступно на PRO и выше", alert=True)
+        if not limits["export"]:
+            return await e.answer("💎 Доступно на PRO и выше", alert=True)
         async with repo.db.conn() as db:
             async with db.execute("SELECT target, sent_messages_count, status, started_at, ended_at FROM spam_history WHERE user_id=? ORDER BY id DESC", (uid,)) as cur:
                 rows = await cur.fetchall()
-        if not rows: return await e.answer("⚠️ Нет данных", alert=True)
+        if not rows:
+            return await e.answer("⚠️ Нет данных", alert=True)
         output = io.StringIO()
         writer = csv.writer(output)
         writer.writerow(["target", "sent", "status", "started_at", "ended_at"])
@@ -890,48 +942,59 @@ async def cb_handler(e):
         await bot.send_file(uid, buf, caption="📤 История в CSV")
         await e.answer("✅ Отправлено")
     elif action == "nav_blacklist":
-        if not limits["blacklist"]: return await e.answer("💎 Доступно на PRO и выше", alert=True)
+        if not limits["blacklist"]:
+            return await e.answer("💎 Доступно на PRO и выше", alert=True)
         user_steps[uid] = "ST_BLACKLIST"
         await e.edit(blacklist_text(p), buttons=[[Button.inline("🗑 Очистить", b"nav_blacklist_clear")], [Button.inline("🔙 Назад", b"nav_home")]], parse_mode="html")
     elif action == "nav_blacklist_clear":
         await repo.save(uid, blacklist=[])
-        await e.answer("✅ Очищено"); user_steps[uid] = "IDLE"
+        await e.answer("✅ Очищено")
+        user_steps[uid] = "IDLE"
         await e.edit("🚫 <b>Чёрный список (0)</b>", buttons=back, parse_mode="html")
     elif action == "nav_whitelist":
-        if not limits["whitelist"]: return await e.answer("💎 Доступно на PRO и выше", alert=True)
+        if not limits["whitelist"]:
+            return await e.answer("💎 Доступно на PRO и выше", alert=True)
         user_steps[uid] = "ST_WHITELIST"
         await e.edit(whitelist_text(p), buttons=[[Button.inline("🗑 Очистить", b"nav_whitelist_clear")], [Button.inline("🔙 Назад", b"nav_home")]], parse_mode="html")
     elif action == "nav_whitelist_clear":
         await repo.save(uid, whitelist=[])
-        await e.answer("✅ Очищено"); user_steps[uid] = "IDLE"
+        await e.answer("✅ Очищено")
+        user_steps[uid] = "IDLE"
         await e.edit("✅ <b>Белый список (0)</b>", buttons=back, parse_mode="html")
     elif action == "nav_stop_words":
-        if not limits["stop_words"]: return await e.answer("💎 Доступно на PRO и выше", alert=True)
+        if not limits["stop_words"]:
+            return await e.answer("💎 Доступно на PRO и выше", alert=True)
         user_steps[uid] = "ST_STOP_WORDS"
         await e.edit(stop_words_text(p), buttons=[[Button.inline("🗑 Очистить", b"nav_stop_words_clear")], [Button.inline("🔙 Назад", b"nav_home")]], parse_mode="html")
     elif action == "nav_stop_words_clear":
         await repo.save(uid, stop_words=[])
-        await e.answer("✅ Очищено"); user_steps[uid] = "IDLE"
+        await e.answer("✅ Очищено")
+        user_steps[uid] = "IDLE"
         await e.edit("🛑 <b>Стоп-слова (0)</b>", buttons=back, parse_mode="html")
     elif action == "nav_ab":
-        if not limits["ab_test"]: return await e.answer("👑 Доступно на ULTIMATE", alert=True)
+        if not limits["ab_test"]:
+            return await e.answer("👑 Доступно на ULTIMATE", alert=True)
         rows = await repo.get_ab_stats(uid)
         await e.edit(ab_text(rows), buttons=back, parse_mode="html")
     elif action == "nav_schedule":
-        if not limits["schedule"]: return await e.answer("👑 Доступно на ULTIMATE", alert=True)
+        if not limits["schedule"]:
+            return await e.answer("👑 Доступно на ULTIMATE", alert=True)
         user_steps[uid] = "ST_SCHEDULE"
         await e.edit(schedule_text(p), buttons=[[Button.inline("🗑 Сбросить", b"nav_schedule_clear")], [Button.inline("🔙 Назад", b"nav_home")]], parse_mode="html")
     elif action == "nav_schedule_clear":
-        await repo.save(uid, schedule=None); user_steps[uid] = "IDLE"
+        await repo.save(uid, schedule=None)
+        user_steps[uid] = "IDLE"
         await e.answer("✅ Сброшено")
         await e.edit("🕐 <b>Расписание</b>\n\n<i>Сброшено.</i>", buttons=back, parse_mode="html")
     elif action == "nav_webhook":
-        if not limits["webhooks"]: return await e.answer("👑 Доступно на ULTIMATE", alert=True)
+        if not limits["webhooks"]:
+            return await e.answer("👑 Доступно на ULTIMATE", alert=True)
         user_steps[uid] = "ST_WEBHOOK"
         url = p.get("webhook_url") or "—"
         await e.edit(f"🔔 <b>Webhook</b>\n━━━━━━━━━━━━━━━━━━━━\nТекущий: <code>{url}</code>\n\nОтправь URL или <code>off</code> чтобы отключить.", buttons=[[Button.inline("🗑 Убрать", b"nav_webhook_clear")], [Button.inline("🔙 Назад", b"nav_home")]], parse_mode="html")
     elif action == "nav_webhook_clear":
-        await repo.save(uid, webhook_url=None); user_steps[uid] = "IDLE"
+        await repo.save(uid, webhook_url=None)
+        user_steps[uid] = "IDLE"
         await e.answer("✅ Отключено")
         await e.edit("🔔 <b>Webhook убран</b>", buttons=back, parse_mode="html")
     elif action == "nav_help":
@@ -953,7 +1016,10 @@ async def cb_handler(e):
             parse_mode="html",
         )
     elif action == "admin_stats" and is_admin:
-        total = await repo.count_users(); approved = await repo.count_approved(); by_plan = await repo.count_by_plan(); pay = await repo.get_payment_stats()
+        total = await repo.count_users()
+        approved = await repo.count_approved()
+        by_plan = await repo.count_by_plan()
+        pay = await repo.get_payment_stats()
         await e.edit(
             f"📊 <b>Общая статистика</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -970,13 +1036,15 @@ async def cb_handler(e):
         async with repo.db.conn() as db:
             async with db.execute("SELECT plan, COUNT(*), SUM(amount) FROM payments_log GROUP BY plan") as cur:
                 rows = await cur.fetchall()
-        if not rows: return await e.edit("💰 <b>Пока нет платежей</b>", buttons=back, parse_mode="html")
+        if not rows:
+            return await e.edit("💰 <b>Пока нет платежей</b>", buttons=back, parse_mode="html")
         lines = ["💰 <b>Выручка по тарифам</b>", "━━━━━━━━━━━━━━━━━━━━"]
         total_sum, total_count = 0, 0
         for plan_name, count, amount in rows:
             emoji = {"PRO": "💎", "ULTIMATE": "👑"}.get(plan_name, "⚪")
             lines.append(f"{emoji} <b>{plan_name}</b>: {count} шт — <b>{amount} ₽</b>")
-            total_sum += amount or 0; total_count += count
+            total_sum += amount or 0
+            total_count += count
         lines.append("━━━━━━━━━━━━━━━━━━━━")
         lines.append(f"📊 Всего продаж: <b>{total_count}</b>")
         lines.append(f"💰 Выручка: <b>{total_sum} ₽</b>")
@@ -1008,7 +1076,8 @@ async def cb_handler(e):
                 user_steps[uid] = "IDLE"
                 await e.edit("✅ <b>Успешно авторизован!</b>\n\n/start", parse_mode="html")
             except asyncio.TimeoutError:
-                active_clients.pop(f"qr_{uid}", None); user_steps[uid] = "IDLE"
+                active_clients.pop(f"qr_{uid}", None)
+                user_steps[uid] = "IDLE"
                 await e.edit("⏱ QR истёк. /start")
         except Exception as ex:
             user_steps[uid] = "IDLE"
@@ -1016,17 +1085,21 @@ async def cb_handler(e):
     elif action == "qr_cancel":
         b = active_clients.pop(f"qr_{uid}", None)
         if b:
-            try: await b["client"].disconnect()
-            except: pass
+            try:
+                await b["client"].disconnect()
+            except Exception:
+                pass
         user_steps[uid] = "IDLE"
         await e.edit("❌ Отменено", buttons=back)
     elif action == "resend_call":
         b = active_clients.get(f"temp_{uid}")
-        if not b: return await e.answer("❌ Нет активной попытки", alert=True)
+        if not b:
+            return await e.answer("❌ Нет активной попытки", alert=True)
         try:
             await b["client"].send_code_request(b["phone"], force_sms=False)
             await e.answer("📞 Повторный запрос", alert=True)
-        except Exception as ex: await e.answer(f"❌ {str(ex)[:100]}", alert=True)
+        except Exception as ex:
+            await e.answer(f"❌ {str(ex)[:100]}", alert=True)
     else:
         await e.answer("⚠️ Неизвестное действие", alert=True)
 
@@ -1035,7 +1108,8 @@ async def cb_handler(e):
 async def text_handler(e):
     uid = e.sender_id
     text = e.text.strip()
-    if text.startswith("/") or is_rate_limited(uid, max_per_sec=5): return
+    if text.startswith("/") or is_rate_limited(uid, max_per_sec=5):
+        return
 
     p = await repo.get(uid) or {}
     is_admin = p.get("is_admin") == 1 or is_super(uid)
@@ -1048,52 +1122,76 @@ async def text_handler(e):
         try:
             if text.startswith(".approve"):
                 t_id = int(text.split()[1])
-                await repo.save(t_id, is_approved=1); await repo.log_audit(uid, "approve", t_id)
+                await repo.save(t_id, is_approved=1)
+                await repo.log_audit(uid, "approve", t_id)
                 await e.reply(f"✅ Доступ: <code>{t_id}</code>", parse_mode="html")
-                try: await bot.send_message(t_id, "✅ Вам выдан доступ! Напишите /start")
-                except: pass
+                try:
+                    await bot.send_message(t_id, "✅ Вам выдан доступ! Напишите /start")
+                except Exception:
+                    pass
                 return
             if text.startswith(".revoke"):
                 t_id = int(text.split()[1])
-                if is_super(t_id): return await e.reply("⚠️ Нельзя забрать у создателя")
-                await repo.save(t_id, is_approved=0); await repo.log_audit(uid, "revoke", t_id)
+                if is_super(t_id):
+                    return await e.reply("⚠️ Нельзя забрать у создателя")
+                await repo.save(t_id, is_approved=0)
+                await repo.log_audit(uid, "revoke", t_id)
                 await e.reply(f"🚫 Забран: <code>{t_id}</code>", parse_mode="html")
                 return
             if text.startswith(".sub"):
-                parts = text.split(); t_id, new_plan = int(parts[1]), parts[2].upper()
-                if new_plan not in ("FREE", "PRO", "ULTIMATE"): return await e.reply("❌ FREE / PRO / ULTIMATE")
-                old_p = await repo.get(t_id); old_plan = old_p["plan"] if old_p else "FREE"
-                await repo.save(t_id, plan=new_plan, is_approved=1); await repo.log_audit(uid, "set_plan", t_id, new_plan)
-                if new_plan != "FREE" and new_plan != old_plan: await repo.log_payment(t_id, new_plan, PRICES[new_plan], uid)
-                try: await bot.send_message(t_id, f"🎉 <b>Тариф обновлён!</b>\n\nТвой новый план: <b>{new_plan}</b>", parse_mode="html")
-                except: pass
+                parts = text.split()
+                t_id, new_plan = int(parts[1]), parts[2].upper()
+                if new_plan not in ("FREE", "PRO", "ULTIMATE"):
+                    return await e.reply("❌ FREE / PRO / ULTIMATE")
+                old_p = await repo.get(t_id)
+                old_plan = old_p["plan"] if old_p else "FREE"
+                await repo.save(t_id, plan=new_plan, is_approved=1)
+                await repo.log_audit(uid, "set_plan", t_id, new_plan)
+                if new_plan != "FREE" and new_plan != old_plan:
+                    await repo.log_payment(t_id, new_plan, PRICES[new_plan], uid)
+                try:
+                    await bot.send_message(t_id, f"🎉 <b>Тариф обновлён!</b>\n\nТвой новый план: <b>{new_plan}</b>", parse_mode="html")
+                except Exception:
+                    pass
                 await e.reply(f"✅ <b>{new_plan}</b> → <code>{t_id}</code>", parse_mode="html")
                 return
             if text.startswith(".balance"):
-                parts = text.split(); t_id, amount = int(parts[1]), int(parts[2])
-                tp = await repo.get(t_id); current = tp["balance"] if tp else 0
-                if current + amount < 0: return await e.reply(f"⚠️ Баланс не может быть отрицательным (сейчас {current} ₽)")
-                await repo.add_balance(t_id, amount); await repo.log_audit(uid, "balance", t_id, str(amount))
-                await e.reply(f"💰 {amount:+d} ₽ → <code>{t_id}</code> (баланс: {current+amount} ₽)", parse_mode="html")
+                parts = text.split()
+                t_id, amount = int(parts[1]), int(parts[2])
+                tp = await repo.get(t_id)
+                current = tp["balance"] if tp else 0
+                if current + amount < 0:
+                    return await e.reply(f"⚠️ Баланс не может быть отрицательным (сейчас {current} ₽)")
+                await repo.add_balance(t_id, amount)
+                await repo.log_audit(uid, "balance", t_id, str(amount))
+                await e.reply(f"💰 {amount:+d} ₽ → <code>{t_id}</code> (баланс: {current + amount} ₽)", parse_mode="html")
                 return
             if text.startswith(".badge"):
-                parts = text.split(maxsplit=2); t_id = int(parts[1]); badge = parts[2] if len(parts) > 2 else None
+                parts = text.split(maxsplit=2)
+                t_id = int(parts[1])
+                badge = parts[2] if len(parts) > 2 else None
                 await repo.save(t_id, custom_badge=badge)
                 await e.reply(f"🏅 Бейдж → <code>{t_id}</code>: {badge or '—'}", parse_mode="html")
                 return
             if text.startswith(".info"):
                 tp = await repo.get(int(text.split()[1]))
-                if not tp: return await e.reply("❌ Не найден")
+                if not tp:
+                    return await e.reply("❌ Не найден")
                 await e.reply(f"👤 <b>Юзер</b> <code>{tp.get('user_id', '')}</code>\nТариф: <b>{tp['plan']}</b>\nШаблонов: {len(tp['templates'])}\nБаланс: {tp['balance']} ₽\nСессия: {'✅' if tp['session'] else '❌'}", parse_mode="html")
                 return
             if text == ".stats":
-                total = await repo.count_users(); approved = await repo.count_approved(); by_plan = await repo.count_by_plan(); pay = await repo.get_payment_stats()
+                total = await repo.count_users()
+                approved = await repo.count_approved()
+                by_plan = await repo.count_by_plan()
+                pay = await repo.get_payment_stats()
                 await e.reply(f"📊 <b>Статистика</b>\n👥 Юзеров: {total}\n✅ Доступ: {approved}\n⚪ FREE: {by_plan.get('FREE', 0)}\n💎 PRO: {by_plan.get('PRO', 0)}\n👑 ULTIMATE: {by_plan.get('ULTIMATE', 0)}\n💰 Платежей: {pay['count']} на {pay['sum']} ₽", parse_mode="html")
                 return
             if text == ".revenue":
                 async with repo.db.conn() as db:
-                    async with db.execute("SELECT plan, COUNT(*), SUM(amount) FROM payments_log GROUP BY plan") as cur: rows = await cur.fetchall()
-                if not rows: return await e.reply("💰 Пока нет платежей")
+                    async with db.execute("SELECT plan, COUNT(*), SUM(amount) FROM payments_log GROUP BY plan") as cur:
+                        rows = await cur.fetchall()
+                if not rows:
+                    return await e.reply("💰 Пока нет платежей")
                 lines = ["💰 <b>Выручка</b>"]
                 for plan_name, count, amount in rows:
                     emoji = {"PRO": "💎", "ULTIMATE": "👑"}.get(plan_name, "⚪")
@@ -1106,21 +1204,29 @@ async def text_handler(e):
                 return
             if text.startswith(".broadcast"):
                 body = text[len(".broadcast"):].strip()
-                if not body: return await e.reply("❌ <code>.broadcast текст</code>", parse_mode="html")
-                users = await repo.get_approved_users(); sent = failed = 0
+                if not body:
+                    return await e.reply("❌ <code>.broadcast текст</code>", parse_mode="html")
+                users = await repo.get_approved_users()
+                sent = failed = 0
                 await e.reply(f"⏳ Рассылка на {len(users)} юзеров...")
                 for u in users:
                     try:
-                        await bot.send_message(u, body, parse_mode="html"); sent += 1; await asyncio.sleep(0.05)
-                    except: failed += 1
+                        await bot.send_message(u, body, parse_mode="html")
+                        sent += 1
+                        await asyncio.sleep(0.05)
+                    except Exception:
+                        failed += 1
                 await e.reply(f"✅ Отправлено: {sent}, ошибок: {failed}")
                 return
-            if text == ".id": return await e.reply(f"Ваш ID: <code>{uid}</code>", parse_mode="html")
+            if text == ".id":
+                return await e.reply(f"Ваш ID: <code>{uid}</code>", parse_mode="html")
         except (IndexError, ValueError):
             return await e.reply("❌ Неверный формат команды")
 
-    if not is_admin and not is_approved: return
-    if not p.get("accepted_rules"): return
+    if not is_admin and not is_approved:
+        return
+    if not p.get("accepted_rules"):
+        return
 
     step = user_steps.get(uid, "IDLE")
 
@@ -1128,36 +1234,51 @@ async def text_handler(e):
         await e.reply("⏳ Запрашиваю код...")
         c = TelegramClient(StringSession(), API_ID, API_HASH)
         try:
-            await c.connect(); req = await c.send_code_request(text)
+            await c.connect()
+            req = await c.send_code_request(text)
             active_clients[f"temp_{uid}"] = {"client": c, "phone": text, "hash": req.phone_code_hash}
             user_steps[uid] = "ST_CODE"
             await e.reply("📩 <b>Код отправлен</b>\nВведите код:", buttons=[[Button.inline("📷 Войти по QR", b"qr_start")], [Button.inline("📞 Запросить звонок", b"resend_call")], [Button.inline("🔙 Отмена", b"nav_home")]], parse_mode="html")
         except Exception as ex:
-            await e.reply(f"❌ <code>{str(ex)[:200]}</code>", parse_mode="html"); user_steps[uid] = "IDLE"
+            await e.reply(f"❌ <code>{str(ex)[:200]}</code>", parse_mode="html")
+            user_steps[uid] = "IDLE"
 
     elif step == "ST_CODE":
         b = active_clients.get(f"temp_{uid}")
-        if not b: return
+        if not b:
+            return
         try:
             await b["client"].sign_in(phone=b["phone"], code=text, phone_code_hash=b["hash"])
             await repo.save(uid, session=b["client"].session.save())
-            active_clients[uid] = b["client"]; active_clients.pop(f"temp_{uid}", None); user_steps[uid] = "IDLE"
+            active_clients[uid] = b["client"]
+            active_clients.pop(f"temp_{uid}", None)
+            user_steps[uid] = "IDLE"
             await e.reply("✅ Сессия создана! /start")
         except SessionPasswordNeededError:
-            user_steps[uid] = "ST_2FA"; await e.reply("🔐 Введите пароль 2FA:")
-        except PhoneCodeInvalidError: await e.reply("❌ Неверный код")
-        except PhoneCodeExpiredError: user_steps[uid] = "IDLE"; await e.reply("❌ Код истёк, /start")
-        except Exception as ex: user_steps[uid] = "IDLE"; await e.reply(f"❌ <code>{str(ex)[:200]}</code>", parse_mode="html")
+            user_steps[uid] = "ST_2FA"
+            await e.reply("🔐 Введите пароль 2FA:")
+        except PhoneCodeInvalidError:
+            await e.reply("❌ Неверный код")
+        except PhoneCodeExpiredError:
+            user_steps[uid] = "IDLE"
+            await e.reply("❌ Код истёк, /start")
+        except Exception as ex:
+            user_steps[uid] = "IDLE"
+            await e.reply(f"❌ <code>{str(ex)[:200]}</code>", parse_mode="html")
 
     elif step == "ST_2FA":
         b = active_clients.get(f"temp_{uid}")
-        if not b: return
+        if not b:
+            return
         try:
             await b["client"].sign_in(password=text)
             await repo.save(uid, session=b["client"].session.save())
-            active_clients[uid] = b["client"]; active_clients.pop(f"temp_{uid}", None); user_steps[uid] = "IDLE"
+            active_clients[uid] = b["client"]
+            active_clients.pop(f"temp_{uid}", None)
+            user_steps[uid] = "IDLE"
             await e.reply("✅ 2FA пройдена! /start")
-        except Exception as ex: await e.reply(f"❌ <code>{str(ex)[:200]}</code>", parse_mode="html")
+        except Exception as ex:
+            await e.reply(f"❌ <code>{str(ex)[:200]}</code>", parse_mode="html")
 
     elif step == "ST_TARGET":
         user_steps[uid] = "IDLE"
@@ -1165,100 +1286,154 @@ async def text_handler(e):
         targets, bad = [], []
         for r in raw:
             n = normalize_target(r)
-            if n: targets.append(n)
-            else: bad.append(r)
-        if not targets: return await e.reply("❌ Не удалось распознать цели")
-        if len(targets) > limits["max_targets"]: return await e.reply(f"⚠️ Тариф <b>{plan}</b> разрешает <b>{limits['max_targets']}</b> целей. У тебя: {len(targets)}.\n\nПовысь тариф: /start → 💎", parse_mode="html")
+            if n:
+                targets.append(n)
+            else:
+                bad.append(r)
+        if not targets:
+            return await e.reply("❌ Не удалось распознать цели")
+        if len(targets) > limits["max_targets"]:
+            return await e.reply(f"⚠️ Тариф <b>{plan}</b> разрешает <b>{limits['max_targets']}</b> целей. У тебя: {len(targets)}.\n\nПовысь тариф: /start → 💎", parse_mode="html")
         daily_count = await repo.get_daily_count(uid)
-        if daily_count >= limits["daily_limit"]: return await e.reply(f"⚠️ Дневной лимит {limits['daily_limit']} исчерпан", parse_mode="html")
+        if daily_count >= limits["daily_limit"]:
+            return await e.reply(f"⚠️ Дневной лимит {limits['daily_limit']} исчерпан", parse_mode="html")
         if uid in spam_engines:
-            spam_engines[uid].stop(); await asyncio.sleep(0.5)
+            spam_engines[uid].stop()
+            await asyncio.sleep(0.5)
         c = await resolve_client(uid)
-        if not c: return await e.reply("❌ Сессия потеряна, /start → Аккаунт")
-        eng = SpamEngine(c, uid, DB_FILE, p["min_delay"], p["max_delay"], system_metrics, protection=limits["flood_protection"], auto_pause=limits["auto_pause"], repo=repo, schedule=p.get("schedule"), blacklist=p.get("blacklist", []), whitelist=p.get("whitelist", []), stop_words=p.get("stop_words", []), random_targets=limits.get("random_targets", False), ab_test=limits.get("ab_test", False), webhook_url=p.get("webhook_url"))
-        spam_engines[uid] = eng; asyncio.create_task(eng.start(targets, p["templates"]))
+        if not c:
+            return await e.reply("❌ Сессия потеряна, /start → Аккаунт")
+        eng = SpamEngine(
+            c, uid, DB_FILE, p["min_delay"], p["max_delay"], system_metrics,
+            protection=limits["flood_protection"],
+            auto_pause=limits["auto_pause"],
+            repo=repo,
+            schedule=p.get("schedule"),
+            blacklist=p.get("blacklist", []),
+            whitelist=p.get("whitelist", []),
+            stop_words=p.get("stop_words", []),
+            random_targets=limits.get("random_targets", False),
+            ab_test=limits.get("ab_test", False),
+            webhook_url=p.get("webhook_url"),
+        )
+        spam_engines[uid] = eng
+        asyncio.create_task(eng.start(targets, p["templates"]))
         msg = "🚀 <b>Запущено</b>\n\n<b>Цели:</b>\n" + "\n".join(f"• <code>{t}</code>" for t in targets)
-        if bad: msg += f"\n\n⚠️ Не распознано: {len(bad)}"
+        if bad:
+            msg += f"\n\n⚠️ Не распознано: {len(bad)}"
         msg += f"\n\nЗадержка: {int(p['min_delay']/1000)}–{int(p['max_delay']/1000)}с"
         await e.reply(msg, parse_mode="html")
 
     elif step == "ST_DELAY":
         try:
             parts = text.replace(" ", "").split("-")
-            if len(parts) != 2: raise ValueError
+            if len(parts) != 2:
+                raise ValueError
             low, high = map(int, parts)
-            if low < limits["min_delay"]: return await e.reply(f"⚠️ Минимум {limits['min_delay']}с для <b>{plan}</b>", parse_mode="html")
-            if high > limits["max_delay"]: return await e.reply(f"⚠️ Максимум {limits['max_delay']}с")
-            if high < low: return await e.reply("⚠️ Максимум меньше минимума")
-            
+            if low < limits["min_delay"]:
+                return await e.reply(f"⚠️ Минимум {limits['min_delay']}с для <b>{plan}</b>", parse_mode="html")
+            if high > limits["max_delay"]:
+                return await e.reply(f"⚠️ Максимум {limits['max_delay']}с")
+            if high < low:
+                return await e.reply("⚠️ Максимум меньше минимума")
+
             await repo.save(uid, min_delay=low * 1000, max_delay=high * 1000)
             if uid in spam_engines and spam_engines[uid].is_active:
                 spam_engines[uid].update_delay(low * 1000, high * 1000)
                 msg_extra = "\n\n⚡ <b>Применено к активной сессии без остановки!</b>"
             else:
                 msg_extra = ""
-                
+
             user_steps[uid] = "IDLE"
             await e.reply(f"✅ Задержка: <b>{low}–{high}с</b>" + msg_extra, buttons=main_menu(is_admin), parse_mode="html")
         except (ValueError, AttributeError):
             await e.reply(f"❌ Формат: <code>{limits['min_delay']}-{limits['max_delay']}</code>", parse_mode="html")
 
     elif step == "ST_BLACKLIST":
-        user_steps[uid] = "IDLE"; cur = set(p.get("blacklist", [])); added = 0
+        user_steps[uid] = "IDLE"
+        cur = set(p.get("blacklist", []))
+        added = 0
         for line in text.split("\n"):
             n = normalize_target(line)
-            if n and n not in cur: cur.add(n); added += 1
+            if n and n not in cur:
+                cur.add(n)
+                added += 1
         await repo.save(uid, blacklist=list(cur))
         await e.reply(f"🚫 Добавлено: <b>{added}</b>. Всего: {len(cur)}", buttons=[[Button.inline("🔙 К списку", b"nav_blacklist")]], parse_mode="html")
     elif step == "ST_WHITELIST":
-        user_steps[uid] = "IDLE"; cur = set(p.get("whitelist", [])); added = 0
+        user_steps[uid] = "IDLE"
+        cur = set(p.get("whitelist", []))
+        added = 0
         for line in text.split("\n"):
             n = normalize_target(line)
-            if n and n not in cur: cur.add(n); added += 1
+            if n and n not in cur:
+                cur.add(n)
+                added += 1
         await repo.save(uid, whitelist=list(cur))
         await e.reply(f"✅ Добавлено: <b>{added}</b>. Всего: {len(cur)}", buttons=[[Button.inline("🔙 К списку", b"nav_whitelist")]], parse_mode="html")
     elif step == "ST_STOP_WORDS":
-        user_steps[uid] = "IDLE"; cur = set(p.get("stop_words", [])); added = 0
+        user_steps[uid] = "IDLE"
+        cur = set(p.get("stop_words", []))
+        added = 0
         for line in text.split("\n"):
             w = line.strip().lower()
-            if w and w not in cur: cur.add(w); added += 1
+            if w and w not in cur:
+                cur.add(w)
+                added += 1
         await repo.save(uid, stop_words=list(cur))
         await e.reply(f"🛑 Добавлено: <b>{added}</b>. Всего: {len(cur)}", buttons=[[Button.inline("🔙 К списку", b"nav_stop_words")]], parse_mode="html")
     elif step == "ST_SCHEDULE":
         user_steps[uid] = "IDLE"
         try:
             parts = text.split()
-            days_part = parts[0]; days = []
+            days_part = parts[0]
+            days = []
             for chunk in days_part.split(","):
-                if "-" in chunk: a, b_ = map(int, chunk.split("-")); days.extend(range(a, b_ + 1))
-                else: days.append(int(chunk))
+                if "-" in chunk:
+                    a, b_ = map(int, chunk.split("-"))
+                    days.extend(range(a, b_ + 1))
+                else:
+                    days.append(int(chunk))
             from_t, to_t = parts[1], parts[2]
-            datetime.datetime.strptime(from_t, "%H:%M"); datetime.datetime.strptime(to_t, "%H:%M")
+            datetime.datetime.strptime(from_t, "%H:%M")
+            datetime.datetime.strptime(to_t, "%H:%M")
             sch = {"days": sorted(set(days)), "from": from_t, "to": to_t}
             await repo.save(uid, schedule=sch)
             await e.reply(f"✅ Сохранено: дни <code>{sch['days']}</code>, часы <code>{from_t}—{to_t}</code>", buttons=[[Button.inline("🔙 К расписанию", b"nav_schedule")]], parse_mode="html")
-        except: await e.reply("❌ Формат: <code>1-5 09:00 23:00</code>", parse_mode="html")
+        except Exception:
+            await e.reply("❌ Формат: <code>1-5 09:00 23:00</code>", parse_mode="html")
     elif step == "ST_WEBHOOK":
         user_steps[uid] = "IDLE"
         if text.lower() == "off":
-            await repo.save(uid, webhook_url=None); return await e.reply("✅ Webhook отключён", buttons=[[Button.inline("🔙 Назад", b"nav_home")]])
-        if not text.startswith("http"): return await e.reply("❌ URL должен начинаться с http:// или https://")
+            await repo.save(uid, webhook_url=None)
+            return await e.reply("✅ Webhook отключён", buttons=[[Button.inline("🔙 Назад", b"nav_home")]])
+        if not text.startswith("http"):
+            return await e.reply("❌ URL должен начинаться с http:// или https://")
         await repo.save(uid, webhook_url=text)
         await e.reply(f"✅ Webhook сохранён:\n<code>{text}</code>", buttons=[[Button.inline("🔙 Назад", b"nav_home")]], parse_mode="html")
     elif step == "IDLE":
-        new_lines = [line for line in text.split("\n") if line.strip()]; cur = list(p.get("templates", [])); added = skipped = 0
+        new_lines = [line for line in text.split("\n") if line.strip()]
+        cur = list(p.get("templates", []))
+        added = skipped = 0
         for line in new_lines:
-            if line in cur: continue
-            if len(cur) >= limits["templates"]: skipped += 1; continue
-            cur.append(line); added += 1
+            if line in cur:
+                continue
+            if len(cur) >= limits["templates"]:
+                skipped += 1
+                continue
+            cur.append(line)
+            added += 1
         if added > 0:
             await repo.save(uid, templates=cur)
             max_t = limits['templates'] if limits['templates'] < 9999 else '∞'
             msg = f"📝 Добавлено: <b>{added}</b>. Всего: <b>{len(cur)}/{max_t}</b>"
-            if skipped: msg += f"\n⚠️ Пропущено {skipped} — лимит тарифа."
+            if skipped:
+                msg += f"\n⚠️ Пропущено {skipped} — лимит тарифа."
             await e.reply(msg, parse_mode="html")
-        elif skipped: await e.reply(f"⚠️ Лимит шаблонов для <b>{plan}</b> — {limits['templates']}\nПовысь тариф: /start → 💎", parse_mode="html")
-        else: await e.reply("⚠️ Эти шаблоны уже есть")
+        elif skipped:
+            await e.reply(f"⚠️ Лимит шаблонов для <b>{plan}</b> — {limits['templates']}\nПовысь тариф: /start → 💎", parse_mode="html")
+        else:
+            await e.reply("⚠️ Эти шаблоны уже есть")
 
 
 # =====================================================================
@@ -1455,57 +1630,91 @@ app.config["JSON_AS_ASCII"] = False
 START_TIME = datetime.datetime.now()
 
 def _check_auth():
-    if not DASHBOARD_TOKEN: abort(503, "DASHBOARD_TOKEN не задан")
+    if not DASHBOARD_TOKEN:
+        abort(503, "DASHBOARD_TOKEN не задан")
     got = request.headers.get("X-Token") or request.args.get("token", "")
-    if not hmac.compare_digest(got, DASHBOARD_TOKEN): abort(401)
+    if not hmac.compare_digest(got, DASHBOARD_TOKEN):
+        abort(401)
 
 @app.route("/healthz")
-def health(): return jsonify(status="OK"), 200
+def health():
+    return jsonify(status="OK"), 200
 
 @app.route("/api/stats")
 def stats_api():
     _check_auth()
+
     async def _fetch():
         async with repo.db.conn() as db:
-            async with db.execute("SELECT COUNT(*) FROM users") as cur: users = (await cur.fetchone())[0]
-            async with db.execute("SELECT COALESCE(SUM(amount),0) FROM payments_log") as cur: revenue = (await cur.fetchone())[0]
+            async with db.execute("SELECT COUNT(*) FROM users") as cur:
+                users = (await cur.fetchone())[0]
+            async with db.execute("SELECT COALESCE(SUM(amount),0) FROM payments_log") as cur:
+                revenue = (await cur.fetchone())[0]
         return users, revenue
+
     users, revenue = asyncio.run_coroutine_threadsafe(_fetch(), bot.loop).result()
-    return jsonify(messages=system_metrics["total_messages_sent"], sessions=len(spam_engines), errors=system_metrics["total_errors_caught"], flood=system_metrics["total_flood_wait_events"], uptime=str(datetime.datetime.now() - START_TIME).split(".")[0], users=users, revenue=int(revenue))
+    return jsonify(
+        messages=system_metrics["total_messages_sent"],
+        sessions=len(spam_engines),
+        errors=system_metrics["total_errors_caught"],
+        flood=system_metrics["total_flood_wait_events"],
+        uptime=str(datetime.datetime.now() - START_TIME).split(".")[0],
+        users=users,
+        revenue=int(revenue),
+    )
 
 @app.route("/api/users")
 def api_users():
     _check_auth()
+
     async def _fetch():
         async with repo.db.conn() as db:
-            async with db.execute("SELECT user_id, plan, balance, templates, session_string, is_approved, is_admin FROM users ORDER BY user_id LIMIT 500") as cur: return await cur.fetchall()
+            async with db.execute("SELECT user_id, plan, balance, templates, session_string, is_approved, is_admin FROM users ORDER BY user_id LIMIT 500") as cur:
+                return await cur.fetchall()
+
     rows = asyncio.run_coroutine_threadsafe(_fetch(), bot.loop).result()
-    return jsonify(users=[{"user_id": r[0], "plan": r[1] or "FREE", "balance": r[2] or 0, "templates": len(json.loads(r[3] or "[]")), "has_session": bool(r[4]), "is_approved": r[5], "is_admin": r[6]} for r in rows])
+    return jsonify(users=[{
+        "user_id": r[0], "plan": r[1] or "FREE", "balance": r[2] or 0,
+        "templates": len(json.loads(r[3] or "[]")), "has_session": bool(r[4]),
+        "is_approved": r[5], "is_admin": r[6],
+    } for r in rows])
 
 @app.route("/api/payments")
 def api_payments():
     _check_auth()
+
     async def _fetch():
         async with repo.db.conn() as db:
-            async with db.execute("SELECT created_at, user_id, plan, amount, method FROM payments_log ORDER BY id DESC LIMIT 100") as cur: return await cur.fetchall()
+            async with db.execute("SELECT created_at, user_id, plan, amount, method FROM payments_log ORDER BY id DESC LIMIT 100") as cur:
+                return await cur.fetchall()
+
     rows = asyncio.run_coroutine_threadsafe(_fetch(), bot.loop).result()
     return jsonify(payments=[{"created_at": r[0], "user_id": r[1], "plan": r[2], "amount": r[3], "method": r[4]} for r in rows])
 
 @app.route("/api/sessions")
 def api_sessions():
-    _check_auth(); items = []
+    _check_auth()
+    items = []
     for uid, eng in spam_engines.items():
         up = datetime.datetime.now() - eng.started_at
         h, m, s = up.seconds // 3600, up.seconds % 3600 // 60, up.seconds % 60
-        items.append({"user_id": uid, "sent": eng.sent, "errors": eng.errors, "flood": eng.pacer.flood_count, "min_s": eng.pacer.base_min // 1000, "max_s": eng.pacer.base_max // 1000, "uptime": f"{h:02d}:{m:02d}:{s:02d}"})
+        items.append({
+            "user_id": uid, "sent": eng.sent, "errors": eng.errors,
+            "flood": eng.pacer.flood_count,
+            "min_s": eng.pacer.base_min // 1000, "max_s": eng.pacer.base_max // 1000,
+            "uptime": f"{h:02d}:{m:02d}:{s:02d}",
+        })
     return jsonify(sessions=items)
 
 @app.route("/api/audit")
 def api_audit():
     _check_auth()
+
     async def _fetch():
         async with repo.db.conn() as db:
-            async with db.execute("SELECT created_at, admin_id, action, target_id, details FROM audit_log ORDER BY id DESC LIMIT 100") as cur: return await cur.fetchall()
+            async with db.execute("SELECT created_at, admin_id, action, target_id, details FROM audit_log ORDER BY id DESC LIMIT 100") as cur:
+                return await cur.fetchall()
+
     rows = asyncio.run_coroutine_threadsafe(_fetch(), bot.loop).result()
     return jsonify(audit=[{"created_at": r[0], "admin_id": r[1], "action": r[2], "target_id": r[3], "details": r[4]} for r in rows])
 
@@ -1548,8 +1757,10 @@ async def main():
     finally:
         for c in list(active_clients.values()):
             if hasattr(c, "disconnect"):
-                try: await c.disconnect()
-                except: pass
+                try:
+                    await c.disconnect()
+                except Exception:
+                    pass
 
 if __name__ == "__main__":
     log.info("=" * 50)
