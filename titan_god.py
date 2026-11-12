@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TITAN Enterprise v8.0 — Полный функционал v6.3 + Дизайн v7.1 + Фиксы Python 3.14.
+TITAN Enterprise v8.1 — Полный функционал v6 + Дизайн v7.1 + Фикс colorama и БД.
 """
 
 import os
@@ -32,10 +32,7 @@ from telethon.errors import (
 )
 from telethon.errors.rpcerrorlist import AccessTokenInvalidError
 from flask import Flask, jsonify, request, abort, Response
-from colorama import init
 import aiosqlite
-
-init(autoreset=True)
 
 API_ID = int(os.getenv("API_ID", "2040"))
 API_HASH = os.getenv("API_HASH", "b18441a1ff607e10a989891a5462e627")
@@ -190,18 +187,14 @@ class TitanDB:
                 await asyncio.to_thread(shutil.copyfile, self.path, dst)
                 files = sorted(f for f in os.listdir(self.backup_dir) if f.startswith("backup_"))
                 for old in files[:-10]:
-                    try:
-                        os.remove(os.path.join(self.backup_dir, old))
-                    except OSError:
-                        pass
+                    try: os.remove(os.path.join(self.backup_dir, old))
+                    except OSError: pass
 
     async def backup_loop(self, hours=6):
         while True:
             await asyncio.sleep(hours * 3600)
-            try:
-                await self.backup()
-            except Exception:
-                pass
+            try: await self.backup()
+            except Exception: pass
 
 class UserRepo:
     def __init__(self, db: TitanDB):
@@ -343,7 +336,7 @@ class UserRepo:
             async with db.execute("SELECT template, SUM(sent), SUM(errors) FROM ab_tests WHERE user_id=? GROUP BY template ORDER BY SUM(sent) DESC", (uid,)) as cur:
                 return await cur.fetchall()
 
-# --- Парсер целей с поддержкой закрытых чатов ---
+# --- Парсер целей ---
 _TG_URL = re.compile(r"(?:https?://)?t\.me/([A-Za-z0-9_]{4,})")
 _TG_RESOLVE = re.compile(r"(?:https?://)?t\.me/c/(\d+)")
 _TG_APP_CHAT = re.compile(r"tg://(?:chat|resolve)\?id=(-?\d+)")
@@ -477,7 +470,6 @@ class SpamEngine:
                     await self._sleep_until(1)
                     continue
 
-                # Поддержка закрытых чатов
                 if isinstance(target, int):
                     try:
                         entity = await self.client.get_entity(target)
@@ -495,12 +487,10 @@ class SpamEngine:
                 if self.repo:
                     try:
                         await self.repo.log_daily(self.user_id, 1)
-                        if self.ab_test:
-                            await self.repo.log_ab_test(self.user_id, raw, sent=1)
+                        if self.ab_test: await self.repo.log_ab_test(self.user_id, raw, sent=1)
                     except Exception: pass
                 
-                if counter % 10 == 0:
-                    await self._write_history(target, counter, "RUNNING")
+                if counter % 10 == 0: await self._write_history(target, counter, "RUNNING")
 
                 delay = self.pacer.next_delay()
                 log.info("[%s] → %s | отправлено=%d | ждём %.1fс", self.user_id, target, self.sent, delay)
@@ -511,28 +501,23 @@ class SpamEngine:
                 wait_for = self.pacer.on_flood(e.seconds)
                 log.warning("[%s] FloodWait %sс → ждём %.0fс", self.user_id, e.seconds, wait_for)
                 await self._sleep_until(wait_for)
-                
             except SlowModeWaitError as e:
                 self.errors += 1
                 self.metrics["total_errors_caught"] += 1
                 log.warning(f"[%s] SlowMode в {target}: ждем {e.seconds} сек", self.user_id)
                 await self._sleep_until(e.seconds + 5)
-                continue  # Продолжаем после ожидания
-                
+                continue
             except (ChatWriteForbiddenError, ChatAdminRequiredError) as e:
-                # Авто-возобновление после снятия мута
                 self.errors += 1
                 self.metrics["total_errors_caught"] += 1
                 log.warning(f"[%s] Мут/Запрет в {target}: ждем 5 минут...", self.user_id)
                 await self._sleep_until(300)
-                continue  # Возобновляем после ожидания
-                
+                continue
             except UserBannedInChannelError:
                 self.errors += 1
                 self.metrics["total_errors_caught"] += 1
                 log.warning(f"[%s] Аккаунт забанен в {target}. Остановка для этой цели.", self.user_id)
                 break
-
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -540,8 +525,7 @@ class SpamEngine:
                 self.metrics["total_errors_caught"] += 1
                 log.warning("[%s] ошибка отправки в %s: %s", self.user_id, target, str(e)[:120])
                 await self._sleep_until(self.pacer.next_delay())
-                if self.auto_pause and self._consecutive_errors >= self._error_threshold:
-                    break
+                if self.auto_pause and self._consecutive_errors >= self._error_threshold: break
 
         await self._write_history(target, counter, "STOPPED")
         await self._send_webhook("stopped", target, counter)
@@ -582,7 +566,7 @@ class SpamEngine:
         )
 
 # ---------------------------------------------------------------------
-# UI (Функционал из v6)
+# UI
 # ---------------------------------------------------------------------
 RULES_TEXT = (
     "<b>📜 ПРАВИЛА ПОЛЬЗОВАНИЯ</b>\n"
@@ -1495,7 +1479,7 @@ async def text_handler(e):
 
 
 # ---------------------------------------------------------------------
-# WEB DASHBOARD + API (Дизайн v7.1, API v6)
+# WEB DASHBOARD + API
 # ---------------------------------------------------------------------
 DASHBOARD_HTML = r"""<!doctype html>
 <html lang="ru"><head>
@@ -1510,8 +1494,8 @@ DASHBOARD_HTML = r"""<!doctype html>
 </style></head><body><div class="layout">
 <aside class="side"><div class="brand"><div class="logo">T</div><div><b>TITAN ENTERPRISE</b><small>PRIVATE CONTROL</small></div></div>
 <div class="navlabel">WORKSPACE</div><nav class="nav"><a class="active" href="#overview">◈ &nbsp; Обзор</a><a href="#users-section">♙ &nbsp; Пользователи</a><a href="#activity">◷ &nbsp; Активность</a><a href="#access">⚿ &nbsp; Доступ</a></nav>
-<div class="sidefoot"><span class="online">● SYSTEM ONLINE</span><br>CONTROL CENTER / V8.0<br>SECURE ADMIN INTERFACE</div></aside>
-<main id="overview"><header class="top"><div><div class="crumb">WORKSPACE / OVERVIEW</div><h1>Панель управления</h1></div><div class="topright"><div class="pill">● LIVE MONITORING</div><div class="pill">V8.0</div></div></header>
+<div class="sidefoot"><span class="online">● SYSTEM ONLINE</span><br>CONTROL CENTER / V8.1<br>SECURE ADMIN INTERFACE</div></aside>
+<main id="overview"><header class="top"><div><div class="crumb">WORKSPACE / OVERVIEW</div><h1>Панель управления</h1></div><div class="topright"><div class="pill">● LIVE MONITORING</div><div class="pill">V8.1</div></div></header>
 <section class="hero"><div class="eyebrow">TITAN COMMAND CENTER</div><h2>Полный контроль. Один интерфейс.</h2><p>Мониторинг пользователей, подписок и активности. Данные обновляются автоматически, доступ к API защищён отдельным ключом.</p></section>
 <section class="stats"><article class="card"><div class="kicker">ВСЕГО ПОЛЬЗОВАТЕЛЕЙ</div><div class="num" id="users">—</div></article><article class="card"><div class="kicker">АКТИВНЫЕ СЕССИИ</div><div class="num green" id="subs">—</div></article><article class="card"><div class="kicker">УСПЕШНЫЕ ОТПРАВКИ</div><div class="num red" id="sent">—</div></article><article class="card"><div class="kicker">ОШИБКИ ОТПРАВКИ</div><div class="num" id="failed">—</div></article><article class="card"><div class="kicker">FLOOD WAIT</div><div class="num" id="flood">—</div></article><article class="card"><div class="kicker">ОБОРОТ</div><div class="num" id="revenue">— ₽</div></article></section>
 <section class="lower"><article class="panel" id="users-section"><div class="panelhead"><b>♙ Пользователи</b><span>LAST 500</span></div><div class="tablewrap"><table><thead><tr><th>USER ID</th><th>ТАРИФ</th><th>БАЛАНС</th><th>СЕССИЯ</th><th>ДОСТУП</th></tr></thead><tbody id="userRows"><tr><td colspan="5" class="muted">Подключите панель для загрузки данных</td></tr></tbody></table></div></article>
@@ -1638,7 +1622,7 @@ async def main():
 
 if __name__ == "__main__":
     log.info("=" * 50)
-    log.info("  TITAN Enterprise v8.0 — старт")
+    log.info("  TITAN Enterprise v8.1 — старт")
     log.info("=" * 50)
     try:
         asyncio.run(main())
