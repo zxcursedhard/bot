@@ -33,7 +33,9 @@ OWNER_CONTACT = "@apemiru"
 SUPPORT_CONTACT = "@apemiru"
 SUPER_ADMINS = {8655682794, 8773171051}
 
-DB_PATH = os.getenv("DB_PATH", "titan_enterprise.db")
+DB_PATH = os.getenv("DB_PATH", "/var/data/titan_enterprise.db")
+WEB_HOST = os.getenv("WEB_HOST", "0.0.0.0")
+WEB_PORT = int(os.getenv("PORT", "10000"))
 WEB_HOST = os.getenv("WEB_HOST", "0.0.0.0")
 WEB_PORT = int(os.getenv("PORT", "10000"))
 SUBSCRIPTION_PRICE = 400
