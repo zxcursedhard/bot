@@ -26,7 +26,7 @@ from telethon.errors import (
 
 API_ID = int(os.getenv("API_ID", "2040"))
 API_HASH = os.getenv("API_HASH", "b18441a1ff607e10a989891a5462e627")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8732669492:AAFocBFBmGu6XL0R0w7VYAOkxpnq1N18ef8")
 DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "titan_super_secret_change_me_12345")
 FLASK_SECRET = os.getenv("FLASK_SECRET", "")
 OWNER_CONTACT = "@apemiru"
