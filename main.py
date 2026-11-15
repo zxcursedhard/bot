@@ -1,4 +1,4 @@
-# TITAN Enterprise — compact Flask + Telethon + SQLite (FULL FIXED v8.8)
+# TITAN Enterprise — compact Flask + Telethon + SQLite (FULL FIXED v8.9)
 # Install: pip install telethon flask waitress aiosqlite psutil
 
 import os
@@ -53,7 +53,7 @@ SUPER_ADMINS = {
 MAX_ACTIVE_CLIENTS = max(1, min(50, int(os.getenv("MAX_ACTIVE_CLIENTS", "10"))))
 LOGIN_TOKEN_TTL = 24 * 60 * 60
 SESSION_DAYS = 14
-MAX_TARGETS = 9999
+MAX_TARGETS = 9999 
 MAX_TEMPLATES = 9999
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -89,6 +89,8 @@ def parse_targets(raw):
     for line in raw.splitlines():
         item = line.strip()
         if not item: continue
+        
+        # 1. Если ссылка tg://chat?id=...
         if item.startswith("tg://chat?id="):
             try:
                 target = int(item.split("=")[1])
@@ -96,19 +98,31 @@ def parse_targets(raw):
                 continue
             except: pass
         
+        # 2. Чистим ссылки t.me
         item = re.sub(r"^https?://t\.me/", "", item).strip("/")
         item = re.sub(r"\?.*$", "", item)
         
         if item.startswith("c/"):
             parts = item.split("/")
-            if len(parts) >= 2 and parts[1].isdigit(): target = int("-100" + parts[1])
-            else: continue
-        elif item.startswith("@"): target = item
-        elif re.fullmatch(r"[A-Za-z0-9_]{5,}", item): target = "@" + item
-        elif re.fullmatch(r"-?\d+", item): target = int(item)
-        else: continue
+            if len(parts) >= 2 and parts[1].isdigit():
+                target = int("-100" + parts[1])
+            else:
+                continue
+        # 3. Если это уже юзернейм с @
+        elif item.startswith("@"):
+            target = item
+        # 4. ИСПРАВЛЕНО: Сначала проверяем числовой ID, чтобы не ставить @
+        elif re.fullmatch(r"-?\d+", item):
+            target = int(item)
+        # 5. И только потом проверяем на юзернейм
+        elif re.fullmatch(r"[A-Za-z0-9_]{5,}", item):
+            target = "@" + item
+        else:
+            continue
         
-        if target not in result: result.append(target)
+        if target not in result:
+            result.append(target)
+            
     return result[:MAX_TARGETS]
 
 # -------------------- DATABASE --------------------
@@ -422,15 +436,14 @@ async def setup_bot():
                 qr_flows[uid] = {"client": client, "qr": qr}
                 bot_states[uid] = "QR_WAIT"
                 qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=400x400&data={urllib.parse.quote(qr.url)}"
-                await event.respond(f"📷 Отсканируйте QR-код в Telegram (Настройки -> Устройства -> Подключить устройство):\n{qr_url}", buttons=[[Button.inline("Отмена", b"cancel_qr")]])
+                await event.respond(f"📷 Отсканируйте QR-код:\n{qr_url}", buttons=[[Button.inline("Отмена", b"cancel_qr")]])
                 asyncio.create_task(finish_qr_login(uid, event))
             except Exception as ex:
                 await event.respond(f"Ошибка QR: {str(ex)[:100]}")
                 await client.disconnect()
         elif data == "cancel_qr":
             flow = qr_flows.pop(uid, None)
-            if flow:
-                await flow["client"].disconnect()
+            if flow: await flow["client"].disconnect()
             bot_states.pop(uid, None)
             await event.respond("QR-вход отменен.")
         else:
@@ -873,7 +886,7 @@ def api_admin_revoke():
     run_async(db.audit(request.titan_user["user_id"], "USER_REVOKED", str(uid)))
     return jsonify({"ok": True})
 
-# -------------------- NOTIFICATION WORKER --------------------
+# -------------------- NOTIFICATION WORKER (SMART) --------------------
 
 async def notification_worker(uid, stop_event):
     try:
