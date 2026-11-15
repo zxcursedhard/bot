@@ -1,4 +1,4 @@
-# TITAN Enterprise — compact Flask + Telethon + SQLite (FULL FIXED v8.6)
+# TITAN Enterprise — compact Flask + Telethon + SQLite (FULL FIXED v8.7)
 # Install: pip install telethon flask waitress aiosqlite psutil
 
 import os
@@ -25,7 +25,7 @@ from flask import (
 from waitress import serve
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
-from telethon.errors import (SessionPasswordNeededError, FloodWaitError, PhoneCodeInvalidError, PasswordHashInvalidError)
+from telethon.errors import (SessionPasswordNeededError, FloodWaitError, PhoneCodeInvalidError, PasswordHashInvalidError, ChatWriteForbiddenError)
 
 try:
     import psutil
@@ -36,7 +36,7 @@ except ImportError:
 
 API_ID = int(os.getenv("API_ID", "2040"))
 API_HASH = os.getenv("API_HASH", "b18441a1ff607e10a989891a5462e627")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8732669492:AAGjBx_kMW4JRpo4DyhCoRwAISSS-lJ1IhE") # ТВОЙ НОВЫЙ ТОКЕН
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8732669492:AAGjBx_kMW4JRpo4DyhCoRwAISSS-lJ1IhE")
 FLASK_SECRET = os.getenv("FLASK_SECRET", "titan_secret_key_secure_1234567890")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 DB_PATH = os.getenv("DB_PATH", "titan_enterprise.db")
@@ -46,13 +46,11 @@ SUPER_ADMINS = {
     int(x.strip()) for x in os.getenv("SUPER_ADMINS", "8655682794,8773171051").split(",")
     if x.strip().isdigit()
 }
-MAX_ACTIVE_CLIENTS = max(1, min(10, int(os.getenv("MAX_ACTIVE_CLIENTS", "5"))))
-LOGIN_TOKEN_TTL = 24 * 60 * 60 # ССЫЛКА ЖИВЕТ 24 ЧАСА
+MAX_ACTIVE_CLIENTS = max(1, min(50, int(os.getenv("MAX_ACTIVE_CLIENTS", "10")))) # Больше клиентов для скорости
+LOGIN_TOKEN_TTL = 24 * 60 * 60
 SESSION_DAYS = 14
-MAX_TARGETS = 30
-MAX_TEMPLATES = 100
-MIN_SEND_DELAY = 10
-MAX_SEND_DELAY = 300
+MAX_TARGETS = 9999 # Безлимит целей
+MAX_TEMPLATES = 9999 # Безлимит шаблонов
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("titan")
@@ -61,7 +59,7 @@ app = Flask(__name__)
 app.secret_key = FLASK_SECRET
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SECURE=False, # ВАЖНО: чтобы кука сохранялась на телефоне
+    SESSION_COOKIE_SECURE=False,
     SESSION_COOKIE_SAMESITE="Lax",
     PERMANENT_SESSION_LIFETIME=dt.timedelta(days=SESSION_DAYS),
     MAX_CONTENT_LENGTH=64 * 1024
@@ -86,12 +84,27 @@ def parse_targets(raw):
     for line in raw.splitlines():
         item = line.strip()
         if not item: continue
+        # Поддержка ссылок t.me, tg://chat?id=, и обычных ID
+        if item.startswith("tg://chat?id="):
+            try:
+                target = int(item.split("=")[1])
+                if target not in result: result.append(target)
+                continue
+            except: pass
+        
         item = re.sub(r"^https?://t\.me/", "", item).strip("/")
         item = re.sub(r"\?.*$", "", item)
-        if item.startswith("@"): target = item
+        
+        if item.startswith("c/"):
+            parts = item.split("/")
+            if len(parts) >= 2 and parts[1].isdigit():
+                target = int("-100" + parts[1])
+            else: continue
+        elif item.startswith("@"): target = item
         elif re.fullmatch(r"[A-Za-z0-9_]{5,}", item): target = "@" + item
         elif re.fullmatch(r"-?\d+", item): target = int(item)
         else: continue
+        
         if target not in result: result.append(target)
     return result[:MAX_TARGETS]
 
@@ -114,7 +127,8 @@ class Database:
                     user_id INTEGER PRIMARY KEY, username TEXT NOT NULL DEFAULT '',
                     role TEXT NOT NULL DEFAULT 'USER', approved INTEGER NOT NULL DEFAULT 0,
                     session_string TEXT NOT NULL DEFAULT '', subscription_until TEXT NOT NULL DEFAULT '',
-                    templates TEXT NOT NULL DEFAULT '[]', targets TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL
+                    templates TEXT NOT NULL DEFAULT '[]', targets TEXT NOT NULL DEFAULT '[]', 
+                    delay INTEGER NOT NULL DEFAULT 10, created_at TEXT NOT NULL
                 )
             """)
             await db.execute("""
@@ -175,7 +189,7 @@ class Database:
         async with self.connect() as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute("""
-                SELECT u.user_id,u.username,u.role,u.approved,u.subscription_until,
+                SELECT u.user_id,u.username,u.role,u.approved,u.subscription_until,u.delay,
                        CASE WHEN u.session_string!='' THEN 1 ELSE 0 END AS has_session,
                        s.sent,s.errors,COALESCE(j.status,'stopped') AS job_status
                 FROM users u LEFT JOIN user_stats s ON s.user_id=u.user_id
@@ -194,27 +208,13 @@ class Database:
         return raw
 
     async def consume_login_token(self, raw):
-        # ИСПРАВЛЕНО: Теперь токен НЕ УДАЛЯЕТСЯ (многоразовый), живет 24 часа
         async with self.connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute("SELECT user_id, expires_at FROM login_tokens WHERE token_hash=?", (token_hash(raw),)) as cur:
                 row = await cur.fetchone()
-            
-            if not row:
-                log.warning("Токен не найден в базе!")
-                return None
-                
-            user_id = row["user_id"]
-            expires_at = row["expires_at"]
-            
-            if time.time() > expires_at:
-                log.warning(f"Токен истек по времени для юзера {user_id}!")
-                await db.execute("DELETE FROM login_tokens WHERE token_hash=?", (token_hash(raw),))
-                await db.commit()
-                return None
-                
-            log.info(f"Успешный вход в панель для юзера {user_id}")
-            return int(user_id)
+            if not row: return None
+            if time.time() > row["expires_at"]: return None
+            return int(row["user_id"])
 
     async def create_web_session(self, uid):
         raw = secrets.token_urlsafe(40)
@@ -244,12 +244,14 @@ class Database:
                 (int(uid), action[:80], str(details)[:500], iso_now()))
             await db.commit()
 
-    async def update_user_lists(self, uid, templates=None, targets=None):
+    async def update_user_lists(self, uid, templates=None, targets=None, delay=None):
         async with self.connect() as db:
             if templates is not None:
                 await db.execute("UPDATE users SET templates=? WHERE user_id=?", (json.dumps(templates, ensure_ascii=False), int(uid)))
             if targets is not None:
                 await db.execute("UPDATE users SET targets=? WHERE user_id=?", (json.dumps(targets, ensure_ascii=False), int(uid)))
+            if delay is not None:
+                await db.execute("UPDATE users SET delay=? WHERE user_id=?", (int(delay), int(uid)))
             await db.commit()
 
     async def set_session(self, uid, value):
@@ -378,7 +380,7 @@ async def issue_web_login(event):
         await event.respond("Не задан PUBLIC_BASE_URL в переменных Render.")
         return
     link = f"{base}/login?token={raw}"
-    await event.respond(f"🔐 Ссылка для входа (действует 24 часа):\n{link}")
+    await event.respond(f"🔐 Ссылка для входа:\n{link}")
     await db.audit(uid, "WEB_LOGIN_TOKEN_ISSUED")
 
 async def setup_bot():
@@ -589,7 +591,12 @@ main{padding:19px 14px}h1{font-size:23px}.grid{grid-template-columns:repeat(2,mi
 <textarea id="templates" placeholder="Текст уведомления"></textarea><br><br><button onclick="saveTemplates()">Сохранить шаблоны</button></div>
 <div class="card field"><b>Цели уведомлений</b><p class="muted">Указывайте только чаты, где у аккаунта есть право публикации.</p>
 <textarea id="targets" placeholder="@company_channel&#10;-100123456789"></textarea><br><br><button onclick="saveTargets()">Сохранить цели</button></div>
-</div><div class="row"><button onclick="jobAction('start')">Запустить</button>
+</div>
+<div class="card field" style="margin-top:14px">
+<b>Задержка (в секундах)</b><p class="muted">Сколько ждать между отправками (от 1 до 3600 сек).</p>
+<div class="row"><input type="number" id="delay" min="1" max="3600" style="width:100px; flex:none;"> <button onclick="saveDelay()">Сохранить задержку</button></div>
+</div>
+<div class="row"><button onclick="jobAction('start')">Запустить</button>
 <button class="danger" onclick="jobAction('stop')">Остановить</button></div><div class="notice" id="notice"></div></div>
 <div class="section admin-only hidden" id="serverStats"><h2>Состояние сервера</h2>
 <div class="grid"><div class="card">RAM<div class="metric" id="ram">—</div></div>
@@ -622,10 +629,12 @@ document.getElementById('account').textContent=p.has_session?'ПОДКЛЮЧЁН
 document.getElementById('queue').textContent='Активно: '+p.pool.active+' / '+p.pool.maximum+' · ожидают: '+p.pool.waiting;
 document.getElementById('templates').value=p.templates.join('\\n');
 document.getElementById('targets').value=p.targets.join('\\n');
+document.getElementById('delay').value=p.delay;
 if(role==='ADMIN')await loadAdmin();
 }catch(e){msg(e.message)}}
 async function saveTemplates(){try{await api('/api/templates',{method:'POST',body:JSON.stringify({text:document.getElementById('templates').value})});msg('Шаблоны сохранены')}catch(e){msg(e.message)}}
 async function saveTargets(){try{await api('/api/targets',{method:'POST',body:JSON.stringify({text:document.getElementById('targets').value})});msg('Цели сохранены')}catch(e){msg(e.message)}}
+async function saveDelay(){try{await api('/api/delay',{method:'POST',body:JSON.stringify({delay:parseInt(document.getElementById('delay').value)})});msg('Задержка сохранена')}catch(e){msg(e.message)}}
 async function jobAction(action){try{const r=await api('/api/job/'+action,{method:'POST',body:'{}'});msg(r.message);await load()}catch(e){msg(e.message)}}
 async function loadAdmin(){const stats=await api('/api/admin/stats');if(stats){
 document.getElementById('ram').textContent=stats.ram_mb==null?'н/д':stats.ram_mb+' MB';
@@ -654,18 +663,14 @@ def consume_login():
     raw = request.args.get("token", "")
     if not raw or len(raw) > 200:
         return render_template_string(LOGIN_HTML, message="Ссылка недействительна."), 400
-    
     uid = run_async(db.consume_login_token(raw))
     if not uid:
         return render_template_string(LOGIN_HTML, message="Ссылка истекла."), 401
-    
     user = run_async(db.get_user(uid))
     if not user or (not user["approved"] and user["role"] != "ADMIN"):
-        return render_template_string(LOGIN_HTML, message="Доступ к панели не активирован."), 403
-    
+        return render_template_string(LOGIN_HTML, message="Доступ не активирован."), 403
     sid = run_async(db.create_web_session(uid))
-    run_async(db.audit(uid, "WEB_LOGIN", "one-time Telegram token"))
-    
+    run_async(db.audit(uid, "WEB_LOGIN", "token"))
     response = redirect(url_for("dashboard"))
     response.set_cookie("titan_sid", sid, max_age=SESSION_DAYS * 86400, httponly=True, secure=False, samesite="Lax", path="/")
     return response
@@ -706,7 +711,7 @@ def api_me():
     return jsonify({
         "user_id": uid, "username": u["username"], "role": u["role"],
         "subscription_active": active, "subscription_until": u["subscription_until"],
-        "stats": stats, "templates": templates, "targets": targets,
+        "stats": stats, "templates": templates, "targets": targets, "delay": u["delay"],
         "has_session": bool(u["session_string"]), "job_status": job_status,
         "pool": {"active": client_manager.active, "waiting": client_manager.waiting, "maximum": client_manager.maximum},
         "csrf": session["csrf"]
@@ -720,7 +725,6 @@ def api_templates():
     raw = (request.get_json(silent=True) or {}).get("text", "")
     if not isinstance(raw, str) or len(raw) > 30000: return jsonify({"error": "invalid_text"}), 400
     values = list(dict.fromkeys(x.strip() for x in raw.splitlines() if x.strip()))
-    if len(values) > MAX_TEMPLATES: return jsonify({"error": f"maximum_{MAX_TEMPLATES}_templates"}), 400
     run_async(db.update_user_lists(uid, templates=values))
     run_async(db.audit(uid, "TEMPLATES_UPDATED", str(len(values))))
     return jsonify({"ok": True, "count": len(values)})
@@ -737,6 +741,16 @@ def api_targets():
     run_async(db.update_user_lists(uid, targets=values))
     run_async(db.audit(uid, "TARGETS_UPDATED", str(len(values))))
     return jsonify({"ok": True, "count": len(values)})
+
+@app.post("/api/delay")
+@login_required
+@csrf_required
+def api_delay():
+    uid = int(request.titan_user["user_id"])
+    delay = int((request.get_json(silent=True) or {}).get("delay", 10))
+    if delay < 1 or delay > 3600: return jsonify({"error": "invalid_delay"}), 400
+    run_async(db.update_user_lists(uid, delay=delay))
+    return jsonify({"ok": True})
 
 @app.post("/api/job/start")
 @login_required
@@ -815,18 +829,7 @@ def api_admin_revoke():
     run_async(db.audit(request.titan_user["user_id"], "USER_REVOKED", str(uid)))
     return jsonify({"ok": True})
 
-@app.get("/export.csv")
-@admin_required
-def export_csv():
-    rows = run_async(db.all_users())
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["user_id", "username", "role", "approved", "subscription_until", "has_session", "sent", "errors"])
-    for row in rows:
-        writer.writerow([row["user_id"], row["username"], row["role"], row["approved"], row["subscription_until"], row["has_session"], row["sent"], row["errors"]])
-    return Response(output.getvalue(), mimetype="text/csv", headers={"Content-Disposition": "attachment; filename=titan_users.csv"})
-
-# -------------------- NOTIFICATION WORKER --------------------
+# -------------------- NOTIFICATION WORKER (SMART) --------------------
 
 async def notification_worker(uid, stop_event):
     try:
@@ -834,30 +837,47 @@ async def notification_worker(uid, stop_event):
             user = await db.get_user(uid)
             if not user or (not user["approved"] and user["role"] != "ADMIN"): break
             if not is_admin(uid) and not await db.subscription_active(uid): break
+            
             templates = json.loads(user["templates"] or "[]")
             targets = json.loads(user["targets"] or "[]")
+            delay = max(1, int(user["delay"]))
+            
             if not templates or not targets or not user["session_string"]: break
 
             for target in targets:
                 if stop_event.is_set(): break
                 message = templates[int(time.time()) % len(templates)]
+                
                 try:
                     async with client_manager.acquire(uid) as client:
-                        await client.send_message(target, message)
+                        # Пытаемся получить entity (для закрытых чатов)
+                        try:
+                            entity = await client.get_entity(target)
+                        except Exception:
+                            entity = target # Если не вышло, шлем как есть
+                            
+                        await client.send_message(entity, message)
+                        
                     await db.increment_stat(uid, "sent")
                     await db.audit(uid, "NOTIFICATION_SENT", str(target))
+                    
                 except FloodWaitError as exc:
                     await db.audit(uid, "TELEGRAM_FLOOD_WAIT", f"{exc.seconds}s")
                     await asyncio.sleep(min(max(exc.seconds, 30), 3600))
                     stop_event.set()
                     break
+                except ChatWriteForbiddenError:
+                    await db.increment_stat(uid, "errors")
+                    await db.audit(uid, "FORBIDDEN_MUTE", str(target))
+                    await asyncio.sleep(300) # Ждем 5 минут и идем к следующей цели
                 except asyncio.CancelledError: raise
                 except Exception as exc:
                     await db.increment_stat(uid, "errors")
-                    await db.audit(uid, "NOTIFICATION_ERROR", str(exc)[:350])
+                    await db.audit(uid, "NOTIFICATION_ERROR", f"{target}: {str(exc)[:150]}")
 
-                try: await asyncio.wait_for(stop_event.wait(), timeout=MIN_SEND_DELAY)
+                try: await asyncio.wait_for(stop_event.wait(), timeout=delay)
                 except asyncio.TimeoutError: pass
+                
         await db.set_job_status(uid, "stopped")
     except asyncio.CancelledError:
         await db.set_job_status(uid, "stopped")
