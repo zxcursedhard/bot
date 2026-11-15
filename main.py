@@ -1,4 +1,4 @@
-# TITAN Enterprise — compact Flask + Telethon + SQLite (FULL FIXED v8.9)
+# TITAN Enterprise — compact Flask + Telethon + SQLite (FULL FIXED v9.1)
 # Install: pip install telethon flask waitress aiosqlite psutil
 
 import os
@@ -30,6 +30,7 @@ from telethon.errors import (
     SessionPasswordNeededError, FloodWaitError, PhoneCodeInvalidError, 
     PasswordHashInvalidError, ChatWriteForbiddenError
 )
+from telethon.tl.functions.channels import JoinChannelRequest
 
 try:
     import psutil
@@ -53,7 +54,7 @@ SUPER_ADMINS = {
 MAX_ACTIVE_CLIENTS = max(1, min(50, int(os.getenv("MAX_ACTIVE_CLIENTS", "10"))))
 LOGIN_TOKEN_TTL = 24 * 60 * 60
 SESSION_DAYS = 14
-MAX_TARGETS = 9999 
+MAX_TARGETS = 9999
 MAX_TEMPLATES = 9999
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -90,7 +91,6 @@ def parse_targets(raw):
         item = line.strip()
         if not item: continue
         
-        # 1. Если ссылка tg://chat?id=...
         if item.startswith("tg://chat?id="):
             try:
                 target = int(item.split("=")[1])
@@ -98,31 +98,19 @@ def parse_targets(raw):
                 continue
             except: pass
         
-        # 2. Чистим ссылки t.me
         item = re.sub(r"^https?://t\.me/", "", item).strip("/")
         item = re.sub(r"\?.*$", "", item)
         
         if item.startswith("c/"):
             parts = item.split("/")
-            if len(parts) >= 2 and parts[1].isdigit():
-                target = int("-100" + parts[1])
-            else:
-                continue
-        # 3. Если это уже юзернейм с @
-        elif item.startswith("@"):
-            target = item
-        # 4. ИСПРАВЛЕНО: Сначала проверяем числовой ID, чтобы не ставить @
-        elif re.fullmatch(r"-?\d+", item):
-            target = int(item)
-        # 5. И только потом проверяем на юзернейм
-        elif re.fullmatch(r"[A-Za-z0-9_]{5,}", item):
-            target = "@" + item
-        else:
-            continue
+            if len(parts) >= 2 and parts[1].isdigit(): target = int("-100" + parts[1])
+            else: continue
+        elif item.startswith("@"): target = item
+        elif re.fullmatch(r"-?\d+", item): target = int(item)
+        elif re.fullmatch(r"[A-Za-z0-9_]{5,}", item): target = "@" + item
+        else: continue
         
-        if target not in result:
-            result.append(target)
-            
+        if target not in result: result.append(target)
     return result[:MAX_TARGETS]
 
 # -------------------- DATABASE --------------------
@@ -886,7 +874,49 @@ def api_admin_revoke():
     run_async(db.audit(request.titan_user["user_id"], "USER_REVOKED", str(uid)))
     return jsonify({"ok": True})
 
-# -------------------- NOTIFICATION WORKER (SMART) --------------------
+# -------------------- NOTIFICATION WORKER (PARALLEL) --------------------
+
+async def send_to_target(uid, target, message, delay, stop_event):
+    try:
+        async with client_manager.acquire(uid) as client:
+            try:
+                if isinstance(target, int):
+                    try:
+                        entity = await client.get_entity(target)
+                    except ValueError:
+                        try:
+                            await client(JoinChannelRequest(target))
+                            entity = await client.get_entity(target)
+                        except Exception:
+                            raise ValueError(f"Не могу найти чат по ID {target}.")
+                else:
+                    entity = await client.get_entity(target)
+                
+                await client.send_message(entity, message)
+            except Exception as e:
+                raise e
+
+        await db.increment_stat(uid, "sent")
+        await db.audit(uid, "NOTIFICATION_SENT", str(target))
+        
+    except FloodWaitError as exc:
+        await db.audit(uid, "TELEGRAM_FLOOD_WAIT", f"{target}: {exc.seconds}s")
+        await asyncio.sleep(min(max(exc.seconds, 30), 3600))
+    except ChatWriteForbiddenError:
+        await db.increment_stat(uid, "errors")
+        await db.audit(uid, "FORBIDDEN_MUTE", str(target))
+        await asyncio.sleep(300)
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:
+        await db.increment_stat(uid, "errors")
+        await db.audit(uid, "NOTIFICATION_ERROR", f"{target}: {str(exc)[:150]}")
+    
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=delay)
+    except asyncio.TimeoutError:
+        pass
+
 
 async def notification_worker(uid, stop_event):
     try:
@@ -901,34 +931,20 @@ async def notification_worker(uid, stop_event):
             
             if not templates or not targets or not user["session_string"]: break
 
-            for target in targets:
-                if stop_event.is_set(): break
-                message = templates[int(time.time()) % len(templates)]
-                
-                try:
-                    async with client_manager.acquire(uid) as client:
-                        try: entity = await client.get_entity(target)
-                        except Exception: entity = target
-                        await client.send_message(entity, message)
-                    await db.increment_stat(uid, "sent")
-                    await db.audit(uid, "NOTIFICATION_SENT", str(target))
-                    
-                except FloodWaitError as exc:
-                    await db.audit(uid, "TELEGRAM_FLOOD_WAIT", f"{exc.seconds}s")
-                    await asyncio.sleep(min(max(exc.seconds, 30), 3600))
-                    stop_event.set()
-                    break
-                except ChatWriteForbiddenError:
-                    await db.increment_stat(uid, "errors")
-                    await db.audit(uid, "FORBIDDEN_MUTE", str(target))
-                    await asyncio.sleep(300)
-                except asyncio.CancelledError: raise
-                except Exception as exc:
-                    await db.increment_stat(uid, "errors")
-                    await db.audit(uid, "NOTIFICATION_ERROR", f"{target}: {str(exc)[:150]}")
+            valid_templates = [t for t in templates if len(t) <= 4000]
+            if not valid_templates:
+                await db.audit(uid, "NO_VALID_TEMPLATES", "Все шаблоны слишком длинные")
+                break
 
-                try: await asyncio.wait_for(stop_event.wait(), timeout=delay)
-                except asyncio.TimeoutError: pass
+            # Запускаем задачи для КАЖДОГО чата ПАРАЛЛЕЛЬНО
+            tasks = []
+            for target in targets:
+                message = valid_templates[int(time.time()) % len(valid_templates)]
+                task = asyncio.create_task(send_to_target(uid, target, message, delay, stop_event))
+                tasks.append(task)
+
+            # Ждем завершения всех задач текущего круга
+            await asyncio.gather(*tasks, return_exceptions=True)
                 
         await db.set_job_status(uid, "stopped")
     except asyncio.CancelledError:
