@@ -1,4 +1,4 @@
-# TITAN Enterprise — compact Flask + Telethon + SQLite (FULL FIXED v8.7)
+# TITAN Enterprise — compact Flask + Telethon + SQLite (FULL FIXED v8.8)
 # Install: pip install telethon flask waitress aiosqlite psutil
 
 import os
@@ -14,6 +14,7 @@ import hashlib
 import logging
 import threading
 import datetime as dt
+import urllib.parse
 from contextlib import asynccontextmanager
 from functools import wraps
 
@@ -25,7 +26,10 @@ from flask import (
 from waitress import serve
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
-from telethon.errors import (SessionPasswordNeededError, FloodWaitError, PhoneCodeInvalidError, PasswordHashInvalidError, ChatWriteForbiddenError)
+from telethon.errors import (
+    SessionPasswordNeededError, FloodWaitError, PhoneCodeInvalidError, 
+    PasswordHashInvalidError, ChatWriteForbiddenError
+)
 
 try:
     import psutil
@@ -46,11 +50,11 @@ SUPER_ADMINS = {
     int(x.strip()) for x in os.getenv("SUPER_ADMINS", "8655682794,8773171051").split(",")
     if x.strip().isdigit()
 }
-MAX_ACTIVE_CLIENTS = max(1, min(50, int(os.getenv("MAX_ACTIVE_CLIENTS", "10")))) # Больше клиентов для скорости
+MAX_ACTIVE_CLIENTS = max(1, min(50, int(os.getenv("MAX_ACTIVE_CLIENTS", "10"))))
 LOGIN_TOKEN_TTL = 24 * 60 * 60
 SESSION_DAYS = 14
-MAX_TARGETS = 9999 # Безлимит целей
-MAX_TEMPLATES = 9999 # Безлимит шаблонов
+MAX_TARGETS = 9999
+MAX_TEMPLATES = 9999
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("titan")
@@ -73,6 +77,7 @@ workers = {}
 worker_stops = {}
 bot_states = {}
 phone_flows = {}
+qr_flows = {}
 
 def utcnow(): return dt.datetime.now(dt.timezone.utc)
 def iso_now(): return utcnow().isoformat()
@@ -84,7 +89,6 @@ def parse_targets(raw):
     for line in raw.splitlines():
         item = line.strip()
         if not item: continue
-        # Поддержка ссылок t.me, tg://chat?id=, и обычных ID
         if item.startswith("tg://chat?id="):
             try:
                 target = int(item.split("=")[1])
@@ -97,8 +101,7 @@ def parse_targets(raw):
         
         if item.startswith("c/"):
             parts = item.split("/")
-            if len(parts) >= 2 and parts[1].isdigit():
-                target = int("-100" + parts[1])
+            if len(parts) >= 2 and parts[1].isdigit(): target = int("-100" + parts[1])
             else: continue
         elif item.startswith("@"): target = item
         elif re.fullmatch(r"[A-Za-z0-9_]{5,}", item): target = "@" + item
@@ -363,7 +366,7 @@ class ClientManager:
 def bot_menu(uid):
     return [
         [Button.inline("🌐 Войти в панель", b"web_login")],
-        [Button.inline("📱 Подключить Telegram-аккаунт", b"connect_account")]
+        [Button.inline("📱 Подключить аккаунт", b"connect_account")]
     ]
 
 async def issue_web_login(event):
@@ -402,6 +405,7 @@ async def setup_bot():
     async def callback_handler(event):
         uid = int(event.sender_id)
         data = event.data.decode("utf-8", "ignore")
+        
         if data == "web_login":
             await issue_web_login(event)
             await event.answer("Ссылка отправлена")
@@ -409,8 +413,48 @@ async def setup_bot():
             bot_states[uid] = "PHONE"
             await event.answer()
             await event.respond("Отправьте номер телефона в формате (+...).")
+        elif data == "qr_login":
+            await event.answer("Генерирую QR...")
+            client = TelegramClient(StringSession(), API_ID, API_HASH)
+            await client.connect()
+            try:
+                qr = await client.qr_login()
+                qr_flows[uid] = {"client": client, "qr": qr}
+                bot_states[uid] = "QR_WAIT"
+                qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=400x400&data={urllib.parse.quote(qr.url)}"
+                await event.respond(f"📷 Отсканируйте QR-код в Telegram (Настройки -> Устройства -> Подключить устройство):\n{qr_url}", buttons=[[Button.inline("Отмена", b"cancel_qr")]])
+                asyncio.create_task(finish_qr_login(uid, event))
+            except Exception as ex:
+                await event.respond(f"Ошибка QR: {str(ex)[:100]}")
+                await client.disconnect()
+        elif data == "cancel_qr":
+            flow = qr_flows.pop(uid, None)
+            if flow:
+                await flow["client"].disconnect()
+            bot_states.pop(uid, None)
+            await event.respond("QR-вход отменен.")
         else:
             await event.answer()
+
+    async def finish_qr_login(uid, event):
+        flow = qr_flows.get(uid)
+        if not flow: return
+        client = flow["client"]
+        try:
+            await flow["qr"].wait()
+            await db.set_session(uid, client.session.save())
+            await client.disconnect()
+            qr_flows.pop(uid, None)
+            bot_states.pop(uid, None)
+            await event.respond("✅ Аккаунт успешно подключён через QR!")
+        except SessionPasswordNeededError:
+            bot_states[uid] = "2FA"
+            phone_flows[uid] = {"client": client, "phone": "", "phone_code_hash": ""}
+            await event.respond("🔐 Включена 2FA. Отправьте облачный пароль в чат.")
+        except Exception as ex:
+            await client.disconnect()
+            qr_flows.pop(uid, None)
+            await event.respond(f"Ошибка QR: {str(ex)[:100]}")
 
     @bot.on(events.NewMessage)
     async def account_login_handler(event):
@@ -431,7 +475,7 @@ async def setup_bot():
                 sent = await client.send_code_request(value)
                 phone_flows[uid] = {"client": client, "phone": value, "phone_code_hash": sent.phone_code_hash}
                 bot_states[uid] = "CODE"
-                await event.respond("Введите код подтверждения.")
+                await event.respond("Введите код подтверждения.", buttons=[[Button.inline("Войти по QR", b"qr_login")]])
             except Exception as exc:
                 await client.disconnect()
                 bot_states.pop(uid, None)
@@ -455,7 +499,7 @@ async def setup_bot():
             await client.disconnect()
             phone_flows.pop(uid, None)
             bot_states.pop(uid, None)
-            await event.respond("Аккаунт подключён. Сессия сохранена.")
+            await event.respond("✅ Аккаунт подключён. Сессия сохранена.")
         except SessionPasswordNeededError:
             bot_states[uid] = "2FA"
             await event.respond("Введите пароль 2FA.")
@@ -829,7 +873,7 @@ def api_admin_revoke():
     run_async(db.audit(request.titan_user["user_id"], "USER_REVOKED", str(uid)))
     return jsonify({"ok": True})
 
-# -------------------- NOTIFICATION WORKER (SMART) --------------------
+# -------------------- NOTIFICATION WORKER --------------------
 
 async def notification_worker(uid, stop_event):
     try:
@@ -850,14 +894,9 @@ async def notification_worker(uid, stop_event):
                 
                 try:
                     async with client_manager.acquire(uid) as client:
-                        # Пытаемся получить entity (для закрытых чатов)
-                        try:
-                            entity = await client.get_entity(target)
-                        except Exception:
-                            entity = target # Если не вышло, шлем как есть
-                            
+                        try: entity = await client.get_entity(target)
+                        except Exception: entity = target
                         await client.send_message(entity, message)
-                        
                     await db.increment_stat(uid, "sent")
                     await db.audit(uid, "NOTIFICATION_SENT", str(target))
                     
@@ -869,7 +908,7 @@ async def notification_worker(uid, stop_event):
                 except ChatWriteForbiddenError:
                     await db.increment_stat(uid, "errors")
                     await db.audit(uid, "FORBIDDEN_MUTE", str(target))
-                    await asyncio.sleep(300) # Ждем 5 минут и идем к следующей цели
+                    await asyncio.sleep(300)
                 except asyncio.CancelledError: raise
                 except Exception as exc:
                     await db.increment_stat(uid, "errors")
