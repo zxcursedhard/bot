@@ -1,4 +1,4 @@
-# TITAN Enterprise — compact Flask + Telethon + SQLite (FULL FIXED v8.5)
+# TITAN Enterprise — compact Flask + Telethon + SQLite (FULL FIXED v8.6)
 # Install: pip install telethon flask waitress aiosqlite psutil
 
 import os
@@ -36,7 +36,7 @@ except ImportError:
 
 API_ID = int(os.getenv("API_ID", "2040"))
 API_HASH = os.getenv("API_HASH", "b18441a1ff607e10a989891a5462e627")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8732669492:AAGjBx_kMW4JRpo4DyhCoRwAISSS-lJ1IhE")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8732669492:AAGjBx_kMW4JRpo4DyhCoRwAISSS-lJ1IhE") # ТВОЙ НОВЫЙ ТОКЕН
 FLASK_SECRET = os.getenv("FLASK_SECRET", "titan_secret_key_secure_1234567890")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 DB_PATH = os.getenv("DB_PATH", "titan_enterprise.db")
@@ -47,7 +47,7 @@ SUPER_ADMINS = {
     if x.strip().isdigit()
 }
 MAX_ACTIVE_CLIENTS = max(1, min(10, int(os.getenv("MAX_ACTIVE_CLIENTS", "5"))))
-LOGIN_TOKEN_TTL = 5 * 60
+LOGIN_TOKEN_TTL = 24 * 60 * 60 # ССЫЛКА ЖИВЕТ 24 ЧАСА
 SESSION_DAYS = 14
 MAX_TARGETS = 30
 MAX_TEMPLATES = 100
@@ -61,7 +61,7 @@ app = Flask(__name__)
 app.secret_key = FLASK_SECRET
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SECURE=False, # ИСПРАВЛЕНО: False чтобы Cookie не слетали на телефоне
+    SESSION_COOKIE_SECURE=False, # ВАЖНО: чтобы кука сохранялась на телефоне
     SESSION_COOKIE_SAMESITE="Lax",
     PERMANENT_SESSION_LIFETIME=dt.timedelta(days=SESSION_DAYS),
     MAX_CONTENT_LENGTH=64 * 1024
@@ -194,6 +194,7 @@ class Database:
         return raw
 
     async def consume_login_token(self, raw):
+        # ИСПРАВЛЕНО: Теперь токен НЕ УДАЛЯЕТСЯ (многоразовый), живет 24 часа
         async with self.connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute("SELECT user_id, expires_at FROM login_tokens WHERE token_hash=?", (token_hash(raw),)) as cur:
@@ -212,8 +213,6 @@ class Database:
                 await db.commit()
                 return None
                 
-            await db.execute("DELETE FROM login_tokens WHERE token_hash=?", (token_hash(raw),))
-            await db.commit()
             log.info(f"Успешный вход в панель для юзера {user_id}")
             return int(user_id)
 
@@ -379,7 +378,7 @@ async def issue_web_login(event):
         await event.respond("Не задан PUBLIC_BASE_URL в переменных Render.")
         return
     link = f"{base}/login?token={raw}"
-    await event.respond(f"🔐 Одноразовая ссылка для входа:\n{link}\n\nСсылка действует 5 минут.")
+    await event.respond(f"🔐 Ссылка для входа (действует 24 часа):\n{link}")
     await db.audit(uid, "WEB_LOGIN_TOKEN_ISSUED")
 
 async def setup_bot():
@@ -528,7 +527,7 @@ h1{font-size:27px;margin:28px 0 8px}.muted{color:#a1a1aa;line-height:1.6}
 .pill{display:inline-block;margin-top:20px;padding:9px 13px;border-radius:99px;background:#a855f722;color:#e9a8ff}
 </style></head><body><main class="glass"><div class="logo">TITAN <span>ENTERPRISE</span></div>
 <h1>Вход по Telegram</h1><p class="muted">{{ message }}</p>
-<div class="pill">Одноразовая авторизация · 5 минут</div></main></body></html>
+<div class="pill">Авторизация</div></main></body></html>
 """
 
 DASHBOARD_HTML = r"""
@@ -648,7 +647,7 @@ load();setInterval(load,30000);
 
 @app.get("/")
 def login_page():
-    return render_template_string(LOGIN_HTML, message="Откройте бота TITAN Enterprise, нажмите «Войти в панель» и перейдите по одноразовой ссылке из личного чата.")
+    return render_template_string(LOGIN_HTML, message="Откройте бота TITAN Enterprise, нажмите «Войти в панель» и перейдите по ссылке из личного чата.")
 
 @app.get("/login")
 def consume_login():
@@ -658,7 +657,7 @@ def consume_login():
     
     uid = run_async(db.consume_login_token(raw))
     if not uid:
-        return render_template_string(LOGIN_HTML, message="Ссылка истекла или уже была использована."), 401
+        return render_template_string(LOGIN_HTML, message="Ссылка истекла."), 401
     
     user = run_async(db.get_user(uid))
     if not user or (not user["approved"] and user["role"] != "ADMIN"):
