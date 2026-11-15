@@ -1,107 +1,186 @@
+# TITAN Enterprise — compact Flask + Telethon + SQLite (Fixed for Python 3.14)
+#
+# Install:
+#   pip install telethon flask waitress aiosqlite psutil
+#
+# Required env variables: API_ID, API_HASH, BOT_TOKEN, FLASK_SECRET
+# Optional: SUPER_ADMINS, PUBLIC_BASE_URL, DB_PATH, MAX_ACTIVE_CLIENTS
+
 import os
 import re
+import json
+import time
+import hmac
 import csv
 import io
-import json
 import asyncio
-import random
+import secrets
+import hashlib
+import logging
 import threading
 import datetime as dt
-import urllib.parse
+from contextlib import asynccontextmanager
 from functools import wraps
 
 import aiosqlite
-from flask import Flask, jsonify, request, render_template_string, session, redirect, url_for, Response
+from flask import (
+    Flask, request, jsonify, redirect, url_for, session,
+    render_template_string, Response
+)
 from waitress import serve
-
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
-from telethon.errors import (
-    FloodWaitError, SlowModeWaitError, ChatWriteForbiddenError,
-    UserBannedInChannelError, SessionPasswordNeededError,
-    PhoneCodeInvalidError, PasswordHashInvalidError
-)
+from telethon.errors import (SessionPasswordNeededError, FloodWaitError, PhoneCodeInvalidError, PasswordHashInvalidError)
 
-# ---------------- CONFIG ----------------
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
+
+# -------------------- CONFIG --------------------
 
 API_ID = int(os.getenv("API_ID", "2040"))
 API_HASH = os.getenv("API_HASH", "b18441a1ff607e10a989891a5462e627")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8732669492:AAFocBFBmGu6XL0R0w7VYAOkxpnq1N18ef8")
-DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "titan_super_secret_change_me_12345")
-FLASK_SECRET = os.getenv("FLASK_SECRET", "")
-OWNER_CONTACT = "@apemiru"
-SUPPORT_CONTACT = "@apemiru"
-SUPER_ADMINS = {8655682794, 8773171051}
-
-DB_PATH = os.getenv("DB_PATH", "/var/data/titan_enterprise.db")
-WEB_HOST = os.getenv("WEB_HOST", "0.0.0.0")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8732669492:AAF6lfPEgcOp9iKzo74UGnPIPw9wfVa7YGo")
+FLASK_SECRET = os.getenv("FLASK_SECRET", "titan_secret_key_secure_1234567890")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+DB_PATH = os.getenv("DB_PATH", "titan_enterprise.db")
+WEB_HOST = "0.0.0.0"
 WEB_PORT = int(os.getenv("PORT", "10000"))
-WEB_HOST = os.getenv("WEB_HOST", "0.0.0.0")
-WEB_PORT = int(os.getenv("PORT", "10000"))
-SUBSCRIPTION_PRICE = 400
-SUBSCRIPTION_DAYS = 60
-MAX_TARGETS = 10
+SUPER_ADMINS = {
+    int(x.strip()) for x in os.getenv("SUPER_ADMINS", "8655682794,8773171051").split(",")
+    if x.strip().isdigit()
+}
+MAX_ACTIVE_CLIENTS = max(1, min(10, int(os.getenv("MAX_ACTIVE_CLIENTS", "5"))))
+LOGIN_TOKEN_TTL = 5 * 60
+SESSION_DAYS = 14
+MAX_TARGETS = 30
+MAX_TEMPLATES = 100
+MIN_SEND_DELAY = 10
+MAX_SEND_DELAY = 300
 
-if not FLASK_SECRET:
-    FLASK_SECRET = os.urandom(32).hex()
+if not API_ID or not API_HASH or not BOT_TOKEN or len(FLASK_SECRET) < 32:
+    raise RuntimeError(
+        "Set API_ID, API_HASH, BOT_TOKEN and FLASK_SECRET "
+        "(FLASK_SECRET must contain at least 32 characters)."
+    )
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+)
+log = logging.getLogger("titan")
 
 app = Flask(__name__)
 app.secret_key = FLASK_SECRET
-app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SECURE=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    PERMANENT_SESSION_LIFETIME=dt.timedelta(days=SESSION_DAYS),
+    MAX_CONTENT_LENGTH=64 * 1024
+)
 
 bot = None
-loop = None
 db = None
-states = {}
+loop = None
+client_manager = None
+workers = {}
+worker_stops = {}
+bot_states = {}
 phone_flows = {}
-qr_flows = {}
-dispatchers = {}
-active_clients = {}
-
-IDLE = "IDLE"
-WAIT_PHONE = "WAIT_PHONE"
-WAIT_CODE = "WAIT_CODE"
-WAIT_2FA = "WAIT_2FA"
-WAIT_TARGETS = "WAIT_TARGETS"
-WAIT_DELAY = "WAIT_DELAY"
-WAIT_SUB = "WAIT_SUB"
 
 
 def utcnow():
     return dt.datetime.now(dt.timezone.utc)
 
 
-# ---------------- DATABASE ----------------
+def iso_now():
+    return utcnow().isoformat()
+
+
+def is_admin(uid):
+    return int(uid) in SUPER_ADMINS
+
+
+def token_hash(value):
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def parse_targets(raw):
+    result = []
+    for line in raw.splitlines():
+        item = line.strip()
+        if not item:
+            continue
+        item = re.sub(r"^https?://t\.me/", "", item).strip("/")
+        item = re.sub(r"\?.*$", "", item)
+        if item.startswith("@"):
+            target = item
+        elif re.fullmatch(r"[A-Za-z0-9_]{5,}", item):
+            target = "@" + item
+        elif re.fullmatch(r"-?\d+", item):
+            target = int(item)
+        else:
+            continue
+        if target not in result:
+            result.append(target)
+    return result[:MAX_TARGETS]
+
+
+# -------------------- DATABASE (FIXED FOR PY 3.14) --------------------
 
 class Database:
     def __init__(self, path):
         self.path = path
 
+    # FIX: Removed `async def`, just return the connection context manager
     def connect(self):
-        # Fixed for Python 3.14
-        return aiosqlite.connect(self.path)
+        return aiosqlite.connect(self.path, timeout=15)
 
     async def initialize(self):
-        async with self.connect() as conn:
-            await conn.execute("PRAGMA journal_mode=WAL")
-            await conn.execute("PRAGMA foreign_keys=ON")
-            await conn.execute("""
+        async with self.connect() as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("PRAGMA foreign_keys=ON")
+            await db.execute("PRAGMA busy_timeout=15000")
+            await db.execute("""
                 CREATE TABLE IF NOT EXISTS users(
                     user_id INTEGER PRIMARY KEY,
                     username TEXT NOT NULL DEFAULT '',
-                    session_string TEXT NOT NULL DEFAULT '',
+                    role TEXT NOT NULL DEFAULT 'USER',
                     approved INTEGER NOT NULL DEFAULT 0,
-                    is_admin INTEGER NOT NULL DEFAULT 0,
-                    balance INTEGER NOT NULL DEFAULT 0,
+                    session_string TEXT NOT NULL DEFAULT '',
                     subscription_until TEXT NOT NULL DEFAULT '',
                     templates TEXT NOT NULL DEFAULT '[]',
                     targets TEXT NOT NULL DEFAULT '[]',
-                    min_delay INTEGER NOT NULL DEFAULT 3,
-                    max_delay INTEGER NOT NULL DEFAULT 10,
                     created_at TEXT NOT NULL
                 )
             """)
-            await conn.execute("""
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS login_tokens(
+                    token_hash TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    expires_at REAL NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS web_sessions(
+                    sid_hash TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    expires_at REAL NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS user_stats(
+                    user_id INTEGER PRIMARY KEY,
+                    sent INTEGER NOT NULL DEFAULT 0,
+                    errors INTEGER NOT NULL DEFAULT 0
+                )
+            """)
+            await db.execute("""
                 CREATE TABLE IF NOT EXISTS audit(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER NOT NULL,
@@ -110,96 +189,165 @@ class Database:
                     created_at TEXT NOT NULL
                 )
             """)
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS metrics(
-                    id INTEGER PRIMARY KEY CHECK(id=1),
-                    sent INTEGER NOT NULL DEFAULT 0,
-                    errors INTEGER NOT NULL DEFAULT 0,
-                    revenue INTEGER NOT NULL DEFAULT 0
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS runtime_jobs(
+                    user_id INTEGER PRIMARY KEY,
+                    status TEXT NOT NULL DEFAULT 'stopped',
+                    updated_at TEXT NOT NULL
                 )
             """)
-            await conn.execute("INSERT OR IGNORE INTO metrics(id) VALUES(1)")
-            await conn.commit()
+            await db.commit()
 
-        expiry = (utcnow() + dt.timedelta(days=3650)).isoformat()
-        async with self.connect() as conn:
+        async with self.connect() as db:
             for uid in SUPER_ADMINS:
-                await conn.execute("""
-                    INSERT OR IGNORE INTO users(user_id, approved, is_admin, subscription_until, created_at)
-                    VALUES(?,1,1,?,?)
-                """, (uid, expiry, utcnow().isoformat()))
-                await conn.execute("""
-                    UPDATE users SET approved=1, is_admin=1, subscription_until=?
-                    WHERE user_id=?
-                """, (expiry, uid))
-            await conn.commit()
+                await db.execute("""
+                    INSERT INTO users(user_id, role, approved, created_at)
+                    VALUES(?, 'ADMIN', 1, ?)
+                    ON CONFLICT(user_id) DO UPDATE SET role='ADMIN', approved=1
+                """, (uid, iso_now()))
+                await db.execute(
+                    "INSERT OR IGNORE INTO user_stats(user_id) VALUES(?)", (uid,)
+                )
+            await db.commit()
 
     async def ensure_user(self, uid, username=""):
-        async with self.connect() as conn:
-            await conn.execute("""
-                INSERT OR IGNORE INTO users(user_id, username, created_at)
+        async with self.connect() as db:
+            await db.execute("""
+                INSERT INTO users(user_id, username, created_at)
                 VALUES(?,?,?)
-            """, (uid, username or "", utcnow().isoformat()))
-            if username:
-                await conn.execute("UPDATE users SET username=? WHERE user_id=?", (username, uid))
-            await conn.commit()
+                ON CONFLICT(user_id) DO UPDATE SET
+                    username=CASE WHEN excluded.username!=''
+                                  THEN excluded.username ELSE users.username END
+            """, (int(uid), username or "", iso_now()))
+            await db.execute(
+                "INSERT OR IGNORE INTO user_stats(user_id) VALUES(?)", (int(uid),)
+            )
+            await db.commit()
 
-    async def user(self, uid):
-        async with self.connect() as conn:
-            conn.row_factory = aiosqlite.Row
-            cur = await conn.execute("SELECT * FROM users WHERE user_id=?", (uid,))
+    async def get_user(self, uid):
+        async with self.connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT * FROM users WHERE user_id=?", (int(uid),))
             return await cur.fetchone()
 
-    async def audit(self, uid, action, details=""):
-        async with self.connect() as conn:
-            await conn.execute(
-                "INSERT INTO audit(user_id,action,details,created_at) VALUES(?,?,?,?)",
-                (uid, action, str(details)[:1000], utcnow().isoformat())
+    async def all_users(self):
+        async with self.connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("""
+                SELECT u.user_id,u.username,u.role,u.approved,u.subscription_until,
+                       CASE WHEN u.session_string!='' THEN 1 ELSE 0 END AS has_session,
+                       s.sent,s.errors,COALESCE(j.status,'stopped') AS job_status
+                FROM users u LEFT JOIN user_stats s ON s.user_id=u.user_id
+                LEFT JOIN runtime_jobs j ON j.user_id=u.user_id
+                ORDER BY u.created_at DESC LIMIT 1000
+            """)
+            return await cur.fetchall()
+
+    async def create_login_token(self, uid):
+        raw = secrets.token_urlsafe(32)
+        async with self.connect() as db:
+            await db.execute("DELETE FROM login_tokens WHERE expires_at<?", (time.time(),))
+            await db.execute(
+                "INSERT INTO login_tokens(token_hash,user_id,expires_at,created_at) VALUES(?,?,?,?)",
+                (token_hash(raw), int(uid), time.time() + LOGIN_TOKEN_TTL, iso_now())
             )
-            await conn.commit()
+            await db.commit()
+        return raw
 
-    async def templates_add(self, uid, text):
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-        async with self.connect() as conn:
-            cur = await conn.execute("SELECT templates FROM users WHERE user_id=?", (uid,))
+    async def consume_login_token(self, raw):
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute("""
+                SELECT user_id FROM login_tokens
+                WHERE token_hash=? AND expires_at>?
+            """, (token_hash(raw), time.time()))
             row = await cur.fetchone()
-            values = json.loads(row[0] or "[]") if row else []
-            existing = set(values)
-            added = 0
-            for line in lines:
-                if line not in existing:
-                    values.append(line)
-                    existing.add(line)
-                    added += 1
-            await conn.execute("UPDATE users SET templates=? WHERE user_id=?",
-                               (json.dumps(values, ensure_ascii=False), uid))
-            await conn.commit()
-        return added, len(values)
+            if not row:
+                await db.rollback()
+                return None
+            await db.execute("DELETE FROM login_tokens WHERE token_hash=?", (token_hash(raw),))
+            await db.commit()
+            return int(row[0])
 
-    async def templates_clear(self, uid):
-        async with self.connect() as conn:
-            await conn.execute("UPDATE users SET templates='[]' WHERE user_id=?", (uid,))
-            await conn.commit()
+    async def create_web_session(self, uid):
+        raw = secrets.token_urlsafe(40)
+        async with self.connect() as db:
+            await db.execute("DELETE FROM web_sessions WHERE expires_at<?", (time.time(),))
+            await db.execute(
+                "INSERT INTO web_sessions(sid_hash,user_id,expires_at,created_at) VALUES(?,?,?,?)",
+                (token_hash(raw), int(uid), time.time() + SESSION_DAYS * 86400, iso_now())
+            )
+            await db.commit()
+        return raw
+
+    async def get_web_session(self, raw):
+        if not raw:
+            return None
+        async with self.connect() as db:
+            cur = await db.execute("""
+                SELECT user_id FROM web_sessions
+                WHERE sid_hash=? AND expires_at>?
+            """, (token_hash(raw), time.time()))
+            row = await cur.fetchone()
+            return int(row[0]) if row else None
+
+    async def delete_web_session(self, raw):
+        if raw:
+            async with self.connect() as db:
+                await db.execute("DELETE FROM web_sessions WHERE sid_hash=?", (token_hash(raw),))
+                await db.commit()
+
+    async def audit(self, uid, action, details=""):
+        async with self.connect() as db:
+            await db.execute(
+                "INSERT INTO audit(user_id,action,details,created_at) VALUES(?,?,?,?)",
+                (int(uid), action[:80], str(details)[:500], iso_now())
+            )
+            await db.commit()
+
+    async def update_user_lists(self, uid, templates=None, targets=None):
+        async with self.connect() as db:
+            if templates is not None:
+                await db.execute(
+                    "UPDATE users SET templates=? WHERE user_id=?",
+                    (json.dumps(templates, ensure_ascii=False), int(uid))
+                )
+            if targets is not None:
+                await db.execute(
+                    "UPDATE users SET targets=? WHERE user_id=?",
+                    (json.dumps(targets, ensure_ascii=False), int(uid))
+                )
+            await db.commit()
 
     async def set_session(self, uid, value):
-        async with self.connect() as conn:
-            await conn.execute("UPDATE users SET session_string=? WHERE user_id=?", (value, uid))
-            await conn.commit()
+        async with self.connect() as db:
+            await db.execute(
+                "UPDATE users SET session_string=? WHERE user_id=?", (value, int(uid))
+            )
+            await db.commit()
 
-    async def set_targets(self, uid, targets):
-        async with self.connect() as conn:
-            await conn.execute("UPDATE users SET targets=? WHERE user_id=?",
-                               (json.dumps(targets, ensure_ascii=False), uid))
-            await conn.commit()
+    async def stats(self, uid):
+        async with self.connect() as db:
+            cur = await db.execute(
+                "SELECT sent,errors FROM user_stats WHERE user_id=?", (int(uid),)
+            )
+            row = await cur.fetchone()
+            return {"sent": row[0], "errors": row[1]} if row else {"sent": 0, "errors": 0}
 
-    async def set_delay(self, uid, low, high):
-        async with self.connect() as conn:
-            await conn.execute("UPDATE users SET min_delay=?, max_delay=? WHERE user_id=?",
-                               (low, high, uid))
-            await conn.commit()
+    async def increment_stat(self, uid, column):
+        if column not in ("sent", "errors"):
+            return
+        async with self.connect() as db:
+            await db.execute(
+                f"INSERT OR IGNORE INTO user_stats(user_id) VALUES(?)", (int(uid),)
+            )
+            await db.execute(
+                f"UPDATE user_stats SET {column}={column}+1 WHERE user_id=?", (int(uid),)
+            )
+            await db.commit()
 
     async def subscription_active(self, uid):
-        row = await self.user(uid)
+        row = await self.get_user(uid)
         if not row or not row["subscription_until"]:
             return False
         try:
@@ -207,809 +355,673 @@ class Database:
         except ValueError:
             return False
 
-    async def grant_subscription(self, uid, days=60):
+    async def grant_subscription(self, uid, days=30):
         await self.ensure_user(uid)
-        row = await self.user(uid)
+        row = await self.get_user(uid)
         start = utcnow()
         if row and row["subscription_until"]:
             try:
-                old = dt.datetime.fromisoformat(row["subscription_until"])
-                if old > start:
-                    start = old
+                previous = dt.datetime.fromisoformat(row["subscription_until"])
+                if previous > start:
+                    start = previous
             except ValueError:
                 pass
-        expiry = (start + dt.timedelta(days=days)).isoformat()
-        async with self.connect() as conn:
-            await conn.execute("UPDATE users SET approved=1, subscription_until=? WHERE user_id=?",
-                               (expiry, uid))
-            await conn.commit()
+        expiry = (start + dt.timedelta(days=max(1, min(3650, int(days))))).isoformat()
+        async with self.connect() as db:
+            await db.execute(
+                "UPDATE users SET approved=1,subscription_until=? WHERE user_id=?",
+                (expiry, int(uid))
+            )
+            await db.commit()
         return expiry
 
-    async def approve(self, uid, enabled):
+    async def set_approved(self, uid, enabled):
         await self.ensure_user(uid)
-        async with self.connect() as conn:
-            await conn.execute("UPDATE users SET approved=? WHERE user_id=?", (int(enabled), uid))
-            await conn.commit()
+        async with self.connect() as db:
+            await db.execute(
+                "UPDATE users SET approved=? WHERE user_id=?", (int(enabled), int(uid))
+            )
+            await db.commit()
 
-    async def add_balance(self, uid, amount):
-        await self.ensure_user(uid)
-        async with self.connect() as conn:
-            await conn.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (amount, uid))
-            await conn.commit()
+    async def admin_stats(self):
+        async with self.connect() as db:
+            cur = await db.execute("""
+                SELECT COUNT(*),
+                       SUM(CASE WHEN session_string!='' THEN 1 ELSE 0 END)
+                FROM users
+            """)
+            users, sessions = await cur.fetchone()
+            cur = await db.execute("SELECT COALESCE(SUM(sent),0),COALESCE(SUM(errors),0) FROM user_stats")
+            sent, errors = await cur.fetchone()
+            cur = await db.execute("SELECT COUNT(*) FROM runtime_jobs WHERE status='running'")
+            running = (await cur.fetchone())[0]
+            return {
+                "users": users or 0, "saved_sessions": sessions or 0,
+                "sent": sent or 0, "errors": errors or 0, "running_jobs": running
+            }
 
-    async def all_users(self):
-        async with self.connect() as conn:
-            conn.row_factory = aiosqlite.Row
-            cur = await conn.execute("SELECT * FROM users ORDER BY user_id DESC")
-            return await cur.fetchall()
+    async def recent_audit(self, limit=100):
+        async with self.connect() as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT user_id,action,details,created_at FROM audit ORDER BY id DESC LIMIT ?",
+                (max(1, min(300, int(limit))),)
+            )
+            return [dict(x) for x in await cur.fetchall()]
+
+    async def set_job_status(self, uid, status):
+        async with self.connect() as db:
+            await db.execute("""
+                INSERT INTO runtime_jobs(user_id,status,updated_at) VALUES(?,?,?)
+                ON CONFLICT(user_id) DO UPDATE SET status=excluded.status,updated_at=excluded.updated_at
+            """, (int(uid), status, iso_now()))
+            await db.commit()
 
 
-# ---------------- TARGET PARSING ----------------
+# -------------------- LIMITED TELETHON CLIENT POOL --------------------
 
-def parse_target(raw):
-    value = raw.strip()
-    if not value:
-        return None
-    if value.startswith("tg://chat?id="):
-        return int(value.split("=", 1)[1])
-    if re.fullmatch(r"-100\d+", value) or re.fullmatch(r"-?\d+", value):
-        return int(value)
-    value = re.sub(r"^https?://t\.me/", "", value).strip("/")
-    value = re.sub(r"\?.*$", "", value)
-    if value.startswith("c/"):
-        parts = value.split("/")
-        if len(parts) >= 2 and parts[1].isdigit():
-            return int("-100" + parts[1])
-    if value.startswith("@"):
-        return value
-    if re.fullmatch(r"[A-Za-z0-9_]{5,}", value):
-        return "@" + value
-    return None
+class ClientManager:
+    def __init__(self, database, maximum):
+        self.database = database
+        self.semaphore = asyncio.Semaphore(maximum)
+        self.maximum = maximum
+        self.active = 0
+        self.waiting = 0
+        self._lock = asyncio.Lock()
 
-
-# ---------------- DISPATCHER ----------------
-
-class Dispatcher:
-    def __init__(self, uid, client, targets, templates, min_delay=3, max_delay=10):
-        self.uid = uid
-        self.client = client
-        self.targets = list(targets)[:MAX_TARGETS]
-        self.templates = list(templates)
-        self.min_delay = max(1, min(60, int(min_delay)))
-        self.max_delay = max(self.min_delay, min(60, int(max_delay)))
-        self.stop_event = asyncio.Event()
-        self.task = None
-        self.sent = 0
-        self.errors = 0
-        self.disabled_targets = set()
-
-    async def start(self):
-        if self.task and not self.task.done():
-            return False
-        self.stop_event.clear()
-        self.task = asyncio.create_task(self.run(), name=f"dispatcher-{self.uid}")
-        return True
-
-    async def stop(self):
-        self.stop_event.set()
-        if self.task:
-            try:
-                await asyncio.wait_for(self.task, timeout=10)
-            except asyncio.TimeoutError:
-                self.task.cancel()
-                await asyncio.gather(self.task, return_exceptions=True)
-
-    async def interruptible_sleep(self, seconds):
+    @asynccontextmanager
+    async def acquire(self, uid):
+        self.waiting += 1
+        await self.semaphore.acquire()
+        self.waiting -= 1
+        client = None
+        async with self._lock:
+            self.active += 1
         try:
-            await asyncio.wait_for(self.stop_event.wait(), timeout=max(0, seconds))
-        except asyncio.TimeoutError:
-            pass
-
-    async def record_metric(self, column):
-        if column not in ("sent", "errors"):
-            return
-        async with db.connect() as conn:
-            await conn.execute(f"UPDATE metrics SET {column}={column}+1 WHERE id=1")
-            await conn.commit()
-
-    async def run(self):
-        if not self.targets or not self.templates:
-            return
-        while not self.stop_event.is_set():
-            for target in self.targets:
-                if self.stop_event.is_set():
-                    break
-                if target in self.disabled_targets:
-                    continue
-
-                message = random.choice(self.templates)
+            row = await self.database.get_user(uid)
+            if not row or not row["session_string"]:
+                raise RuntimeError("Telegram-аккаунт не подключён")
+            client = TelegramClient(
+                StringSession(row["session_string"]), API_ID, API_HASH,
+                connection_retries=1, request_retries=1, timeout=15,
+                auto_reconnect=False
+            )
+            await client.connect()
+            if not await client.is_user_authorized():
+                raise RuntimeError("Сессия Telegram недействительна")
+            yield client
+        finally:
+            if client is not None:
                 try:
-                    await self.client.send_message(target, message)
-                    self.sent += 1
-                    await self.record_metric("sent")
-                    await db.audit(self.uid, "MESSAGE_SENT", str(target))
-
-                except FloodWaitError as exc:
-                    await db.audit(self.uid, "FLOOD_WAIT", f"{target}: {exc.seconds}s")
-                    await self.interruptible_sleep(exc.seconds)
-                    continue
-
-                except SlowModeWaitError as exc:
-                    await db.audit(self.uid, "SLOW_MODE_WAIT", f"{target}: {exc.seconds}s")
-                    await self.interruptible_sleep(exc.seconds)
-                    continue
-
-                except ChatWriteForbiddenError:
-                    await db.audit(self.uid, "WRITE_FORBIDDEN", str(target))
-                    # Ждём 5 минут, если не остановили
-                    await self.interruptible_sleep(300)
-                    if self.stop_event.is_set():
-                        break
-                    try:
-                        await self.client.get_entity(target)
-                        await self.client.send_message(target, message)
-                        self.sent += 1
-                        await self.record_metric("sent")
-                        await db.audit(self.uid, "RETRY_SUCCESS", str(target))
-                    except ChatWriteForbiddenError:
-                        self.disabled_targets.add(target)
-                        await db.audit(self.uid, "RETRY_STILL_FORBIDDEN", str(target))
-                    except Exception as retry_error:
-                        self.errors += 1
-                        await self.record_metric("errors")
-                        await db.audit(self.uid, "RETRY_ERROR", str(retry_error)[:500])
-                    continue
-
-                except UserBannedInChannelError:
-                    self.disabled_targets.add(target)
-                    await db.audit(self.uid, "TARGET_BANNED", str(target))
-                    continue
-
-                except asyncio.CancelledError:
-                    raise
-
-                except Exception as exc:
-                    self.errors += 1
-                    await self.record_metric("errors")
-                    await db.audit(self.uid, "SEND_ERROR", f"{target}: {str(exc)[:400]}")
-
-                await self.interruptible_sleep(random.randint(self.min_delay, self.max_delay))
+                    await client.disconnect()
+                except Exception:
+                    log.warning("Client disconnect failed for user %s", uid)
+            async with self._lock:
+                self.active = max(0, self.active - 1)
+            self.semaphore.release()
 
 
-# ---------------- TELEGRAM HELPERS ----------------
+# -------------------- BOT AUTH / ACCOUNT LOGIN --------------------
 
-def is_admin(uid):
-    return uid in SUPER_ADMINS
-
-def menu_buttons(uid):
-    rows = [
-        [Button.inline("📱 Аккаунт", b"account"), Button.inline("📝 Шаблоны", b"templates")],
-        [Button.inline("🎯 Цели", b"targets"), Button.inline("⏱ Задержка", b"delay")],
-        [Button.inline("🚀 Запустить", b"start"), Button.inline("🛑 Остановить", b"stop")],
-        [Button.inline("📊 Статистика", b"stats"), Button.inline("💎 Подписка", b"subscription")],
-        [Button.inline("🏠 Главное меню", b"home")]
+def bot_menu(uid):
+    return [
+        [Button.inline("🌐 Войти в панель", b"web_login")],
+        [Button.inline("📱 Подключить Telegram-аккаунт", b"connect_account")]
     ]
-    if is_admin(uid):
-        rows.append([Button.inline("🛡 Админ-панель", b"admin")])
-    return rows
 
-async def show_menu(event, text="**TITAN Enterprise**\nСистема корпоративных уведомлений."):
-    await event.respond(text, buttons=menu_buttons(event.sender_id), parse_mode="md")
-
-async def get_account_client(uid):
-    row = await db.user(uid)
-    if not row or not row["session_string"]:
-        return None
-    cached = active_clients.get(uid)
-    if cached and cached.is_connected():
-        return cached
-    client = TelegramClient(StringSession(row["session_string"]), API_ID, API_HASH)
-    await client.connect()
-    if not await client.is_user_authorized():
-        await client.disconnect()
-        return None
-    active_clients[uid] = client
-    return client
-
-async def finish_phone_login(uid, client):
-    await db.set_session(uid, client.session.save())
-    active_clients[uid] = client
-    phone_flows.pop(uid, None)
-    states[uid] = IDLE
-
-
-# ---------------- TELEGRAM BOT ----------------
+async def issue_web_login(event):
+    uid = int(event.sender_id)
+    sender = await event.get_sender()
+    await db.ensure_user(uid, getattr(sender, "username", "") or "")
+    user = await db.get_user(uid)
+    if not user["approved"] and not is_admin(uid):
+        await event.respond(f"Доступ ещё не активирован.\nВаш Telegram ID: {uid}\nОбратитесь в поддержку.")
+        return
+    raw = await db.create_login_token(uid)
+    base = PUBLIC_BASE_URL
+    if not base:
+        await event.respond("Не задан PUBLIC_BASE_URL в переменных Render.")
+        return
+    link = f"{base}/login?token={raw}"
+    await event.respond(f"🔐 Одноразовая ссылка для входа:\n{link}\n\nСсылка действует 5 минут.")
+    await db.audit(uid, "WEB_LOGIN_TOKEN_ISSUED")
 
 async def setup_bot():
     global bot
-    if not BOT_TOKEN:
-        raise RuntimeError("Set BOT_TOKEN environment variable before starting.")
     bot = TelegramClient("titan_bot", API_ID, API_HASH)
     await bot.start(bot_token=BOT_TOKEN)
 
-    @bot.on(events.NewMessage(pattern=r"^/start$"))
+    @bot.on(events.NewMessage(pattern=r"^/start(?:@\w+)?$"))
     async def start_handler(event):
-        uid = event.sender_id
         sender = await event.get_sender()
-        await db.ensure_user(uid, getattr(sender, "username", "") or "")
-        row = await db.user(uid)
-        if not row["approved"] and not is_admin(uid):
-            await event.respond(
-                f"Доступ пока не активирован.\nВаш ID: `{uid}`\n"
-                f"Для подключения: {SUPPORT_CONTACT}"
-            )
+        await db.ensure_user(event.sender_id, getattr(sender, "username", "") or "")
+        user = await db.get_user(event.sender_id)
+        if not user["approved"] and not is_admin(event.sender_id):
+            await event.respond(f"Доступ не активирован.\nВаш ID: {event.sender_id}")
             return
-        states[uid] = IDLE
-        await show_menu(event)
+        await event.respond("TITAN Enterprise\nЛичный кабинет и управление уведомлениями.", buttons=bot_menu(event.sender_id))
 
     @bot.on(events.CallbackQuery)
     async def callback_handler(event):
-        uid = event.sender_id
-        data = event.data.decode(errors="ignore")
-        await db.ensure_user(uid)
-        row = await db.user(uid)
-
-        if not row["approved"] and not is_admin(uid):
-            await event.answer("Доступ не активирован", alert=True)
-            return
-
-        if data == "home":
-            states[uid] = IDLE
-            await event.edit("**TITAN Enterprise — главное меню**",
-                             buttons=menu_buttons(uid), parse_mode="md")
-
-        elif data == "account":
-            states[uid] = IDLE
-            connected = bool(row["session_string"])
-            await event.edit(
-                f"**Аккаунт Telegram**\nСтатус: {'Подключён' if connected else 'Не подключён'}\n\n"
-                "Выберите способ авторизации.",
-                buttons=[
-                    [Button.inline("📞 Войти по номеру", b"phone_login")],
-                    [Button.inline("🔳 Войти по QR", b"qr_login")],
-                    [Button.inline("🏠 Меню", b"home")]
-                ], parse_mode="md"
-            )
-
-        elif data == "phone_login":
-            states[uid] = WAIT_PHONE
-            await event.respond("Отправьте номер телефона в международном формате, например +49123456789.")
-
-        elif data == "qr_login":
-            await event.answer("Запускаю генерацию QR...")
-            await start_qr_login(uid, event)
-
-        elif data == "templates":
-            templates = json.loads(row["templates"] or "[]")
-            preview = "\n".join(
-                f"{i+1}. {x[:180]}" for i, x in enumerate(templates[:10])
-            ) or "Список пуст."
-            await event.edit(
-                f"**Ваши шаблоны: {len(templates)}**\n\n{preview}",
-                buttons=[
-                    [Button.inline("➕ Добавить", b"add_templates"),
-                     Button.inline("🗑 Очистить все", b"clear_templates")],
-                    [Button.inline("🏠 Меню", b"home")]
-                ], parse_mode="md"
-            )
-
-        elif data == "add_templates":
-            states[uid] = IDLE
-            await event.respond("Отправьте шаблоны: каждая строка станет отдельным шаблоном. Для выхода нажмите «Главное меню».")
-
-        elif data == "clear_templates":
-            await db.templates_clear(uid)
-            await db.audit(uid, "TEMPLATES_CLEARED")
-            await event.answer("Шаблоны очищены", alert=True)
-
-        elif data == "targets":
-            states[uid] = WAIT_TARGETS
-            current = json.loads(row["targets"] or "[]")
-            await event.respond(
-                "Отправьте цели, каждую с новой строки (до 10).\n"
-                "Поддерживаются @username, t.me-ссылки, tg://chat?id= и ID.\n"
-                "Текущие цели:\n" + ("\n".join(map(str, current)) if current else "нет")
-            )
-
-        elif data == "delay":
-            states[uid] = WAIT_DELAY
-            await event.respond(
-                f"Текущая задержка: {row['min_delay']}–{row['max_delay']} сек.\n"
-                "Отправьте диапазон, например 3-10 (от 1 до 60 секунд)."
-            )
-
-        elif data == "start":
-            if not await db.subscription_active(uid) and not is_admin(uid):
-                await event.answer("Подписка истекла. Продление: @apemiru", alert=True)
-                return
-            client = await get_account_client(uid)
-            if not client:
-                await event.answer("Сначала подключите Telegram-аккаунт.", alert=True)
-                return
-            targets = json.loads(row["targets"] or "[]")
-            templates = json.loads(row["templates"] or "[]")
-            if not targets or not templates:
-                await event.answer("Добавьте цели и шаблоны.", alert=True)
-                return
-            old = dispatchers.get(uid)
-            if old:
-                await old.stop()
-            worker = Dispatcher(uid, client, targets, templates,
-                                 row["min_delay"], row["max_delay"])
-            dispatchers[uid] = worker
-            await worker.start()
-            await db.audit(uid, "DISPATCH_STARTED", f"{len(targets)} targets")
-            await event.answer("Диспетчер запущен")
-
-        elif data == "stop":
-            worker = dispatchers.get(uid)
-            if worker:
-                await worker.stop()
-                dispatchers.pop(uid, None)
-            await db.audit(uid, "DISPATCH_STOPPED")
-            await event.answer("Диспетчер остановлен", alert=True)
-
-        elif data == "stats":
-            worker = dispatchers.get(uid)
-            sent = worker.sent if worker else 0
-            errors = worker.errors if worker else 0
-            await event.edit(
-                f"**Статистика текущей задачи**\nОтправлено: {sent}\nОшибок: {errors}",
-                buttons=[[Button.inline("🏠 Меню", b"home")]], parse_mode="md"
-            )
-
-        elif data == "subscription":
-            active = await db.subscription_active(uid)
-            row = await db.user(uid)
-            await event.edit(
-                f"**TITAN FULL ACCESS**\n400 ₽ / 60 дней\n"
-                f"Статус: {'Активна' if active else 'Не активна'}\n"
-                f"Окончание: {row['subscription_until'] or 'нет'}\n\n"
-                f"Продление: {OWNER_CONTACT}",
-                buttons=[[Button.inline("🏠 Меню", b"home")]], parse_mode="md"
-            )
-
-        elif data == "admin":
-            if not is_admin(uid):
-                await event.answer("Недостаточно прав", alert=True)
-                return
-            await event.edit(
-                "**Администрирование**\n"
-                "/approve ID — открыть доступ\n"
-                "/revoke ID — закрыть доступ\n"
-                "/sub ID — выдать 60 дней\n"
-                "/stats — общая статистика\n"
-                "/broadcast текст — объявление пользователям\n"
-                ".balance ID сумма — начислить баланс",
-                buttons=[[Button.inline("🏠 Меню", b"home")]], parse_mode="md"
-            )
+        uid = int(event.sender_id)
+        data = event.data.decode("utf-8", "ignore")
+        if data == "web_login":
+            await issue_web_login(event)
+            await event.answer("Ссылка отправлена")
+        elif data == "connect_account":
+            bot_states[uid] = "PHONE"
+            await event.answer()
+            await event.respond("Отправьте номер телефона в формате (+...).")
+        else:
+            await event.answer()
 
     @bot.on(events.NewMessage)
-    async def text_handler(event):
-        if not event.is_private or event.raw_text.startswith("/"):
-            return
-        uid = event.sender_id
-        await db.ensure_user(uid)
-        row = await db.user(uid)
-        if not row["approved"] and not is_admin(uid):
-            return
+    async def account_login_handler(event):
+        if not event.is_private: return
+        uid = int(event.sender_id)
+        state = bot_states.get(uid)
+        if state not in ("PHONE", "CODE", "2FA"): return
+        value = (event.raw_text or "").strip()
+        if not value or value.startswith("/"): return
 
-        state = states.get(uid, IDLE)
-        text = event.raw_text.strip()
-
-        if text in ("🏠 Главное меню", "меню", "отмена", "/cancel"):
-            states[uid] = IDLE
-            await show_menu(event)
-            return
-
-        if state == WAIT_PHONE:
-            if not re.fullmatch(r"\+[1-9]\d{6,14}", text):
-                await event.respond("Неверный формат. Пример: +49123456789")
+        if state == "PHONE":
+            if not re.fullmatch(r"\+[1-9]\d{6,14}", value):
+                await event.respond("Неверный формат.")
                 return
-            client = TelegramClient(StringSession(), API_ID, API_HASH)
-            await client.connect()
+            client = TelegramClient(StringSession(), API_ID, API_HASH, connection_retries=1, request_retries=1)
             try:
-                sent = await client.send_code_request(text)
-                phone_flows[uid] = {
-                    "client": client, "phone": text, "hash": sent.phone_code_hash
-                }
-                states[uid] = WAIT_CODE
-                await event.respond("Код отправлен. Введите код Telegram.")
+                await client.connect()
+                sent = await client.send_code_request(value)
+                phone_flows[uid] = {"client": client, "phone": value, "phone_code_hash": sent.phone_code_hash}
+                bot_states[uid] = "CODE"
+                await event.respond("Введите код подтверждения.")
             except Exception as exc:
                 await client.disconnect()
-                states[uid] = IDLE
-                await event.respond(f"Не удалось отправить код: {str(exc)[:250]}")
+                bot_states.pop(uid, None)
+                await event.respond(f"Ошибка: {str(exc)[:180]}")
             return
 
-        if state == WAIT_CODE:
-            flow = phone_flows.get(uid)
-            if not flow:
-                states[uid] = IDLE
-                await event.respond("Сессия авторизации истекла. Начните заново.")
-                return
-            try:
-                await flow["client"].sign_in(
-                    phone=flow["phone"], code=text, phone_code_hash=flow["hash"]
-                )
-                await finish_phone_login(uid, flow["client"])
-                await event.respond("Telegram-аккаунт подключён.")
-            except SessionPasswordNeededError:
-                states[uid] = WAIT_2FA
-                await event.respond("Включена двухэтапная защита. Введите облачный пароль.")
-            except (PhoneCodeInvalidError, Exception) as exc:
-                await event.respond(f"Ошибка входа: {str(exc)[:250]}")
+        flow = phone_flows.get(uid)
+        if not flow:
+            bot_states.pop(uid, None)
+            await event.respond("Авторизация истекла.")
             return
 
-        if state == WAIT_2FA:
-            flow = phone_flows.get(uid)
-            if not flow:
-                states[uid] = IDLE
-                await event.respond("Сессия авторизации истекла.")
-                return
-            try:
-                await flow["client"].sign_in(password=text)
-                await finish_phone_login(uid, flow["client"])
-                await event.respond("Telegram-аккаунт подключён.")
-            except PasswordHashInvalidError:
-                await event.respond("Неверный облачный пароль. Попробуйте ещё раз.")
-            except Exception as exc:
-                await event.respond(f"Ошибка 2FA: {str(exc)[:250]}")
-            return
-
-        if state == WAIT_TARGETS:
-            parsed = []
-            invalid = []
-            for line in text.splitlines():
-                target = parse_target(line)
-                if target is None:
-                    invalid.append(line)
-                elif target not in parsed:
-                    parsed.append(target)
-            if len(parsed) > MAX_TARGETS:
-                await event.respond("Можно сохранить максимум 10 целей.")
-                return
-            if not parsed:
-                await event.respond("Не удалось распознать цели.")
-                return
-            await db.set_targets(uid, parsed)
-            await db.audit(uid, "TARGETS_UPDATED", json.dumps(parsed))
-            states[uid] = IDLE
-            await event.respond(
-                f"Сохранено целей: {len(parsed)}."
-                + (f"\nНе распознано: {len(invalid)}" if invalid else "")
-            )
-            return
-
-        if state == WAIT_DELAY:
-            match = re.fullmatch(r"\s*(\d{1,2})\s*-\s*(\d{1,2})\s*", text)
-            if not match:
-                await event.respond("Формат: 3-10")
-                return
-            low, high = map(int, match.groups())
-            if not (1 <= low <= high <= 60):
-                await event.respond("Допустимый диапазон: 1–60 секунд.")
-                return
-            await db.set_delay(uid, low, high)
-            states[uid] = IDLE
-            await event.respond(f"Задержка сохранена: {low}–{high} секунд.")
-            return
-
-        # IDLE: each non-empty line is an independent template.
-        added, total = await db.templates_add(uid, text)
-        if added:
-            await db.audit(uid, "TEMPLATES_ADDED", f"added={added}")
-            await event.respond(
-                f"Добавлено шаблонов: {added}. Всего: {total}.\n"
-                "Каждая строка сохранена отдельно.",
-                buttons=menu_buttons(uid)
-            )
-
-    @bot.on(events.NewMessage(pattern=r"^/approve\s+(\d+)$"))
-    async def approve_cmd(event):
-        if not is_admin(event.sender_id):
-            return
-        uid = int(event.pattern_match.group(1))
-        await db.approve(uid, True)
-        await db.audit(event.sender_id, "USER_APPROVED", str(uid))
-        await event.respond(f"Доступ выдан: {uid}")
-
-    @bot.on(events.NewMessage(pattern=r"^/revoke\s+(\d+)$"))
-    async def revoke_cmd(event):
-        if not is_admin(event.sender_id):
-            return
-        uid = int(event.pattern_match.group(1))
-        worker = dispatchers.pop(uid, None)
-        if worker:
-            await worker.stop()
-        await db.approve(uid, False)
-        await db.audit(event.sender_id, "USER_REVOKED", str(uid))
-        await event.respond(f"Доступ закрыт: {uid}")
-
-    @bot.on(events.NewMessage(pattern=r"^/sub\s+(\d+)$"))
-    async def sub_cmd(event):
-        if not is_admin(event.sender_id):
-            return
-        uid = int(event.pattern_match.group(1))
-        expiry = await db.grant_subscription(uid, SUBSCRIPTION_DAYS)
-        await db.audit(event.sender_id, "SUBSCRIPTION_GRANTED", f"{uid}: {expiry}")
-        await event.respond(f"Подписка выдана пользователю {uid} до {expiry}")
-
-    @bot.on(events.NewMessage(pattern=r"^/stats$"))
-    async def stats_cmd(event):
-        if not is_admin(event.sender_id):
-            return
-        async with db.connect() as conn:
-            cur = await conn.execute("SELECT COUNT(*) FROM users")
-            users = (await cur.fetchone())[0]
-            cur = await conn.execute("SELECT sent,errors,revenue FROM metrics WHERE id=1")
-            sent, errors, revenue = await cur.fetchone()
-        await event.respond(
-            f"Пользователи: {users}\nОтправки: {sent}\nОшибки: {errors}\nВыручка: {revenue} ₽"
-        )
-
-    @bot.on(events.NewMessage(pattern=r"^\.balance\s+(\d+)\s+(-?\d+)$"))
-    async def balance_cmd(event):
-        if not is_admin(event.sender_id):
-            return
-        uid, amount = map(int, event.pattern_match.groups())
-        await db.add_balance(uid, amount)
-        await db.audit(event.sender_id, "BALANCE_CHANGED", f"{uid}: {amount}")
-        await event.respond(f"Баланс пользователя {uid} изменён на {amount}")
-
-    @bot.on(events.NewMessage(pattern=r"^/broadcast\s+([\s\S]+)$"))
-    async def broadcast_cmd(event):
-        if not is_admin(event.sender_id):
-            return
-        message = event.pattern_match.group(1)
-        users = await db.all_users()
-        sent = 0
-        for user in users:
-            try:
-                await bot.send_message(user["user_id"], message)
-                sent += 1
-            except Exception:
-                pass
-            await asyncio.sleep(0.05)
-        await db.audit(event.sender_id, "BROADCAST", f"delivered={sent}")
-        await event.respond(f"Объявление отправлено: {sent}")
+        client = flow["client"]
+        try:
+            if state == "CODE":
+                await client.sign_in(phone=flow["phone"], code=value, phone_code_hash=flow["phone_code_hash"])
+            else:
+                await client.sign_in(password=value)
+            saved = client.session.save()
+            await db.set_session(uid, saved)
+            await client.disconnect()
+            phone_flows.pop(uid, None)
+            bot_states.pop(uid, None)
+            await event.respond("Аккаунт подключён. Сессия сохранена.")
+        except SessionPasswordNeededError:
+            bot_states[uid] = "2FA"
+            await event.respond("Введите пароль 2FA.")
+        except Exception as exc:
+            await client.disconnect()
+            phone_flows.pop(uid, None)
+            bot_states.pop(uid, None)
+            await event.respond(f"Ошибка: {str(exc)[:180]}")
 
     return bot
 
+# -------------------- FLASK AUTH HELPERS --------------------
 
-async def start_qr_login(uid, event):
-    client = TelegramClient(StringSession(), API_ID, API_HASH)
-    await client.connect()
+def run_async(coro, timeout=25):
+    if loop is None: raise RuntimeError("Async loop is not ready")
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
     try:
-        qr = await client.qr_login()
-        qr_flows[uid] = {"client": client, "qr": qr}
-        qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=400x400&data={urllib.parse.quote(qr.url)}"
-        await event.respond(
-            "Откройте Telegram на устройстве с уже авторизованным аккаунтом → "
-            "Настройки → Устройства → Подключить устройство и отсканируйте QR.\n\n"
-            f"[Кликните сюда, чтобы открыть QR-код]({qr_url})\n\n"
-            "Ссылка действует ограниченное время. После сканирования бот сохранит сессию."
-        )
-        asyncio.create_task(finish_qr_login(uid, event))
-    except Exception as exc:
-        await client.disconnect()
-        await event.respond(f"Не удалось создать QR: {str(exc)[:250]}")
+        return future.result(timeout=timeout)
+    except TimeoutError:
+        return None
 
+def current_user_id():
+    raw = request.cookies.get("titan_sid", "")
+    return run_async(db.get_web_session(raw)) if raw else None
 
-async def finish_qr_login(uid, event):
-    flow = qr_flows.get(uid)
-    if not flow:
-        return
-    client = flow["client"]
-    try:
-        await flow["qr"].wait()
-        await finish_phone_login(uid, client)
-        await event.respond("QR-авторизация завершена. Аккаунт подключён.")
-    except SessionPasswordNeededError:
-        states[uid] = WAIT_2FA
-        phone_flows[uid] = {"client": client, "phone": "", "hash": ""}
-        await event.respond("На аккаунте включена 2FA. Отправьте облачный пароль.")
-    except Exception as exc:
-        await event.respond(f"QR-авторизация не завершена: {str(exc)[:250]}")
-        await client.disconnect()
-    finally:
-        qr_flows.pop(uid, None)
+def load_user():
+    uid = current_user_id()
+    if not uid: return None
+    return run_async(db.get_user(uid))
 
+def login_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        user = load_user()
+        if not user: return jsonify({"error": "unauthorized"}), 401
+        if not user["approved"] and user["role"] != "ADMIN": return jsonify({"error": "access_revoked"}), 403
+        request.titan_user = user
+        return fn(*args, **kwargs)
+    return wrapper
 
-# ---------------- WEB DASHBOARD ----------------
+def admin_required(fn):
+    @wraps(fn)
+    @login_required
+    def wrapper(*args, **kwargs):
+        if request.titan_user["role"] != "ADMIN":
+            if request.path.startswith("/api/"): return jsonify({"error": "forbidden"}), 403
+            return redirect(url_for("dashboard"))
+        return fn(*args, **kwargs)
+    return wrapper
 
-DASHBOARD_HTML = """
+def csrf_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        expected = session.get("csrf")
+        supplied = request.headers.get("X-CSRF-Token", "")
+        if not expected or not hmac.compare_digest(expected, supplied):
+            return jsonify({"error": "csrf"}), 400
+        return fn(*args, **kwargs)
+    return wrapper
+
+# -------------------- WEB UI --------------------
+
+LOGIN_HTML = r"""
 <!doctype html><html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>TITAN Enterprise — Dashboard</title>
+<title>TITAN Enterprise — Вход</title>
 <style>
-*{box-sizing:border-box}body{margin:0;background:#08090d;color:#e9edf5;font:14px Inter,Arial}
-.wrap{display:flex;min-height:100vh}.side{width:235px;background:#10131c;padding:26px 18px;border-right:1px solid #252b3a}
-.logo{font-size:21px;font-weight:800;letter-spacing:2px;color:#ff354f;margin-bottom:35px}
-.side a{display:block;padding:12px;color:#aeb7c9;text-decoration:none;border-radius:9px;margin:5px 0}
-.side a:hover{background:#1b2231;color:white}.main{padding:30px;flex:1;min-width:0}
-h1{margin:0 0 8px;font-size:27px}.muted{color:#8792a8}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:14px;margin:25px 0}
-.card{background:#141824;border:1px solid #252c3b;border-radius:13px;padding:20px}
-.value{font-size:27px;font-weight:800;margin-top:12px;color:#ff5268}
-table{width:100%;border-collapse:collapse;background:#141824;border-radius:12px;overflow:hidden}
-th,td{text-align:left;padding:12px;border-bottom:1px solid #252c3b;word-break:break-word}
-th{color:#9da9bd;font-weight:600}button{padding:9px 12px;border-radius:8px;border:0;background:#d92f49;color:white;cursor:pointer}
-.section{margin:28px 0;overflow:auto}.top{display:flex;justify-content:space-between;gap:15px;align-items:center;flex-wrap:wrap}
-@media(max-width:700px){.wrap{display:block}.side{width:100%;border:0}.main{padding:18px}.side a{display:inline-block}}
-</style></head><body><div class="wrap"><aside class="side">
-<div class="logo">TITAN ENTERPRISE</div><a href="#overview">Обзор</a><a href="#users">Пользователи</a>
-<a href="#audit">Журнал активности</a><a href="/export.csv">CSV-экспорт</a><a href="/logout">Выйти</a>
-<p class="muted">Support: @apemiru</p></aside><main class="main">
-<div class="top"><div><h1>Панель управления</h1><div class="muted">Мониторинг корпоративных уведомлений</div></div>
-<button onclick="loadAll()">Обновить данные</button></div>
-<div id="overview" class="grid">
-<div class="card">Всего пользователей<div class="value" id="users">—</div></div>
-<div class="card">Активные сессии<div class="value" id="sessions">—</div></div>
-<div class="card">Успешные отправки<div class="value" id="sent">—</div></div>
-<div class="card">Ошибки<div class="value" id="errors">—</div></div>
-<div class="card">Выручка<div class="value" id="revenue">—</div></div></div>
-<div class="section" id="users"><h2>Пользователи</h2><table><thead><tr><th>ID</th><th>Username</th><th>Подписка до</th><th>Баланс</th><th>Сессия</th><th>Действия</th></tr></thead><tbody id="userRows"></tbody></table></div>
-<div class="section" id="audit"><h2>Журнал активности</h2><table><thead><tr><th>Дата</th><th>User ID</th><th>Действие</th><th>Подробности</th></tr></thead><tbody id="auditRows"></tbody></table></div>
-</main></div>
-<script>
-async function api(path, opts={}){let r=await fetch(path,{...opts,headers:{'Content-Type':'application/json',...(opts.headers||{})}});if(r.status===401){location.href='/login';return null}return await r.json()}
-async function loadAll(){
- let s=await api('/api/stats');if(s){for(let k of ['users','sessions','sent','errors','revenue'])document.getElementById(k).textContent=s[k]??'—';}
- let u=await api('/api/users');if(u){document.getElementById('userRows').innerHTML=u.map(x=>`<tr><td>${x.user_id}</td><td>${x.username||''}</td><td>${x.subscription_until||'—'}</td><td>${x.balance}</td><td>${x.has_session?'Да':'Нет'}</td><td><button onclick="grant(${x.user_id})">+60 дней</button></td></tr>`).join('')}
- let a=await api('/api/audit');if(a){document.getElementById('auditRows').innerHTML=a.map(x=>`<tr><td>${x.created_at}</td><td>${x.user_id}</td><td>${x.action}</td><td>${x.details||''}</td></tr>`).join('')}
-}
-async function grant(id){if(!confirm('Выдать 60 дней пользователю '+id+'?'))return;let r=await api('/api/grant',{method:'POST',body:JSON.stringify({user_id:id})});if(r&&r.ok)loadAll()}
-loadAll();setInterval(loadAll,30000);
-</script></body></html>
+:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;min-height:100vh;
+display:grid;place-items:center;padding:20px;background:radial-gradient(ellipse at 15% 10%,#54208a55,transparent 38%),
+radial-gradient(ellipse at 90% 85%,#c0266d33,transparent 40%),#09090b;color:#f4f1fa;
+font:15px Inter,system-ui,Arial}.glass{width:min(440px,100%);padding:34px;border:1px solid #ffffff20;
+border-radius:26px;background:#18181bd9;backdrop-filter:blur(14px);box-shadow:0 24px 90px #0009}
+.logo{font-weight:900;letter-spacing:2px;font-size:22px}.logo span{color:#d946ef}
+h1{font-size:27px;margin:28px 0 8px}.muted{color:#a1a1aa;line-height:1.6}
+.pill{display:inline-block;margin-top:20px;padding:9px 13px;border-radius:99px;background:#a855f722;color:#e9a8ff}
+</style></head><body><main class="glass"><div class="logo">TITAN <span>ENTERPRISE</span></div>
+<h1>Вход по Telegram</h1><p class="muted">{{ message }}</p>
+<div class="pill">Одноразовая авторизация · 5 минут</div></main></body></html>
 """
 
-LOGIN_HTML = """
+DASHBOARD_HTML = r"""
 <!doctype html><html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>TITAN Enterprise</title>
 <style>
-*{box-sizing:border-box}body{margin:0;background:#08090d;color:#e9edf5;font:14px Inter,Arial}
-.wrap{display:flex;min-height:100vh}.side{width:235px;background:#10131c;padding:26px 18px;border-right:1px solid #252b3a}
-.logo{font-size:21px;font-weight:800;letter-spacing:2px;color:#ff354f;margin-bottom:35px}
-.side a{display:block;padding:12px;color:#aeb7c9;text-decoration:none;border-radius:9px;margin:5px 0}
-.side a:hover{background:#1b2231;color:white}.main{padding:30px;flex:1;max-width:1500px}
-h1{margin:0 0 8px;font-size:27px}.muted{color:#8792a8}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:14px;margin:25px 0}
-.card{background:#141824;border:1px solid #252c3b;border-radius:13px;padding:20px}
-.value{font-size:27px;font-weight:800;margin-top:12px;color:#ff5268}
-table{width:100%;border-collapse:collapse;background:#141824;border-radius:12px;overflow:hidden}
-th,td{text-align:left;padding:13px;border-bottom:1px solid #252c3b;word-break:break-word}
-th{color:#9da9bd;font-weight:600}input,button{padding:11px;border-radius:8px;border:1px solid #30394b;background:#0c1018;color:white}
-button{background:#d92f49;border:0;cursor:pointer;font-weight:700}.section{margin:28px 0}
-.login{max-width:390px;margin:12vh auto;background:#141824;padding:28px;border-radius:14px;border:1px solid #252c3b}
-.login input{width:100%;margin:10px 0}.error{color:#ff697b}
-@media(max-width:700px){.wrap{display:block}.side{width:100%;border:0}.main{padding:18px}.side a{display:inline-block}}
-</style></head><body>
-<div class="login"><div class="logo">TITAN / ADMIN</div><h2>Вход в панель</h2>
-<p class="muted">Используйте серверный DASHBOARD_TOKEN.</p>
-<form method="post"><input type="password" name="token" placeholder="Токен доступа" required>
-<button style="width:100%">Войти</button></form>{% if error %}<p class="error">{{error}}</p>{% endif %}</div>
-</body></html>
+:root{color-scheme:dark;--bg:#09090b;--panel:#18181b;--line:#ffffff15;--muted:#a1a1aa;
+--pink:#ec4899;--purple:#a855f7;--green:#4ade80;--red:#fb7185}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at 8% 0%,#6b21a833,transparent 36%),
+radial-gradient(ellipse at 95% 90%,#be185d22,transparent 38%),var(--bg);color:#f4f4f5;
+font:14px Inter,system-ui,Arial;min-height:100vh}.layout{display:flex;min-height:100vh}
+aside{width:240px;padding:25px 17px;border-right:1px solid var(--line);background:#111113bb;
+backdrop-filter:blur(12px);flex-shrink:0}.brand{font-size:19px;font-weight:900;letter-spacing:1.5px;margin:5px 8px 32px}
+.brand b{color:#e879f9}.nav{display:block;padding:12px 13px;color:#c4c4cc;text-decoration:none;
+border-radius:12px;margin:5px 0}.nav:hover,.nav.active{background:linear-gradient(100deg,#9333ea33,#ec489922);color:white}
+main{padding:30px;width:100%;max-width:1500px;margin:auto;min-width:0}.top{display:flex;align-items:center;
+justify-content:space-between;gap:15px;flex-wrap:wrap}h1{font-size:27px;margin:0 0 7px}
+.muted{color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(165px,1fr));gap:14px;margin:25px 0}
+.card{background:linear-gradient(135deg,#27272acc,#18181bd9);border:1px solid var(--line);border-radius:19px;
+padding:19px;backdrop-filter:blur(10px);box-shadow:0 12px 40px #0003}.metric{font-size:28px;font-weight:850;
+margin-top:12px;background:linear-gradient(90deg,#e879f9,#f472b6);color:transparent;background-clip:text}
+.section{margin:25px 0}.section h2{font-size:18px}.row{display:flex;gap:10px;flex-wrap:wrap}
+input,textarea{width:100%;background:#09090b99;border:1px solid #ffffff20;color:#fff;padding:12px 13px;
+border-radius:11px;outline:none;font:inherit}textarea{min-height:110px;resize:vertical}.field{flex:1;min-width:220px}
+button{border:0;border-radius:11px;padding:11px 15px;color:white;font-weight:700;cursor:pointer;
+background:linear-gradient(100deg,#9333ea,#db2777);box-shadow:0 6px 20px #a21caf30}
+button.secondary{background:#ffffff12;border:1px solid var(--line);box-shadow:none}
+button.danger{background:linear-gradient(100deg,#be123c,#e11d48)}
+table{width:100%;border-collapse:collapse;min-width:650px}th,td{text-align:left;padding:13px 12px;
+border-bottom:1px solid var(--line)}th{color:#a1a1aa;font-weight:600}.tablewrap{overflow:auto;border:1px solid var(--line);
+border-radius:16px;background:#18181bd9}.avatar{display:inline-grid;place-items:center;width:30px;height:30px;
+border-radius:50%;background:linear-gradient(135deg,#9333ea,#ec4899);font-weight:800;margin-right:8px}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green);margin-right:6px}
+.dot.off{background:var(--red)}.hidden{display:none!important}.notice{margin-top:12px;color:#f0abfc;min-height:20px}
+.actions{display:flex;gap:7px;flex-wrap:wrap}.status{color:var(--green)}.status.off{color:var(--red)}
+@media(max-width:760px){.layout{display:block}aside{width:100%;padding:13px;border-right:0;border-bottom:1px solid var(--line)}
+.brand{margin:5px 8px 10px}.nav{display:inline-block;padding:9px 10px;margin:2px;font-size:13px}
+main{padding:19px 14px}h1{font-size:23px}.grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}
+.card{padding:14px}.metric{font-size:24px}.field{min-width:100%}}
+</style></head><body><div class="layout"><aside>
+<div class="brand">TITAN <b>ENTERPRISE</b></div>
+<a class="nav active" href="#overview">Обзор</a>
+<a class="nav" href="#settings">Мои настройки</a>
+<a class="nav admin-only hidden" href="#users">Пользователи</a>
+<a class="nav admin-only hidden" href="#audit">Журнал</a>
+<a class="nav" href="/logout">Выйти</a>
+</aside><main><div class="top"><div><h1 id="heading">Личный кабинет</h1>
+<div class="muted" id="identity">Загрузка профиля…</div></div><button class="secondary" onclick="load()">↻ Обновить</button></div>
+<div id="overview" class="grid">
+<div class="card">Подписка<div class="metric" id="subscription">—</div><div class="muted" id="expiry"></div></div>
+<div class="card">Отправлено<div class="metric" id="sent">—</div></div>
+<div class="card">Ошибки<div class="metric" id="errors">—</div></div>
+<div class="card">Процесс<div class="metric" id="job">—</div><div class="muted" id="queue"></div></div>
+<div class="card">Telegram-аккаунт<div class="metric" id="account">—</div><div class="muted">Статус привязки</div></div>
+</div>
+<div class="section" id="settings"><h2>Мои настройки</h2><div class="grid">
+<div class="card field"><b>Шаблоны уведомлений</b><p class="muted">Каждая строка — отдельный шаблон. Только для разрешённых получателей.</p>
+<textarea id="templates" placeholder="Текст уведомления"></textarea><br><br><button onclick="saveTemplates()">Сохранить шаблоны</button></div>
+<div class="card field"><b>Цели уведомлений</b><p class="muted">Указывайте только чаты, где у аккаунта есть право публикации.</p>
+<textarea id="targets" placeholder="@company_channel&#10;-100123456789"></textarea><br><br><button onclick="saveTargets()">Сохранить цели</button></div>
+</div><div class="row"><button onclick="jobAction('start')">Запустить</button>
+<button class="danger" onclick="jobAction('stop')">Остановить</button></div><div class="notice" id="notice"></div></div>
+<div class="section admin-only hidden" id="serverStats"><h2>Состояние сервера</h2>
+<div class="grid"><div class="card">RAM<div class="metric" id="ram">—</div></div>
+<div class="card">CPU<div class="metric" id="cpu">—</div></div>
+<div class="card">Активные клиенты<div class="metric" id="activeClients">—</div></div>
+<div class="card">В очереди<div class="metric" id="waitingClients">—</div></div></div></div>
+<div class="section admin-only hidden" id="users"><h2>Пользователи</h2><div class="tablewrap"><table>
+<thead><tr><th>Пользователь</th><th>Роль</th><th>Подписка</th><th>Отправки</th><th>Сессия</th><th>Процесс</th><th>Действия</th></tr></thead>
+<tbody id="userRows"></tbody></table></div></div>
+<div class="section admin-only hidden" id="audit"><h2>Журнал активности</h2><div class="tablewrap"><table>
+<thead><tr><th>Дата</th><th>ID</th><th>Действие</th><th>Детали</th></tr></thead><tbody id="auditRows"></tbody></table></div></div>
+</main></div>
+<script>
+let csrf='', role='USER';
+async function api(path,opts={}){const r=await fetch(path,{...opts,headers:{
+'Content-Type':'application/json','X-CSRF-Token':csrf,...(opts.headers||{})}});
+if(r.status===401){location.href='/';return null}const d=await r.json();if(!r.ok)throw Error(d.error||'Ошибка запроса');return d}
+function msg(s){document.getElementById('notice').textContent=s}
+async function load(){try{
+const p=await api('/api/me');if(!p)return;csrf=p.csrf;role=p.role;
+document.getElementById('identity').textContent=(p.username?'@'+p.username+' · ':'')+'ID '+p.user_id+' · '+p.role;
+document.getElementById('heading').textContent=role==='ADMIN'?'Панель администратора':'Личный кабинет';
+document.querySelectorAll('.admin-only').forEach(x=>x.classList.toggle('hidden',role!=='ADMIN'));
+document.getElementById('subscription').textContent=p.subscription_active?'АКТИВНА':'НЕ АКТИВНА';
+document.getElementById('expiry').textContent=p.subscription_until||'Срок не задан';
+document.getElementById('sent').textContent=p.stats.sent;
+document.getElementById('errors').textContent=p.stats.errors;
+document.getElementById('job').textContent=p.job_status;
+document.getElementById('account').textContent=p.has_session?'ПОДКЛЮЧЁН':'НЕ ПОДКЛЮЧЁН';
+document.getElementById('queue').textContent='Активно: '+p.pool.active+' / '+p.pool.maximum+' · ожидают: '+p.pool.waiting;
+document.getElementById('templates').value=p.templates.join('\\n');
+document.getElementById('targets').value=p.targets.join('\\n');
+if(role==='ADMIN')await loadAdmin();
+}catch(e){msg(e.message)}}
+async function saveTemplates(){try{await api('/api/templates',{method:'POST',body:JSON.stringify({text:document.getElementById('templates').value})});msg('Шаблоны сохранены')}catch(e){msg(e.message)}}
+async function saveTargets(){try{await api('/api/targets',{method:'POST',body:JSON.stringify({text:document.getElementById('targets').value})});msg('Цели сохранены')}catch(e){msg(e.message)}}
+async function jobAction(action){try{const r=await api('/api/job/'+action,{method:'POST',body:'{}'});msg(r.message);await load()}catch(e){msg(e.message)}}
+async function loadAdmin(){const stats=await api('/api/admin/stats');if(stats){
+document.getElementById('ram').textContent=stats.ram_mb==null?'н/д':stats.ram_mb+' MB';
+document.getElementById('cpu').textContent=stats.cpu_percent==null?'н/д':stats.cpu_percent+'%';
+document.getElementById('activeClients').textContent=stats.active_clients+' / '+stats.client_limit;
+document.getElementById('waitingClients').textContent=stats.waiting_clients;
+}
+const d=await api('/api/admin/users');if(!d)return;
+document.getElementById('userRows').innerHTML=d.users.map(u=>`<tr><td><span class="avatar">${esc((u.username||String(u.user_id))[0].toUpperCase())}</span>${esc(u.username||u.user_id)}<br><small>${u.user_id}</small></td><td>${u.role}</td><td>${esc(u.subscription_until||'—')}</td><td>${u.sent} / ${u.errors}</td><td><span class="dot ${u.has_session?'':'off'}"></span>${u.has_session?'Есть':'Нет'}</td><td>${esc(u.job_status)}</td><td><div class="actions"><button onclick="grant(${u.user_id},30)">+30 дней</button><button class="secondary" onclick="revoke(${u.user_id})">Закрыть</button></div></td></tr>`).join('');
+const a=await api('/api/admin/audit');document.getElementById('auditRows').innerHTML=a.items.map(x=>`<tr><td>${esc(x.created_at)}</td><td>${x.user_id}</td><td>${esc(x.action)}</td><td>${esc(x.details)}</td></tr>`).join('')}
+function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+async function grant(id,days){if(!confirm('Выдать подписку на '+days+' дней?'))return;try{await api('/api/admin/grant',{method:'POST',body:JSON.stringify({user_id:id,days})});await load()}catch(e){msg(e.message)}}
+async function revoke(id){if(!confirm('Закрыть доступ пользователю '+id+'?'))return;try{await api('/api/admin/revoke',{method:'POST',body:JSON.stringify({user_id:id})});await load()}catch(e){msg(e.message)}}
+load();setInterval(load,30000);
+</script></body></html>
 """
 
-def require_dashboard(fn):
-    @wraps(fn)
-    def wrapped(*args, **kwargs):
-        if not session.get("dashboard_admin"):
-            return jsonify({"error": "unauthorized"}), 401
-        return fn(*args, **kwargs)
-    return wrapped
+# -------------------- AUTH ROUTES --------------------
 
-@app.route("/")
-def index():
-    if not session.get("dashboard_admin"):
-        return redirect(url_for("login"))
+@app.get("/")
+def login_page():
+    return render_template_string(LOGIN_HTML, message="Откройте бота TITAN Enterprise, нажмите «Войти в панель» и перейдите по одноразовой ссылке из личного чата.")
+
+@app.get("/login")
+def consume_login():
+    raw = request.args.get("token", "")
+    if not raw or len(raw) > 200:
+        return render_template_string(LOGIN_HTML, message="Ссылка недействительна или уже использована."), 400
+    uid = run_async(db.consume_login_token(raw))
+    if not uid:
+        return render_template_string(LOGIN_HTML, message="Ссылка истекла или уже была использована."), 401
+    user = run_async(db.get_user(uid))
+    if not user or (not user["approved"] and user["role"] != "ADMIN"):
+        return render_template_string(LOGIN_HTML, message="Доступ к панели не активирован."), 403
+    sid = run_async(db.create_web_session(uid))
+    run_async(db.audit(uid, "WEB_LOGIN", "one-time Telegram token"))
+    response = redirect(url_for("dashboard"))
+    response.set_cookie("titan_sid", sid, max_age=SESSION_DAYS * 86400, httponly=True, secure=True, samesite="Lax", path="/")
+    return response
+
+@app.get("/dashboard")
+def dashboard():
+    if not load_user(): return redirect(url_for("login_page"))
     return render_template_string(DASHBOARD_HTML)
 
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    error = ""
-    if request.method == "POST":
-        if request.form.get("token", "") == DASHBOARD_TOKEN:
-            session["dashboard_admin"] = True
-            return redirect(url_for("index"))
-        error = "Неверный токен."
-    return render_template_string(LOGIN_HTML, error=error)
+@app.get("/admin")
+def admin_page():
+    user = load_user()
+    if not user: return redirect(url_for("login_page"))
+    if user["role"] != "ADMIN": return redirect(url_for("dashboard"))
+    return render_template_string(DASHBOARD_HTML)
 
-@app.route("/logout")
+@app.get("/logout")
 def logout():
+    raw = request.cookies.get("titan_sid", "")
+    if raw: run_async(db.delete_web_session(raw))
+    response = redirect(url_for("login_page"))
+    response.delete_cookie("titan_sid", path="/")
     session.clear()
-    return redirect(url_for("login"))
+    return response
 
-@app.route("/api/stats")
-@require_dashboard
-def api_stats():
-    async def get_data():
-        async with db.connect() as conn:
-            cur = await conn.execute("SELECT COUNT(*), SUM(CASE WHEN session_string!='' THEN 1 ELSE 0 END) FROM users")
-            users, sessions_count = await cur.fetchone()
-            cur = await conn.execute("SELECT sent,errors,revenue FROM metrics WHERE id=1")
-            sent, errors, revenue = await cur.fetchone()
-        return {"users": users or 0, "sessions": sessions_count or 0,
-                "sent": sent, "errors": errors, "revenue": revenue}
-    return jsonify(run_async(get_data()))
+# -------------------- USER API --------------------
 
-@app.route("/api/users")
-@require_dashboard
-def api_users():
+@app.get("/api/me")
+@login_required
+def api_me():
+    u = request.titan_user
+    uid = int(u["user_id"])
+    stats = run_async(db.stats(uid))
+    active = run_async(db.subscription_active(uid))
+    templates = json.loads(u["templates"] or "[]")
+    targets = json.loads(u["targets"] or "[]")
+    task = workers.get(uid)
+    job_status = "running" if task and not task.done() else "stopped"
+    session["csrf"] = session.get("csrf") or secrets.token_urlsafe(24)
+    return jsonify({
+        "user_id": uid, "username": u["username"], "role": u["role"],
+        "subscription_active": active, "subscription_until": u["subscription_until"],
+        "stats": stats, "templates": templates, "targets": targets,
+        "has_session": bool(u["session_string"]),
+        "job_status": job_status,
+        "pool": {"active": client_manager.active, "waiting": client_manager.waiting,
+                 "maximum": client_manager.maximum},
+        "csrf": session["csrf"]
+    })
+
+@app.post("/api/templates")
+@login_required
+@csrf_required
+def api_templates():
+    uid = int(request.titan_user["user_id"])
+    raw = (request.get_json(silent=True) or {}).get("text", "")
+    if not isinstance(raw, str) or len(raw) > 30000:
+        return jsonify({"error": "invalid_text"}), 400
+    values = list(dict.fromkeys(x.strip() for x in raw.splitlines() if x.strip()))
+    if len(values) > MAX_TEMPLATES:
+        return jsonify({"error": f"maximum_{MAX_TEMPLATES}_templates"}), 400
+    run_async(db.update_user_lists(uid, templates=values))
+    run_async(db.audit(uid, "TEMPLATES_UPDATED", str(len(values))))
+    return jsonify({"ok": True, "count": len(values)})
+
+@app.post("/api/targets")
+@login_required
+@csrf_required
+def api_targets():
+    uid = int(request.titan_user["user_id"])
+    raw = (request.get_json(silent=True) or {}).get("text", "")
+    if not isinstance(raw, str) or len(raw) > 10000:
+        return jsonify({"error": "invalid_text"}), 400
+    values = parse_targets(raw)
+    if not values: return jsonify({"error": "no_valid_targets"}), 400
+    run_async(db.update_user_lists(uid, targets=values))
+    run_async(db.audit(uid, "TARGETS_UPDATED", str(len(values))))
+    return jsonify({"ok": True, "count": len(values)})
+
+@app.post("/api/job/start")
+@login_required
+@csrf_required
+def api_job_start():
+    uid = int(request.titan_user["user_id"])
+    u = run_async(db.get_user(uid))
+    if not is_admin(uid) and not run_async(db.subscription_active(uid)):
+        return jsonify({"error": "subscription_inactive"}), 403
+    if not u["session_string"]: return jsonify({"error": "telegram_account_not_connected"}), 400
+    templates = json.loads(u["templates"] or "[]")
+    targets = json.loads(u["targets"] or "[]")
+    if not templates or not targets: return jsonify({"error": "add_templates_and_targets_first"}), 400
+    old = workers.get(uid)
+    if old and not old.done(): return jsonify({"error": "already_running"}), 409
+    stop_event = asyncio.Event()
+    worker_stops[uid] = stop_event
+    run_async(db.set_job_status(uid, "running"))
+    future = asyncio.run_coroutine_threadsafe(notification_worker(uid, stop_event), loop)
+    workers[uid] = future
+    run_async(db.audit(uid, "JOB_STARTED"))
+    return jsonify({"ok": True, "message": "Задача поставлена в очередь клиентов."})
+
+@app.post("/api/job/stop")
+@login_required
+@csrf_required
+def api_job_stop():
+    uid = int(request.titan_user["user_id"])
+    stop_event = worker_stops.get(uid)
+    if stop_event: loop.call_soon_threadsafe(stop_event.set)
+    run_async(db.audit(uid, "JOB_STOP_REQUESTED"))
+    return jsonify({"ok": True, "message": "Остановка запрошена."})
+
+# -------------------- ADMIN API --------------------
+
+@app.get("/api/admin/users")
+@admin_required
+def api_admin_users():
     rows = run_async(db.all_users())
-    return jsonify([{
-        "user_id": r["user_id"], "username": r["username"],
-        "subscription_until": r["subscription_until"],
-        "balance": r["balance"], "has_session": bool(r["session_string"])
-    } for r in rows])
+    return jsonify({"users": [dict(x) for x in rows]})
 
-@app.route("/api/audit")
-@require_dashboard
-def api_audit():
-    async def fetch():
-        async with db.connect() as conn:
-            conn.row_factory = aiosqlite.Row
-            cur = await conn.execute("SELECT * FROM audit ORDER BY id DESC LIMIT 200")
-            return [dict(r) for r in await cur.fetchall()]
-    return jsonify(run_async(fetch()))
+@app.get("/api/admin/audit")
+@admin_required
+def api_admin_audit():
+    return jsonify({"items": run_async(db.recent_audit(150))})
 
-@app.route("/api/grant", methods=["POST"])
-@require_dashboard
-def api_grant():
+@app.get("/api/admin/stats")
+@admin_required
+def api_admin_stats():
+    result = run_async(db.admin_stats())
+    result.update({
+        "active_clients": client_manager.active,
+        "waiting_clients": client_manager.waiting,
+        "client_limit": client_manager.maximum
+    })
+    if psutil:
+        try:
+            result["ram_mb"] = round(psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024, 1)
+            result["cpu_percent"] = psutil.cpu_percent(interval=None)
+        except Exception:
+            result["ram_mb"] = None
+            result["cpu_percent"] = None
+    else:
+        result["ram_mb"] = None
+        result["cpu_percent"] = None
+    return jsonify(result)
+
+@app.post("/api/admin/grant")
+@admin_required
+@csrf_required
+def api_admin_grant():
+    payload = request.get_json(silent=True) or {}
+    try:
+        uid = int(payload["user_id"])
+        days = int(payload.get("days", 30))
+    except (KeyError, ValueError, TypeError):
+        return jsonify({"error": "invalid_parameters"}), 400
+    expiry = run_async(db.grant_subscription(uid, days))
+    run_async(db.audit(request.titan_user["user_id"], "SUBSCRIPTION_GRANTED", f"{uid}:{expiry}"))
+    return jsonify({"ok": True, "subscription_until": expiry})
+
+@app.post("/api/admin/revoke")
+@admin_required
+@csrf_required
+def api_admin_revoke():
     payload = request.get_json(silent=True) or {}
     try:
         uid = int(payload["user_id"])
     except (KeyError, ValueError, TypeError):
-        return jsonify({"ok": False, "error": "invalid user_id"}), 400
-    expiry = run_async(db.grant_subscription(uid, 60))
-    run_async(db.audit(0, "WEB_SUBSCRIPTION_GRANTED", f"{uid}: {expiry}"))
-    return jsonify({"ok": True, "subscription_until": expiry})
+        return jsonify({"error": "invalid_user_id"}), 400
+    if uid in SUPER_ADMINS: return jsonify({"error": "cannot_revoke_super_admin"}), 403
+    run_async(db.set_approved(uid, False))
+    stop_event = worker_stops.get(uid)
+    if stop_event: loop.call_soon_threadsafe(stop_event.set)
+    run_async(db.audit(request.titan_user["user_id"], "USER_REVOKED", str(uid)))
+    return jsonify({"ok": True})
 
-@app.route("/export.csv")
-@require_dashboard
+@app.get("/export.csv")
+@admin_required
 def export_csv():
-    async def get_rows():
-        return await db.all_users()
-    rows = run_async(get_rows())
+    rows = run_async(db.all_users())
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["user_id", "username", "subscription_until", "balance", "has_session"])
-    for r in rows:
-        writer.writerow([r["user_id"], r["username"], r["subscription_until"],
-                         r["balance"], bool(r["session_string"])])
-    return Response(output.getvalue(), mimetype="text/csv",
-                    headers={"Content-Disposition": "attachment; filename=titan_users.csv"})
+    writer.writerow(["user_id", "username", "role", "approved", "subscription_until", "has_session", "sent", "errors"])
+    for row in rows:
+        writer.writerow([row["user_id"], row["username"], row["role"], row["approved"], row["subscription_until"], row["has_session"], row["sent"], row["errors"]])
+    return Response(output.getvalue(), mimetype="text/csv", headers={"Content-Disposition": "attachment; filename=titan_users.csv"})
 
+# -------------------- NOTIFICATION WORKER --------------------
 
-# Flask runs in a separate thread; bridge API coroutines to the bot's asyncio loop.
-def run_async(coro):
-    if loop is None:
-        raise RuntimeError("Async event loop is not ready")
-    future = asyncio.run_coroutine_threadsafe(coro, loop)
-    return future.result(timeout=20)
+async def notification_worker(uid, stop_event):
+    try:
+        while not stop_event.is_set():
+            user = await db.get_user(uid)
+            if not user or (not user["approved"] and user["role"] != "ADMIN"): break
+            if not is_admin(uid) and not await db.subscription_active(uid): break
+            templates = json.loads(user["templates"] or "[]")
+            targets = json.loads(user["targets"] or "[]")
+            if not templates or not targets or not user["session_string"]: break
+
+            for target in targets:
+                if stop_event.is_set(): break
+                message = templates[int(time.time()) % len(templates)]
+                try:
+                    async with client_manager.acquire(uid) as client:
+                        await client.send_message(target, message)
+                    await db.increment_stat(uid, "sent")
+                    await db.audit(uid, "NOTIFICATION_SENT", str(target))
+                except FloodWaitError as exc:
+                    await db.audit(uid, "TELEGRAM_FLOOD_WAIT", f"{exc.seconds}s")
+                    await asyncio.sleep(min(max(exc.seconds, 30), 3600))
+                    stop_event.set()
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    await db.increment_stat(uid, "errors")
+                    await db.audit(uid, "NOTIFICATION_ERROR", str(exc)[:350])
+
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=MIN_SEND_DELAY)
+                except asyncio.TimeoutError:
+                    pass
+        await db.set_job_status(uid, "stopped")
+    except asyncio.CancelledError:
+        await db.set_job_status(uid, "stopped")
+        raise
+    except Exception:
+        log.exception("Worker failed for user %s", uid)
+        await db.set_job_status(uid, "error")
+    finally:
+        worker_stops.pop(uid, None)
+        workers.pop(uid, None)
+
+# -------------------- STARTUP --------------------
 
 def run_web():
-    serve(app, host=WEB_HOST, port=WEB_PORT, threads=8)
-
-
-# ---------------- MAIN ----------------
+    serve(app, host=WEB_HOST, port=WEB_PORT, threads=4)
 
 async def main():
-    global db, loop
+    global db, loop, client_manager
     loop = asyncio.get_running_loop()
     db = Database(DB_PATH)
     await db.initialize()
+    client_manager = ClientManager(db, MAX_ACTIVE_CLIENTS)
 
-    web_thread = threading.Thread(target=run_web, daemon=True, name="titan-web")
-    web_thread.start()
-
+    threading.Thread(target=run_web, daemon=True, name="titan-web").start()
     await setup_bot()
-    print("TITAN Enterprise started.")
-    print(f"Dashboard: http://0.0.0.0:{WEB_PORT}")
+    log.info("TITAN Enterprise started on port %s; client limit=%s", WEB_PORT, MAX_ACTIVE_CLIENTS)
     await bot.run_until_disconnected()
-
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("TITAN Enterprise stopped.")
+        log.info("TITAN Enterprise stopped")
