@@ -665,10 +665,11 @@ def consume_login():
     if not user or (not user["approved"] and user["role"] != "ADMIN"):
         return render_template_string(LOGIN_HTML, message="Доступ к панели не активирован."), 403
     sid = run_async(db.create_web_session(uid))
-    run_async(db.audit(uid, "WEB_LOGIN", "one-time Telegram token"))
-    response = redirect(url_for("dashboard"))
-    response.set_cookie("titan_sid", sid, max_age=SESSION_DAYS * 86400, httponly=True, secure=True, samesite="Lax", path="/")
-    return response
+run_async(db.audit(uid, "WEB_LOGIN", "one-time Telegram token"))
+response = redirect(url_for("dashboard"))
+# ТУТ ИЗМЕНЕНО secure=False
+response.set_cookie("titan_sid", sid, max_age=SESSION_DAYS * 86400, httponly=True, secure=False, samesite="Lax", path="/")
+return response
 
 @app.get("/dashboard")
 def dashboard():
