@@ -1,5 +1,4 @@
-# TITAN Enterprise — compact Flask + Telethon + SQLite
-# Python 3.14
+# TITAN Enterprise — compact Flask + Telethon + SQLite (FULL FIXED v8.5)
 # Install: pip install telethon flask waitress aiosqlite psutil
 
 import os
@@ -37,7 +36,7 @@ except ImportError:
 
 API_ID = int(os.getenv("API_ID", "2040"))
 API_HASH = os.getenv("API_HASH", "b18441a1ff607e10a989891a5462e627")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8732669492:AAGjBx_kMW4JRpo4DyhCoRwAISSS-lJ1IhE")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8732669492:AAF6lfPEgcOp9iKzo74UGnPIPw9wfVa7YGo")
 FLASK_SECRET = os.getenv("FLASK_SECRET", "titan_secret_key_secure_1234567890")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 DB_PATH = os.getenv("DB_PATH", "titan_enterprise.db")
@@ -62,7 +61,7 @@ app = Flask(__name__)
 app.secret_key = FLASK_SECRET
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SECURE=True,
+    SESSION_COOKIE_SECURE=False, # ИСПРАВЛЕНО: False чтобы Cookie не слетали на телефоне
     SESSION_COOKIE_SAMESITE="Lax",
     PERMANENT_SESSION_LIFETIME=dt.timedelta(days=SESSION_DAYS),
     MAX_CONTENT_LENGTH=64 * 1024
@@ -103,7 +102,6 @@ class Database:
         self.path = path
 
     def connect(self):
-        # ИСПРАВЛЕНИЕ ДЛЯ PYTHON 3.14: убран async def
         return aiosqlite.connect(self.path, timeout=15)
 
     async def initialize(self):
@@ -196,14 +194,13 @@ class Database:
         return raw
 
     async def consume_login_token(self, raw):
-        # ИСПРАВЛЕНО: Теперь токен не сгорает при F5, и добавлены логи
         async with self.connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute("SELECT user_id, expires_at FROM login_tokens WHERE token_hash=?", (token_hash(raw),)) as cur:
                 row = await cur.fetchone()
             
             if not row:
-                log.warning("Токен не найден в базе!") # Если видишь это в логах - база не сохраняет
+                log.warning("Токен не найден в базе!")
                 return None
                 
             user_id = row["user_id"]
@@ -658,18 +655,21 @@ def consume_login():
     raw = request.args.get("token", "")
     if not raw or len(raw) > 200:
         return render_template_string(LOGIN_HTML, message="Ссылка недействительна."), 400
+    
     uid = run_async(db.consume_login_token(raw))
     if not uid:
         return render_template_string(LOGIN_HTML, message="Ссылка истекла или уже была использована."), 401
+    
     user = run_async(db.get_user(uid))
     if not user or (not user["approved"] and user["role"] != "ADMIN"):
         return render_template_string(LOGIN_HTML, message="Доступ к панели не активирован."), 403
+    
     sid = run_async(db.create_web_session(uid))
-run_async(db.audit(uid, "WEB_LOGIN", "one-time Telegram token"))
-response = redirect(url_for("dashboard"))
-# ТУТ ИЗМЕНЕНО secure=False
-response.set_cookie("titan_sid", sid, max_age=SESSION_DAYS * 86400, httponly=True, secure=False, samesite="Lax", path="/")
-return response
+    run_async(db.audit(uid, "WEB_LOGIN", "one-time Telegram token"))
+    
+    response = redirect(url_for("dashboard"))
+    response.set_cookie("titan_sid", sid, max_age=SESSION_DAYS * 86400, httponly=True, secure=False, samesite="Lax", path="/")
+    return response
 
 @app.get("/dashboard")
 def dashboard():
