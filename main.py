@@ -1,10 +1,6 @@
-# TITAN Enterprise — compact Flask + Telethon + SQLite (Fixed for Python 3.14)
-#
-# Install:
-#   pip install telethon flask waitress aiosqlite psutil
-#
-# Required env variables: API_ID, API_HASH, BOT_TOKEN, FLASK_SECRET
-# Optional: SUPER_ADMINS, PUBLIC_BASE_URL, DB_PATH, MAX_ACTIVE_CLIENTS
+# TITAN Enterprise — compact Flask + Telethon + SQLite
+# Python 3.14
+# Install: pip install telethon flask waitress aiosqlite psutil
 
 import os
 import re
@@ -37,7 +33,6 @@ try:
 except ImportError:
     psutil = None
 
-
 # -------------------- CONFIG --------------------
 
 API_ID = int(os.getenv("API_ID", "2040"))
@@ -60,16 +55,7 @@ MAX_TEMPLATES = 100
 MIN_SEND_DELAY = 10
 MAX_SEND_DELAY = 300
 
-if not API_ID or not API_HASH or not BOT_TOKEN or len(FLASK_SECRET) < 32:
-    raise RuntimeError(
-        "Set API_ID, API_HASH, BOT_TOKEN and FLASK_SECRET "
-        "(FLASK_SECRET must contain at least 32 characters)."
-    )
-
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-)
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("titan")
 
 app = Flask(__name__)
@@ -91,52 +77,33 @@ worker_stops = {}
 bot_states = {}
 phone_flows = {}
 
-
-def utcnow():
-    return dt.datetime.now(dt.timezone.utc)
-
-
-def iso_now():
-    return utcnow().isoformat()
-
-
-def is_admin(uid):
-    return int(uid) in SUPER_ADMINS
-
-
-def token_hash(value):
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
-
+def utcnow(): return dt.datetime.now(dt.timezone.utc)
+def iso_now(): return utcnow().isoformat()
+def is_admin(uid): return int(uid) in SUPER_ADMINS
+def token_hash(value): return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 def parse_targets(raw):
     result = []
     for line in raw.splitlines():
         item = line.strip()
-        if not item:
-            continue
+        if not item: continue
         item = re.sub(r"^https?://t\.me/", "", item).strip("/")
         item = re.sub(r"\?.*$", "", item)
-        if item.startswith("@"):
-            target = item
-        elif re.fullmatch(r"[A-Za-z0-9_]{5,}", item):
-            target = "@" + item
-        elif re.fullmatch(r"-?\d+", item):
-            target = int(item)
-        else:
-            continue
-        if target not in result:
-            result.append(target)
+        if item.startswith("@"): target = item
+        elif re.fullmatch(r"[A-Za-z0-9_]{5,}", item): target = "@" + item
+        elif re.fullmatch(r"-?\d+", item): target = int(item)
+        else: continue
+        if target not in result: result.append(target)
     return result[:MAX_TARGETS]
 
-
-# -------------------- DATABASE (FIXED FOR PY 3.14) --------------------
+# -------------------- DATABASE --------------------
 
 class Database:
     def __init__(self, path):
         self.path = path
 
-    # FIX: Removed `async def`, just return the connection context manager
     def connect(self):
+        # ИСПРАВЛЕНИЕ ДЛЯ PYTHON 3.14: убран async def
         return aiosqlite.connect(self.path, timeout=15)
 
     async def initialize(self):
@@ -146,54 +113,38 @@ class Database:
             await db.execute("PRAGMA busy_timeout=15000")
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS users(
-                    user_id INTEGER PRIMARY KEY,
-                    username TEXT NOT NULL DEFAULT '',
-                    role TEXT NOT NULL DEFAULT 'USER',
-                    approved INTEGER NOT NULL DEFAULT 0,
-                    session_string TEXT NOT NULL DEFAULT '',
-                    subscription_until TEXT NOT NULL DEFAULT '',
-                    templates TEXT NOT NULL DEFAULT '[]',
-                    targets TEXT NOT NULL DEFAULT '[]',
-                    created_at TEXT NOT NULL
+                    user_id INTEGER PRIMARY KEY, username TEXT NOT NULL DEFAULT '',
+                    role TEXT NOT NULL DEFAULT 'USER', approved INTEGER NOT NULL DEFAULT 0,
+                    session_string TEXT NOT NULL DEFAULT '', subscription_until TEXT NOT NULL DEFAULT '',
+                    templates TEXT NOT NULL DEFAULT '[]', targets TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL
                 )
             """)
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS login_tokens(
-                    token_hash TEXT PRIMARY KEY,
-                    user_id INTEGER NOT NULL,
-                    expires_at REAL NOT NULL,
-                    created_at TEXT NOT NULL
+                    token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL,
+                    expires_at REAL NOT NULL, created_at TEXT NOT NULL
                 )
             """)
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS web_sessions(
-                    sid_hash TEXT PRIMARY KEY,
-                    user_id INTEGER NOT NULL,
-                    expires_at REAL NOT NULL,
-                    created_at TEXT NOT NULL
+                    sid_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL,
+                    expires_at REAL NOT NULL, created_at TEXT NOT NULL
                 )
             """)
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS user_stats(
-                    user_id INTEGER PRIMARY KEY,
-                    sent INTEGER NOT NULL DEFAULT 0,
-                    errors INTEGER NOT NULL DEFAULT 0
+                    user_id INTEGER PRIMARY KEY, sent INTEGER NOT NULL DEFAULT 0, errors INTEGER NOT NULL DEFAULT 0
                 )
             """)
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS audit(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    action TEXT NOT NULL,
-                    details TEXT NOT NULL DEFAULT '',
-                    created_at TEXT NOT NULL
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+                    action TEXT NOT NULL, details TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
                 )
             """)
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS runtime_jobs(
-                    user_id INTEGER PRIMARY KEY,
-                    status TEXT NOT NULL DEFAULT 'stopped',
-                    updated_at TEXT NOT NULL
+                    user_id INTEGER PRIMARY KEY, status TEXT NOT NULL DEFAULT 'stopped', updated_at TEXT NOT NULL
                 )
             """)
             await db.commit()
@@ -202,26 +153,18 @@ class Database:
             for uid in SUPER_ADMINS:
                 await db.execute("""
                     INSERT INTO users(user_id, role, approved, created_at)
-                    VALUES(?, 'ADMIN', 1, ?)
-                    ON CONFLICT(user_id) DO UPDATE SET role='ADMIN', approved=1
+                    VALUES(?, 'ADMIN', 1, ?) ON CONFLICT(user_id) DO UPDATE SET role='ADMIN', approved=1
                 """, (uid, iso_now()))
-                await db.execute(
-                    "INSERT OR IGNORE INTO user_stats(user_id) VALUES(?)", (uid,)
-                )
+                await db.execute("INSERT OR IGNORE INTO user_stats(user_id) VALUES(?)", (uid,))
             await db.commit()
 
     async def ensure_user(self, uid, username=""):
         async with self.connect() as db:
             await db.execute("""
-                INSERT INTO users(user_id, username, created_at)
-                VALUES(?,?,?)
-                ON CONFLICT(user_id) DO UPDATE SET
-                    username=CASE WHEN excluded.username!=''
-                                  THEN excluded.username ELSE users.username END
+                INSERT INTO users(user_id, username, created_at) VALUES(?,?,?)
+                ON CONFLICT(user_id) DO UPDATE SET username=CASE WHEN excluded.username!='' THEN excluded.username ELSE users.username END
             """, (int(uid), username or "", iso_now()))
-            await db.execute(
-                "INSERT OR IGNORE INTO user_stats(user_id) VALUES(?)", (int(uid),)
-            )
+            await db.execute("INSERT OR IGNORE INTO user_stats(user_id) VALUES(?)", (int(uid),))
             await db.commit()
 
     async def get_user(self, uid):
@@ -247,47 +190,49 @@ class Database:
         raw = secrets.token_urlsafe(32)
         async with self.connect() as db:
             await db.execute("DELETE FROM login_tokens WHERE expires_at<?", (time.time(),))
-            await db.execute(
-                "INSERT INTO login_tokens(token_hash,user_id,expires_at,created_at) VALUES(?,?,?,?)",
-                (token_hash(raw), int(uid), time.time() + LOGIN_TOKEN_TTL, iso_now())
-            )
+            await db.execute("INSERT INTO login_tokens(token_hash,user_id,expires_at,created_at) VALUES(?,?,?,?)",
+                (token_hash(raw), int(uid), time.time() + LOGIN_TOKEN_TTL, iso_now()))
             await db.commit()
         return raw
 
     async def consume_login_token(self, raw):
+        # ИСПРАВЛЕНО: Теперь токен не сгорает при F5, и добавлены логи
         async with self.connect() as db:
-            await db.execute("BEGIN IMMEDIATE")
-            cur = await db.execute("""
-                SELECT user_id FROM login_tokens
-                WHERE token_hash=? AND expires_at>?
-            """, (token_hash(raw), time.time()))
-            row = await cur.fetchone()
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT user_id, expires_at FROM login_tokens WHERE token_hash=?", (token_hash(raw),)) as cur:
+                row = await cur.fetchone()
+            
             if not row:
-                await db.rollback()
+                log.warning("Токен не найден в базе!") # Если видишь это в логах - база не сохраняет
                 return None
+                
+            user_id = row["user_id"]
+            expires_at = row["expires_at"]
+            
+            if time.time() > expires_at:
+                log.warning(f"Токен истек по времени для юзера {user_id}!")
+                await db.execute("DELETE FROM login_tokens WHERE token_hash=?", (token_hash(raw),))
+                await db.commit()
+                return None
+                
             await db.execute("DELETE FROM login_tokens WHERE token_hash=?", (token_hash(raw),))
             await db.commit()
-            return int(row[0])
+            log.info(f"Успешный вход в панель для юзера {user_id}")
+            return int(user_id)
 
     async def create_web_session(self, uid):
         raw = secrets.token_urlsafe(40)
         async with self.connect() as db:
             await db.execute("DELETE FROM web_sessions WHERE expires_at<?", (time.time(),))
-            await db.execute(
-                "INSERT INTO web_sessions(sid_hash,user_id,expires_at,created_at) VALUES(?,?,?,?)",
-                (token_hash(raw), int(uid), time.time() + SESSION_DAYS * 86400, iso_now())
-            )
+            await db.execute("INSERT INTO web_sessions(sid_hash,user_id,expires_at,created_at) VALUES(?,?,?,?)",
+                (token_hash(raw), int(uid), time.time() + SESSION_DAYS * 86400, iso_now()))
             await db.commit()
         return raw
 
     async def get_web_session(self, raw):
-        if not raw:
-            return None
+        if not raw: return None
         async with self.connect() as db:
-            cur = await db.execute("""
-                SELECT user_id FROM web_sessions
-                WHERE sid_hash=? AND expires_at>?
-            """, (token_hash(raw), time.time()))
+            cur = await db.execute("SELECT user_id FROM web_sessions WHERE sid_hash=? AND expires_at>?", (token_hash(raw), time.time()))
             row = await cur.fetchone()
             return int(row[0]) if row else None
 
@@ -299,61 +244,41 @@ class Database:
 
     async def audit(self, uid, action, details=""):
         async with self.connect() as db:
-            await db.execute(
-                "INSERT INTO audit(user_id,action,details,created_at) VALUES(?,?,?,?)",
-                (int(uid), action[:80], str(details)[:500], iso_now())
-            )
+            await db.execute("INSERT INTO audit(user_id,action,details,created_at) VALUES(?,?,?,?)",
+                (int(uid), action[:80], str(details)[:500], iso_now()))
             await db.commit()
 
     async def update_user_lists(self, uid, templates=None, targets=None):
         async with self.connect() as db:
             if templates is not None:
-                await db.execute(
-                    "UPDATE users SET templates=? WHERE user_id=?",
-                    (json.dumps(templates, ensure_ascii=False), int(uid))
-                )
+                await db.execute("UPDATE users SET templates=? WHERE user_id=?", (json.dumps(templates, ensure_ascii=False), int(uid)))
             if targets is not None:
-                await db.execute(
-                    "UPDATE users SET targets=? WHERE user_id=?",
-                    (json.dumps(targets, ensure_ascii=False), int(uid))
-                )
+                await db.execute("UPDATE users SET targets=? WHERE user_id=?", (json.dumps(targets, ensure_ascii=False), int(uid)))
             await db.commit()
 
     async def set_session(self, uid, value):
         async with self.connect() as db:
-            await db.execute(
-                "UPDATE users SET session_string=? WHERE user_id=?", (value, int(uid))
-            )
+            await db.execute("UPDATE users SET session_string=? WHERE user_id=?", (value, int(uid)))
             await db.commit()
 
     async def stats(self, uid):
         async with self.connect() as db:
-            cur = await db.execute(
-                "SELECT sent,errors FROM user_stats WHERE user_id=?", (int(uid),)
-            )
+            cur = await db.execute("SELECT sent,errors FROM user_stats WHERE user_id=?", (int(uid),))
             row = await cur.fetchone()
             return {"sent": row[0], "errors": row[1]} if row else {"sent": 0, "errors": 0}
 
     async def increment_stat(self, uid, column):
-        if column not in ("sent", "errors"):
-            return
+        if column not in ("sent", "errors"): return
         async with self.connect() as db:
-            await db.execute(
-                f"INSERT OR IGNORE INTO user_stats(user_id) VALUES(?)", (int(uid),)
-            )
-            await db.execute(
-                f"UPDATE user_stats SET {column}={column}+1 WHERE user_id=?", (int(uid),)
-            )
+            await db.execute("INSERT OR IGNORE INTO user_stats(user_id) VALUES(?)", (int(uid),))
+            await db.execute(f"UPDATE user_stats SET {column}={column}+1 WHERE user_id=?", (int(uid),))
             await db.commit()
 
     async def subscription_active(self, uid):
         row = await self.get_user(uid)
-        if not row or not row["subscription_until"]:
-            return False
-        try:
-            return dt.datetime.fromisoformat(row["subscription_until"]) > utcnow()
-        except ValueError:
-            return False
+        if not row or not row["subscription_until"]: return False
+        try: return dt.datetime.fromisoformat(row["subscription_until"]) > utcnow()
+        except ValueError: return False
 
     async def grant_subscription(self, uid, days=30):
         await self.ensure_user(uid)
@@ -362,51 +287,34 @@ class Database:
         if row and row["subscription_until"]:
             try:
                 previous = dt.datetime.fromisoformat(row["subscription_until"])
-                if previous > start:
-                    start = previous
-            except ValueError:
-                pass
+                if previous > start: start = previous
+            except ValueError: pass
         expiry = (start + dt.timedelta(days=max(1, min(3650, int(days))))).isoformat()
         async with self.connect() as db:
-            await db.execute(
-                "UPDATE users SET approved=1,subscription_until=? WHERE user_id=?",
-                (expiry, int(uid))
-            )
+            await db.execute("UPDATE users SET approved=1,subscription_until=? WHERE user_id=?", (expiry, int(uid)))
             await db.commit()
         return expiry
 
     async def set_approved(self, uid, enabled):
         await self.ensure_user(uid)
         async with self.connect() as db:
-            await db.execute(
-                "UPDATE users SET approved=? WHERE user_id=?", (int(enabled), int(uid))
-            )
+            await db.execute("UPDATE users SET approved=? WHERE user_id=?", (int(enabled), int(uid)))
             await db.commit()
 
     async def admin_stats(self):
         async with self.connect() as db:
-            cur = await db.execute("""
-                SELECT COUNT(*),
-                       SUM(CASE WHEN session_string!='' THEN 1 ELSE 0 END)
-                FROM users
-            """)
+            cur = await db.execute("SELECT COUNT(*), SUM(CASE WHEN session_string!='' THEN 1 ELSE 0 END) FROM users")
             users, sessions = await cur.fetchone()
             cur = await db.execute("SELECT COALESCE(SUM(sent),0),COALESCE(SUM(errors),0) FROM user_stats")
             sent, errors = await cur.fetchone()
             cur = await db.execute("SELECT COUNT(*) FROM runtime_jobs WHERE status='running'")
             running = (await cur.fetchone())[0]
-            return {
-                "users": users or 0, "saved_sessions": sessions or 0,
-                "sent": sent or 0, "errors": errors or 0, "running_jobs": running
-            }
+            return {"users": users or 0, "saved_sessions": sessions or 0, "sent": sent or 0, "errors": errors or 0, "running_jobs": running}
 
     async def recent_audit(self, limit=100):
         async with self.connect() as db:
             db.row_factory = aiosqlite.Row
-            cur = await db.execute(
-                "SELECT user_id,action,details,created_at FROM audit ORDER BY id DESC LIMIT ?",
-                (max(1, min(300, int(limit))),)
-            )
+            cur = await db.execute("SELECT user_id,action,details,created_at FROM audit ORDER BY id DESC LIMIT ?", (max(1, min(300, int(limit))),))
             return [dict(x) for x in await cur.fetchall()]
 
     async def set_job_status(self, uid, status):
@@ -416,7 +324,6 @@ class Database:
                 ON CONFLICT(user_id) DO UPDATE SET status=excluded.status,updated_at=excluded.updated_at
             """, (int(uid), status, iso_now()))
             await db.commit()
-
 
 # -------------------- LIMITED TELETHON CLIENT POOL --------------------
 
@@ -435,31 +342,23 @@ class ClientManager:
         await self.semaphore.acquire()
         self.waiting -= 1
         client = None
-        async with self._lock:
-            self.active += 1
+        async with self._lock: self.active += 1
         try:
             row = await self.database.get_user(uid)
-            if not row or not row["session_string"]:
-                raise RuntimeError("Telegram-аккаунт не подключён")
+            if not row or not row["session_string"]: raise RuntimeError("Telegram-аккаунт не подключён")
             client = TelegramClient(
                 StringSession(row["session_string"]), API_ID, API_HASH,
-                connection_retries=1, request_retries=1, timeout=15,
-                auto_reconnect=False
+                connection_retries=1, request_retries=1, timeout=15, auto_reconnect=False
             )
             await client.connect()
-            if not await client.is_user_authorized():
-                raise RuntimeError("Сессия Telegram недействительна")
+            if not await client.is_user_authorized(): raise RuntimeError("Сессия Telegram недействительна")
             yield client
         finally:
             if client is not None:
-                try:
-                    await client.disconnect()
-                except Exception:
-                    log.warning("Client disconnect failed for user %s", uid)
-            async with self._lock:
-                self.active = max(0, self.active - 1)
+                try: await client.disconnect()
+                except Exception: log.warning("Client disconnect failed for user %s", uid)
+            async with self._lock: self.active = max(0, self.active - 1)
             self.semaphore.release()
-
 
 # -------------------- BOT AUTH / ACCOUNT LOGIN --------------------
 
@@ -567,7 +466,6 @@ async def setup_bot():
             phone_flows.pop(uid, None)
             bot_states.pop(uid, None)
             await event.respond(f"Ошибка: {str(exc)[:180]}")
-
     return bot
 
 # -------------------- FLASK AUTH HELPERS --------------------
@@ -575,10 +473,8 @@ async def setup_bot():
 def run_async(coro, timeout=25):
     if loop is None: raise RuntimeError("Async loop is not ready")
     future = asyncio.run_coroutine_threadsafe(coro, loop)
-    try:
-        return future.result(timeout=timeout)
-    except TimeoutError:
-        return None
+    try: return future.result(timeout=timeout)
+    except TimeoutError: return None
 
 def current_user_id():
     raw = request.cookies.get("titan_sid", "")
@@ -614,8 +510,7 @@ def csrf_required(fn):
     def wrapper(*args, **kwargs):
         expected = session.get("csrf")
         supplied = request.headers.get("X-CSRF-Token", "")
-        if not expected or not hmac.compare_digest(expected, supplied):
-            return jsonify({"error": "csrf"}), 400
+        if not expected or not hmac.compare_digest(expected, supplied): return jsonify({"error": "csrf"}), 400
         return fn(*args, **kwargs)
     return wrapper
 
@@ -752,7 +647,7 @@ load();setInterval(load,30000);
 </script></body></html>
 """
 
-# -------------------- AUTH ROUTES --------------------
+# -------------------- ROUTES --------------------
 
 @app.get("/")
 def login_page():
@@ -762,7 +657,7 @@ def login_page():
 def consume_login():
     raw = request.args.get("token", "")
     if not raw or len(raw) > 200:
-        return render_template_string(LOGIN_HTML, message="Ссылка недействительна или уже использована."), 400
+        return render_template_string(LOGIN_HTML, message="Ссылка недействительна."), 400
     uid = run_async(db.consume_login_token(raw))
     if not uid:
         return render_template_string(LOGIN_HTML, message="Ссылка истекла или уже была использована."), 401
@@ -796,8 +691,6 @@ def logout():
     session.clear()
     return response
 
-# -------------------- USER API --------------------
-
 @app.get("/api/me")
 @login_required
 def api_me():
@@ -814,10 +707,8 @@ def api_me():
         "user_id": uid, "username": u["username"], "role": u["role"],
         "subscription_active": active, "subscription_until": u["subscription_until"],
         "stats": stats, "templates": templates, "targets": targets,
-        "has_session": bool(u["session_string"]),
-        "job_status": job_status,
-        "pool": {"active": client_manager.active, "waiting": client_manager.waiting,
-                 "maximum": client_manager.maximum},
+        "has_session": bool(u["session_string"]), "job_status": job_status,
+        "pool": {"active": client_manager.active, "waiting": client_manager.waiting, "maximum": client_manager.maximum},
         "csrf": session["csrf"]
     })
 
@@ -827,11 +718,9 @@ def api_me():
 def api_templates():
     uid = int(request.titan_user["user_id"])
     raw = (request.get_json(silent=True) or {}).get("text", "")
-    if not isinstance(raw, str) or len(raw) > 30000:
-        return jsonify({"error": "invalid_text"}), 400
+    if not isinstance(raw, str) or len(raw) > 30000: return jsonify({"error": "invalid_text"}), 400
     values = list(dict.fromkeys(x.strip() for x in raw.splitlines() if x.strip()))
-    if len(values) > MAX_TEMPLATES:
-        return jsonify({"error": f"maximum_{MAX_TEMPLATES}_templates"}), 400
+    if len(values) > MAX_TEMPLATES: return jsonify({"error": f"maximum_{MAX_TEMPLATES}_templates"}), 400
     run_async(db.update_user_lists(uid, templates=values))
     run_async(db.audit(uid, "TEMPLATES_UPDATED", str(len(values))))
     return jsonify({"ok": True, "count": len(values)})
@@ -842,8 +731,7 @@ def api_templates():
 def api_targets():
     uid = int(request.titan_user["user_id"])
     raw = (request.get_json(silent=True) or {}).get("text", "")
-    if not isinstance(raw, str) or len(raw) > 10000:
-        return jsonify({"error": "invalid_text"}), 400
+    if not isinstance(raw, str) or len(raw) > 10000: return jsonify({"error": "invalid_text"}), 400
     values = parse_targets(raw)
     if not values: return jsonify({"error": "no_valid_targets"}), 400
     run_async(db.update_user_lists(uid, targets=values))
@@ -856,8 +744,7 @@ def api_targets():
 def api_job_start():
     uid = int(request.titan_user["user_id"])
     u = run_async(db.get_user(uid))
-    if not is_admin(uid) and not run_async(db.subscription_active(uid)):
-        return jsonify({"error": "subscription_inactive"}), 403
+    if not is_admin(uid) and not run_async(db.subscription_active(uid)): return jsonify({"error": "subscription_inactive"}), 403
     if not u["session_string"]: return jsonify({"error": "telegram_account_not_connected"}), 400
     templates = json.loads(u["templates"] or "[]")
     targets = json.loads(u["targets"] or "[]")
@@ -882,38 +769,25 @@ def api_job_stop():
     run_async(db.audit(uid, "JOB_STOP_REQUESTED"))
     return jsonify({"ok": True, "message": "Остановка запрошена."})
 
-# -------------------- ADMIN API --------------------
-
 @app.get("/api/admin/users")
 @admin_required
-def api_admin_users():
-    rows = run_async(db.all_users())
-    return jsonify({"users": [dict(x) for x in rows]})
+def api_admin_users(): return jsonify({"users": [dict(x) for x in run_async(db.all_users())]})
 
 @app.get("/api/admin/audit")
 @admin_required
-def api_admin_audit():
-    return jsonify({"items": run_async(db.recent_audit(150))})
+def api_admin_audit(): return jsonify({"items": run_async(db.recent_audit(150))})
 
 @app.get("/api/admin/stats")
 @admin_required
 def api_admin_stats():
     result = run_async(db.admin_stats())
-    result.update({
-        "active_clients": client_manager.active,
-        "waiting_clients": client_manager.waiting,
-        "client_limit": client_manager.maximum
-    })
+    result.update({"active_clients": client_manager.active, "waiting_clients": client_manager.waiting, "client_limit": client_manager.maximum})
     if psutil:
         try:
             result["ram_mb"] = round(psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024, 1)
             result["cpu_percent"] = psutil.cpu_percent(interval=None)
-        except Exception:
-            result["ram_mb"] = None
-            result["cpu_percent"] = None
-    else:
-        result["ram_mb"] = None
-        result["cpu_percent"] = None
+        except Exception: result["ram_mb"], result["cpu_percent"] = None, None
+    else: result["ram_mb"], result["cpu_percent"] = None, None
     return jsonify(result)
 
 @app.post("/api/admin/grant")
@@ -921,11 +795,8 @@ def api_admin_stats():
 @csrf_required
 def api_admin_grant():
     payload = request.get_json(silent=True) or {}
-    try:
-        uid = int(payload["user_id"])
-        days = int(payload.get("days", 30))
-    except (KeyError, ValueError, TypeError):
-        return jsonify({"error": "invalid_parameters"}), 400
+    try: uid, days = int(payload["user_id"]), int(payload.get("days", 30))
+    except (KeyError, ValueError, TypeError): return jsonify({"error": "invalid_parameters"}), 400
     expiry = run_async(db.grant_subscription(uid, days))
     run_async(db.audit(request.titan_user["user_id"], "SUBSCRIPTION_GRANTED", f"{uid}:{expiry}"))
     return jsonify({"ok": True, "subscription_until": expiry})
@@ -935,10 +806,8 @@ def api_admin_grant():
 @csrf_required
 def api_admin_revoke():
     payload = request.get_json(silent=True) or {}
-    try:
-        uid = int(payload["user_id"])
-    except (KeyError, ValueError, TypeError):
-        return jsonify({"error": "invalid_user_id"}), 400
+    try: uid = int(payload["user_id"])
+    except (KeyError, ValueError, TypeError): return jsonify({"error": "invalid_user_id"}), 400
     if uid in SUPER_ADMINS: return jsonify({"error": "cannot_revoke_super_admin"}), 403
     run_async(db.set_approved(uid, False))
     stop_event = worker_stops.get(uid)
@@ -982,16 +851,13 @@ async def notification_worker(uid, stop_event):
                     await asyncio.sleep(min(max(exc.seconds, 30), 3600))
                     stop_event.set()
                     break
-                except asyncio.CancelledError:
-                    raise
+                except asyncio.CancelledError: raise
                 except Exception as exc:
                     await db.increment_stat(uid, "errors")
                     await db.audit(uid, "NOTIFICATION_ERROR", str(exc)[:350])
 
-                try:
-                    await asyncio.wait_for(stop_event.wait(), timeout=MIN_SEND_DELAY)
-                except asyncio.TimeoutError:
-                    pass
+                try: await asyncio.wait_for(stop_event.wait(), timeout=MIN_SEND_DELAY)
+                except asyncio.TimeoutError: pass
         await db.set_job_status(uid, "stopped")
     except asyncio.CancelledError:
         await db.set_job_status(uid, "stopped")
@@ -1021,7 +887,5 @@ async def main():
     await bot.run_until_disconnected()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        log.info("TITAN Enterprise stopped")
+    try: asyncio.run(main())
+    except KeyboardInterrupt: log.info("TITAN Enterprise stopped")
