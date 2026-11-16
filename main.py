@@ -1,4 +1,4 @@
-# TITAN Enterprise — compact Flask + Telethon + SQLite (FULL FIXED v10.1)
+# TITAN Enterprise — compact Flask + Telethon + SQLite (FULL FIXED v10.2)
 # Install: pip install telethon flask waitress aiosqlite psutil aiohttp
 
 import os
@@ -59,6 +59,7 @@ LOGIN_TOKEN_TTL = 24 * 60 * 60
 SESSION_DAYS = 14
 MAX_TARGETS = 9999
 MAX_TEMPLATES = 9999
+MARKUP_RUB = 50 # Наценка
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("titan")
@@ -79,6 +80,7 @@ loop = None
 client_manager = None
 workers = {}
 worker_stops = {}
+bot_states = {}
 phone_flows = {}
 qr_flows = {}
 
@@ -355,6 +357,29 @@ class Database:
             await db.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
             await db.commit()
 
+    async def create_order(self, uid, item_id, country, price_buy, price_sell):
+        async with self.connect() as db:
+            cur = await db.execute("""
+                INSERT INTO shop_orders(user_id,item_id,country,price_buy,price_sell,status,created_at)
+                VALUES(?,?,?,?,?,'pending',?)
+            """, (int(uid), str(item_id), country, price_buy, price_sell, iso_now()))
+            await db.commit()
+            return cur.lastrowid
+
+    async def update_order(self, order_id, status, data=""):
+        async with self.connect() as db:
+            await db.execute("UPDATE shop_orders SET status=?, data=? WHERE id=?", (status, str(data), int(order_id)))
+            await db.commit()
+
+    async def get_orders(self, uid=None):
+        async with self.connect() as db:
+            db.row_factory = aiosqlite.Row
+            if uid:
+                cur = await db.execute("SELECT * FROM shop_orders WHERE user_id=? ORDER BY id DESC", (int(uid),))
+            else:
+                cur = await db.execute("SELECT * FROM shop_orders ORDER BY id DESC LIMIT 100")
+            return await cur.fetchall()
+
 # -------------------- LIMITED TELETHON CLIENT POOL --------------------
 
 class ClientManager:
@@ -390,13 +415,16 @@ class ClientManager:
             async with self._lock: self.active = max(0, self.active - 1)
             self.semaphore.release()
 
-# -------------------- BOT AUTH / ACCOUNT LOGIN --------------------
+# -------------------- BOT LOGIC --------------------
 
-def bot_menu(uid):
-    return [
-        [Button.inline("🌐 Войти в панель", b"web_login")],
-        [Button.inline("📱 Подключить аккаунт", b"connect_account")]
+def bot_main_menu(uid):
+    rows = [
+        [Button.inline("🌐 Веб-панель", b"web_login")],
+        [Button.inline("📱 Подключить аккаунт", b"connect_account")],
+        [Button.inline("🛒 Магазин аккаунтов", b"bot_shop")],
+        [Button.inline("ℹ️ Помощь", b"bot_help")]
     ]
+    return rows
 
 async def issue_web_login(event):
     uid = int(event.sender_id)
@@ -428,22 +456,100 @@ async def setup_bot():
         if not user["approved"] and not is_admin(event.sender_id):
             await event.respond(f"Доступ не активирован.\nВаш ID: {event.sender_id}")
             return
-        await event.respond("TITAN Enterprise\nЛичный кабинет и управление уведомлениями.", buttons=bot_menu(event.sender_id))
+        await event.respond("TITAN Enterprise\nУправление ботом и магазин аккаунтов.", buttons=bot_main_menu(event.sender_id))
 
     @bot.on(events.CallbackQuery)
     async def callback_handler(event):
         uid = int(event.sender_id)
         data = event.data.decode("utf-8", "ignore")
-        
+        await db.ensure_user(uid)
+        user = await db.get_user(uid)
+
         if data == "web_login":
             await issue_web_login(event)
             await event.answer("Ссылка отправлена")
+        
         elif data == "connect_account":
+            bot_states[uid] = "PHONE"
             await event.answer()
-            await event.respond("Для подключения аккаунта зайдите в веб-панель (кнопка «Войти в панель») и выберите «Подключить аккаунт».")
-        else:
+            await event.respond("Отправьте номер телефона в формате (+...).")
+            
+        elif data == "bot_shop":
+            balance = user["balance"]
             await event.answer()
+            await event.respond(f"🛒 Магазин аккаунтов\nВаш баланс: {balance}₽\n\nВыберите товар:", buttons=[[Button.inline("🇧🇩 Бангладеш — 100₽", b"buy_bd")], [Button.inline("🇺🇸 США — 105₽", b"buy_us")], [Button.inline("🔙 Назад", b"back_menu")]])
+            
+        elif data in ("buy_bd", "buy_us"):
+            country = "Бангладеш" if data == "buy_bd" else "США"
+            price = 100 if data == "buy_bd" else 105
+            if user["balance"] < price:
+                await event.answer("Недостаточно средств! Пополните баланс в веб-панели.", alert=True)
+                return
+            await db.update_balance(uid, -price)
+            oid = await db.create_order(uid, f"bot_{data}", country, price - 50, price)
+            await event.respond(f"✅ Заказ #{oid} на {country} оформлен! Ожидайте выдачи (админ получил уведомление).", buttons=[[Button.inline("🔙 В меню", b"back_menu")]])
+            try: await bot.send_message(SUPER_ADMINS[0], f"🚨 Новый заказ в боте! Юзер {uid} купил {country} за {price}₽. Спиши баланс, купи на sms-pro и выдай.")
+            except: pass
 
+        elif data == "back_menu":
+            await event.edit("Главное меню", buttons=bot_main_menu(uid))
+            
+        elif data == "bot_help":
+            await event.answer()
+            await event.respond("Вся подробная инструкция находится в веб-панели (раздел «Помощь»).")
+
+    @bot.on(events.NewMessage)
+    async def account_login_handler(event):
+        if not event.is_private: return
+        uid = int(event.sender_id)
+        state = bot_states.get(uid)
+        if state not in ("PHONE", "CODE", "2FA"): return
+        value = (event.raw_text or "").strip()
+        if not value or value.startswith("/"): return
+
+        if state == "PHONE":
+            if not re.fullmatch(r"\+[1-9]\d{6,14}", value):
+                await event.respond("Неверный формат.")
+                return
+            client = TelegramClient(StringSession(), API_ID, API_HASH, connection_retries=1, request_retries=1)
+            try:
+                await client.connect()
+                sent = await client.send_code_request(value)
+                phone_flows[uid] = {"client": client, "phone": value, "phone_code_hash": sent.phone_code_hash}
+                bot_states[uid] = "CODE"
+                await event.respond("Введите код подтверждения.")
+            except Exception as exc:
+                await client.disconnect()
+                bot_states.pop(uid, None)
+                await event.respond(f"Ошибка: {str(exc)[:180]}")
+            return
+
+        flow = phone_flows.get(uid)
+        if not flow:
+            bot_states.pop(uid, None)
+            await event.respond("Авторизация истекла.")
+            return
+
+        client = flow["client"]
+        try:
+            if state == "CODE":
+                await client.sign_in(phone=flow["phone"], code=value, phone_code_hash=flow["phone_code_hash"])
+            else:
+                await client.sign_in(password=value)
+            saved = client.session.save()
+            await db.set_session(uid, saved)
+            await client.disconnect()
+            phone_flows.pop(uid, None)
+            bot_states.pop(uid, None)
+            await event.respond("✅ Аккаунт подключён. Сессия сохранена. Можете запускать рассылку в веб-панели.")
+        except SessionPasswordNeededError:
+            bot_states[uid] = "2FA"
+            await event.respond("Введите пароль 2FA.")
+        except Exception as exc:
+            await client.disconnect()
+            phone_flows.pop(uid, None)
+            bot_states.pop(uid, None)
+            await event.respond(f"Ошибка: {str(exc)[:180]}")
     return bot
 
 # -------------------- FLASK AUTH HELPERS --------------------
@@ -556,7 +662,6 @@ main{padding:19px 14px}h1{font-size:23px}.grid{grid-template-columns:repeat(2,mi
 <div class="brand">TITAN <b>ENTERPRISE</b></div>
 <a class="nav active" href="#overview">Обзор</a>
 <a class="nav" href="#settings">Мои настройки</a>
-<a class="nav" href="#shop">Магазин аккаунтов</a>
 <a class="nav" href="#orders">Мои заказы</a>
 <a class="nav" href="#help">Помощь / Инструкция</a>
 <a class="nav admin-only hidden" href="#users">Пользователи</a>
@@ -570,7 +675,7 @@ main{padding:19px 14px}h1{font-size:23px}.grid{grid-template-columns:repeat(2,mi
 <div class="card">Мой баланс<div class="metric" id="balance">—</div><div class="muted"><button class="secondary" style="margin-top:8px; padding:4px 8px; font-size:12px;" onclick="showPayment()">Пополнить</button></div></div>
 <div class="card">Отправлено<div class="metric" id="sent">—</div></div>
 <div class="card">Ошибки<div class="metric" id="errors">—</div></div>
-<div class="card">Telegram-аккаунт<div class="metric" id="account">—</div><div class="muted"><button class="secondary" style="margin-top:8px; padding:4px 8px; font-size:12px;" onclick="connectAcc()">Подключить</button></div></div>
+<div class="card">Telegram-аккаунт<div class="metric" id="account">—</div><div class="muted"><button class="secondary" style="margin-top:8px; padding:4px 8px; font-size:12px;" onclick="alert('Используйте бота!')">Подключить</button></div></div>
 </div>
 
 <div class="section" id="settings"><h2>Мои настройки</h2><div class="grid">
@@ -586,11 +691,6 @@ main{padding:19px 14px}h1{font-size:23px}.grid{grid-template-columns:repeat(2,mi
 <div class="row"><button onclick="jobAction('start')">Запустить</button>
 <button class="danger" onclick="jobAction('stop')">Остановить</button></div><div class="notice" id="notice"></div></div>
 
-<div class="section hidden" id="shop"><h2>Магазин аккаунтов</h2>
-<p class="muted">Цены уже включают наценку. Для покупки нужен баланс.</p>
-<div class="tablewrap"><table><thead><tr><th>Страна</th><th>Цена</th><th>Действие</th></tr></thead>
-<tbody id="shopRows"><tr><td colspan="3" class="muted">Загрузка каталога...</td></tr></tbody></table></div></div>
-
 <div class="section hidden" id="orders"><h2>Мои заказы</h2>
 <div class="tablewrap"><table><thead><tr><th>Дата</th><th>Товар</th><th>Сумма</th><th>Статус</th><th>Данные</th></tr></thead>
 <tbody id="orderRows"><tr><td colspan="5" class="muted">Загрузка...</td></tr></tbody></table></div></div>
@@ -598,34 +698,26 @@ main{padding:19px 14px}h1{font-size:23px}.grid{grid-template-columns:repeat(2,mi
 <div class="section hidden" id="help"><h2>Инструкция по использованию</h2>
 <div class="help-box">
 <h3>1. Как подключить аккаунт?</h3>
-<p>В разделе «Обзор» нажмите кнопку <b>«Подключить»</b>. Откроется модальное окно с вкладками:<br>
-- <b>По номеру:</b> введите номер в формате +7999..., затем код из СМС. Если включена 2FA — введите пароль.<br>
-- <b>По QR:</b> нажмите «Сгенерировать QR», отсканируйте его в Telegram (Настройки -> Устройства). Если 2FA — введите пароль.</p>
+<p>Перейдите в Telegram-бота и нажмите <b>«Подключить аккаунт»</b>. Введите номер в формате +7999..., затем код из СМС. Если включена 2FA — введите пароль.</p>
 </div>
 <div class="help-box">
 <h3>2. Как вставлять шаблоны?</h3>
-<p>В поле «Шаблоны» вставляйте текст <b>каждую строку с новой строки</b>. Например:<br>
-<code>Привет, как дела?</code><br>
-<code>Есть новости по проекту?</code><br>
-Бот будет брать случайный шаблон из списка для каждой отправки.</p>
+<p>В поле «Шаблоны» вставляйте текст <b>каждую строку с новой строки</b>. Бот будет брать случайный шаблон из списка для каждой отправки.</p>
 </div>
 <div class="help-box">
 <h3>3. Как вставлять цели (ID)?</h3>
-<p>В поле «Цели» вставляйте <b>каждую цель с новой строки</b>. Поддерживаются:<br>
-- Публичные каналы/чаты: <code>@username</code> или <code>https://t.me/username</code><br>
-- Закрытые чаты (где вы состоите): <code>-1001234567890</code> или <code>tg://chat?id=1234567890</code><br>
-⚠️ <b>Важно:</b> Бот должен состоять в чате, иначе будет ошибка «Cannot find entity».</p>
+<p>В поле «Цели» вставляйте <b>каждую цель с новой строки</b>. Поддерживаются: <code>@username</code>, <code>-1001234567890</code>, <code>tg://chat?id=...</code></p>
 </div>
 <div class="help-box">
 <h3>4. Ошибки при отправке</h3>
-<p>- <b>Message was too long:</b> уберите из шаблонов слишком длинные тексты (лимит 4096 символов).<br>
-- <b>Cannot find entity:</b> бот не может найти чат. Убедитесь, что аккаунт в нём состоит.<br>
-- <b>FloodWait:</b> Telegram ограничил отправку. Бот подождет и продолжит сам.</p>
+<p><b>Message was too long:</b> уберите длинные тексты (лимит 4096).<br>
+<b>Cannot find entity:</b> аккаунт не в чате.<br>
+<b>FloodWait:</b> Telegram ограничил отправку. Бот подождет сам.</p>
 </div>
 <div class="help-box" style="border-color:#a855f7;">
 <h3>5. Связь с поддержкой</h3>
-<p>По любым вопросам (покупка, ошибки, вопросы по работе) пишите владельцу: <b><a href="https://t.me/apemiru" target="_blank" style="color:#e879f9;">@apemiru</a></b><br>
-Также вы можете зайти в наш Telegram-канал: <b><a href="https://t.me/titan_enterprise" target="_blank" style="color:#e879f9;">TITAN Enterprise</a></b></p>
+<p>По любым вопросам пишите владельцу: <b><a href="https://t.me/apemiru" target="_blank" style="color:#e879f9;">@apemiru</a></b><br>
+Канал: <b><a href="https://t.me/titan_enterprise" target="_blank" style="color:#e879f9;">TITAN Enterprise</a></b></p>
 </div>
 </div>
 
@@ -641,11 +733,9 @@ main{padding:19px 14px}h1{font-size:23px}.grid{grid-template-columns:repeat(2,mi
 
 <div class="section admin-only hidden" id="admin-shop"><h2>Управление магазином</h2>
 <div class="grid">
-<div class="card"><b>Реквизиты для оплаты</b><p class="muted">Этот текст увидит клиент при пополнении баланса.</p>
+<div class="card"><b>Реквизиты для оплаты</b><p class="muted">Этот текст увидит клиент при пополнении.</p>
 <textarea id="payment_details" placeholder="СБП: +79991234567"></textarea><br><br>
 <button onclick="savePayment()">Сохранить реквизиты</button></div>
-<div class="card"><b>Сбросить каталог</b><p class="muted">Если цены на sms-pro изменились, нажмите, чтобы обновить кэш каталога.</p>
-<button onclick="refreshShop()">Обновить каталог</button></div>
 </div>
 <div class="tablewrap" style="margin-top:20px;"><table>
 <thead><tr><th>ID</th><th>Юзер</th><th>Товар</th><th>Сумма</th><th>Статус</th><th>Действие</th></tr></thead>
@@ -681,7 +771,6 @@ async function saveDelay(){try{await api('/api/delay',{method:'POST',body:JSON.s
 async function jobAction(action){try{const r=await api('/api/job/'+action,{method:'POST',body:'{}'});msg(r.message);await load()}catch(e){msg(e.message)}}
 
 async function showPayment(){const r=await api('/api/payment_details');alert("Реквизиты для оплаты:\\n" + r.details + "\\n\\nПосле перевода напишите @apemiru")}
-async function connectAcc(){alert("Для подключения аккаунта нажмите кнопку в боте Telegram")}
 
 async function loadAdmin(){
 const stats=await api('/api/admin/stats');if(stats){
@@ -701,7 +790,6 @@ document.getElementById('adminOrderRows').innerHTML=ao.orders.map(o=>`<tr><td>${
 function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 async function addBal(id){const amount=prompt("Сумма для начисления (₽):");if(!amount)return;try{await api('/api/admin/add_balance',{method:'POST',body:JSON.stringify({user_id:id,amount:parseInt(amount)})});await load()}catch(e){msg(e.message)}}
 async function savePayment(){try{await api('/api/admin/set_payment',{method:'POST',body:JSON.stringify({details:document.getElementById('payment_details').value})});msg('Реквизиты сохранены')}catch(e){msg(e.message)}}
-async function refreshShop(){try{await api('/api/admin/refresh_shop',{method:'POST',body:'{}'});msg('Каталог обновлен')}catch(e){msg(e.message)}}
 async function completeOrder(id){try{await api('/api/admin/complete_order',{method:'POST',body:JSON.stringify({order_id:id})});await load()}catch(e){msg(e.message)}}
 
 load();setInterval(load,30000);
@@ -712,7 +800,7 @@ load();setInterval(load,30000);
 
 @app.get("/")
 def login_page():
-    return render_template_string(LOGIN_HTML, message="Откройте бота TITAN Enterprise, нажмите «Войти в панель» и перейдите по ссылке из личного чата.")
+    return render_template_string(LOGIN_HTML, message="Откройте бота TITAN Enterprise, нажмите «🌐 Веб-панель» и перейдите по ссылке.")
 
 @app.get("/login")
 def consume_login():
