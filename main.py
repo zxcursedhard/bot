@@ -1,4 +1,4 @@
-# TITAN Enterprise — compact Flask + Telethon + SQLite (FULL FIXED v10.3)
+# TITAN Enterprise — compact Flask + Telethon + SQLite (FULL FIXED v10.4)
 # Install: pip install telethon flask waitress aiosqlite psutil aiohttp
 
 import os
@@ -79,8 +79,6 @@ loop = None
 client_manager = None
 workers = {}
 worker_stops = {}
-
-# Временные состояния для авторизации на сайте
 web_states = {} 
 web_flows = {}
 
@@ -539,7 +537,7 @@ font:14px Inter,system-ui,Arial;min-height:100vh}.layout{display:flex;min-height
 aside{width:240px;padding:25px 17px;border-right:1px solid var(--line);background:#111113bb;
 backdrop-filter:blur(12px);flex-shrink:0}.brand{font-size:19px;font-weight:900;letter-spacing:1.5px;margin:5px 8px 32px}
 .brand b{color:#e879f9}.nav{display:block;padding:12px 13px;color:#c4c4cc;text-decoration:none;
-border-radius:12px;margin:5px 0}.nav:hover,.nav.active{background:linear-gradient(100deg,#9333ea33,#ec489922);color:white}
+border-radius:12px;margin:5px 0;cursor:pointer}.nav:hover,.nav.active{background:linear-gradient(100deg,#9333ea33,#ec489922);color:white}
 main{padding:30px;width:100%;max-width:1500px;margin:auto;min-width:0}.top{display:flex;align-items:center;
 justify-content:space-between;gap:15px;flex-wrap:wrap}h1{font-size:27px;margin:0 0 7px}
 .muted{color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(165px,1fr));gap:14px;margin:25px 0}
@@ -570,17 +568,19 @@ main{padding:19px 14px}h1{font-size:23px}.grid{grid-template-columns:repeat(2,mi
 .card{padding:14px}.metric{font-size:24px}.field{min-width:100%}}
 </style></head><body><div class="layout"><aside>
 <div class="brand">TITAN <b>ENTERPRISE</b></div>
-<a class="nav active" href="#overview">Обзор</a>
-<a class="nav" href="#settings">Мои настройки</a>
-<a class="nav" href="#shop">Магазин аккаунтов</a>
-<a class="nav" href="#orders">Мои заказы</a>
-<a class="nav" href="#help">Помощь / Инструкция</a>
-<a class="nav admin-only hidden" href="#users">Пользователи</a>
-<a class="nav admin-only hidden" href="#admin-shop">Управление магазином</a>
+<a class="nav active" onclick="showTab('overview')">Обзор</a>
+<a class="nav" onclick="showTab('settings')">Мои настройки</a>
+<a class="nav" onclick="showTab('shop')">Магазин аккаунтов</a>
+<a class="nav" onclick="showTab('orders')">Мои заказы</a>
+<a class="nav" onclick="showTab('help')">Помощь / Инструкция</a>
+<a class="nav admin-only hidden" onclick="showTab('users')">Пользователи</a>
+<a class="nav admin-only hidden" onclick="showTab('admin-shop')">Управление магазином</a>
 <a class="nav" href="/logout">Выйти</a>
 </aside><main><div class="top"><div><h1 id="heading">Личный кабинет</h1>
 <div class="muted" id="identity">Загрузка профиля…</div></div><button class="secondary" onclick="load()">↻ Обновить</button></div>
 
+<!-- ВКЛАДКА 1: ОБЗОР -->
+<div id="tab-overview" class="tab-content">
 <div id="overview" class="grid">
 <div class="card">Подписка<div class="metric" id="subscription">—</div><div class="muted" id="expiry"></div></div>
 <div class="card">Мой баланс<div class="metric" id="balance">—</div><div class="muted"><button class="secondary" style="margin-top:8px; padding:4px 8px; font-size:12px;" onclick="showPayment()">Пополнить</button></div></div>
@@ -588,8 +588,11 @@ main{padding:19px 14px}h1{font-size:23px}.grid{grid-template-columns:repeat(2,mi
 <div class="card">Ошибки<div class="metric" id="errors">—</div></div>
 <div class="card">Telegram-аккаунт<div class="metric" id="account">—</div><div class="muted"><button class="secondary" style="margin-top:8px; padding:4px 8px; font-size:12px;" onclick="openAccModal()">Подключить</button></div></div>
 </div>
+</div>
 
-<div class="section" id="settings"><h2>Мои настройки</h2><div class="grid">
+<!-- ВКЛАДКА 2: НАСТРОЙКИ -->
+<div id="tab-settings" class="tab-content hidden">
+<div class="section"><h2>Мои настройки</h2><div class="grid">
 <div class="card field"><b>Шаблоны уведомлений</b><p class="muted">Каждая строка — отдельный шаблон. Только для разрешённых получателей.</p>
 <textarea id="templates" placeholder="Текст уведомления"></textarea><br><br><button onclick="saveTemplates()">Сохранить шаблоны</button></div>
 <div class="card field"><b>Цели уведомлений</b><p class="muted">Указывайте только чаты, где у аккаунта есть право публикации.</p>
@@ -601,20 +604,29 @@ main{padding:19px 14px}h1{font-size:23px}.grid{grid-template-columns:repeat(2,mi
 </div>
 <div class="row"><button onclick="jobAction('start')">Запустить</button>
 <button class="danger" onclick="jobAction('stop')">Остановить</button></div><div class="notice" id="notice"></div></div>
+</div>
 
-<div class="section hidden" id="shop"><h2>Магазин аккаунтов</h2>
+<!-- ВКЛАДКА 3: МАГАЗИН -->
+<div id="tab-shop" class="tab-content hidden">
+<div class="section"><h2>Магазин аккаунтов</h2>
 <p class="muted">Цены уже включают наценку. Для покупки нужен баланс.</p>
 <div class="tablewrap"><table><thead><tr><th>Страна</th><th>Цена</th><th>Действие</th></tr></thead>
 <tbody id="shopRows">
 <tr><td>🇧🇩 Бангладеш</td><td>100 ₽</td><td><button onclick="buyAcc('Бангладеш', 100, 'bd')">Купить</button></td></tr>
 <tr><td>🇺🇸 США</td><td>105 ₽</td><td><button onclick="buyAcc('США', 105, 'us')">Купить</button></td></tr>
 </tbody></table></div></div>
+</div>
 
-<div class="section hidden" id="orders"><h2>Мои заказы</h2>
+<!-- ВКЛАДКА 4: ЗАКАЗЫ -->
+<div id="tab-orders" class="tab-content hidden">
+<div class="section"><h2>Мои заказы</h2>
 <div class="tablewrap"><table><thead><tr><th>Дата</th><th>Товар</th><th>Сумма</th><th>Статус</th><th>Данные</th></tr></thead>
 <tbody id="orderRows"><tr><td colspan="5" class="muted">Загрузка...</td></tr></tbody></table></div></div>
+</div>
 
-<div class="section hidden" id="help"><h2>Инструкция по использованию</h2>
+<!-- ВКЛАДКА 5: ПОМОЩЬ -->
+<div id="tab-help" class="tab-content hidden">
+<div class="section"><h2>Инструкция по использованию</h2>
 <div class="help-box">
 <h3>1. Как подключить аккаунт?</h3>
 <p>В разделе «Обзор» нажмите кнопку <b>«Подключить»</b>. Откроется модальное окно. Введите номер в формате +7999..., затем код из СМС. Если включена 2FA — введите пароль.</p>
@@ -639,18 +651,23 @@ main{padding:19px 14px}h1{font-size:23px}.grid{grid-template-columns:repeat(2,mi
 Канал: <b><a href="https://t.me/titan_enterprise" target="_blank" style="color:#e879f9;">TITAN Enterprise</a></b></p>
 </div>
 </div>
+</div>
 
-<div class="section admin-only hidden" id="serverStats"><h2>Состояние сервера</h2>
+<!-- ВКЛАДКА 6: АДМИН ПОЛЬЗОВАТЕЛИ -->
+<div id="tab-users" class="tab-content hidden admin-only">
+<div class="section"><h2>Состояние сервера</h2>
 <div class="grid"><div class="card">RAM<div class="metric" id="ram">—</div></div>
 <div class="card">CPU<div class="metric" id="cpu">—</div></div>
 <div class="card">Активные клиенты<div class="metric" id="activeClients">—</div></div>
 <div class="card">В очереди<div class="metric" id="waitingClients">—</div></div></div></div>
-
-<div class="section admin-only hidden" id="users"><h2>Пользователи</h2><div class="tablewrap"><table>
+<div class="section"><h2>Пользователи</h2><div class="tablewrap"><table>
 <thead><tr><th>Пользователь</th><th>Роль</th><th>Баланс</th><th>Подписка</th><th>Отправки</th><th>Сессия</th><th>Действия</th></tr></thead>
 <tbody id="userRows"></tbody></table></div></div>
+</div>
 
-<div class="section admin-only hidden" id="admin-shop"><h2>Управление магазином</h2>
+<!-- ВКЛАДКА 7: АДМИН МАГАЗИН -->
+<div id="tab-admin-shop" class="tab-content hidden admin-only">
+<div class="section"><h2>Управление магазином</h2>
 <div class="grid">
 <div class="card"><b>Реквизиты для оплаты</b><p class="muted">Этот текст увидит клиент при пополнении.</p>
 <textarea id="payment_details" placeholder="СБП: +79991234567"></textarea><br><br>
@@ -659,6 +676,7 @@ main{padding:19px 14px}h1{font-size:23px}.grid{grid-template-columns:repeat(2,mi
 <div class="tablewrap" style="margin-top:20px;"><table>
 <thead><tr><th>ID</th><th>Юзер</th><th>Товар</th><th>Сумма</th><th>Статус</th><th>Действие</th></tr></thead>
 <tbody id="adminOrderRows"></tbody></table></div></div>
+</div>
 
 <!-- МОДАЛЬНОЕ ОКНО ДЛЯ ПОДКЛЮЧЕНИЯ АККАУНТА -->
 <div class="modal" id="accModal">
@@ -686,10 +704,23 @@ main{padding:19px 14px}h1{font-size:23px}.grid{grid-template-columns:repeat(2,mi
 </main></div>
 <script>
 let csrf='', role='USER';
+
+function showTab(name) {
+  document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
+  const target = document.getElementById('tab-' + name);
+  if (target) target.classList.remove('hidden');
+  
+  // Подсветка активного меню
+  document.querySelectorAll('aside .nav').forEach(el => el.classList.remove('active'));
+  const clicked = Array.from(document.querySelectorAll('aside .nav')).find(el => el.getAttribute('onclick') === `showTab('${name}')`);
+  if (clicked) clicked.classList.add('active');
+}
+
 async function api(path,opts={}){const r=await fetch(path,{...opts,headers:{
 'Content-Type':'application/json','X-CSRF-Token':csrf,...(opts.headers||{})}});
 if(r.status===401){location.href='/';return null}const d=await r.json();if(!r.ok)throw Error(d.error||'Ошибка запроса');return d}
-function msg(s){document.getElementById('notice').textContent=s}
+function msg(s){const el=document.getElementById('notice'); if(el)el.textContent=s; else alert(s)}
+
 async function load(){try{
 const p=await api('/api/me');if(!p)return;csrf=p.csrf;role=p.role;
 document.getElementById('identity').textContent=(p.username?'@'+p.username+' · ':'')+'ID '+p.user_id+' · '+p.role;
