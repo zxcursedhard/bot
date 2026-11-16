@@ -1,4 +1,4 @@
-# TITAN Enterprise — compact Flask + Telethon + SQLite (FULL FIXED v10.2)
+# TITAN Enterprise — compact Flask + Telethon + SQLite (FULL FIXED v10.3)
 # Install: pip install telethon flask waitress aiosqlite psutil aiohttp
 
 import os
@@ -59,7 +59,6 @@ LOGIN_TOKEN_TTL = 24 * 60 * 60
 SESSION_DAYS = 14
 MAX_TARGETS = 9999
 MAX_TEMPLATES = 9999
-MARKUP_RUB = 50 # Наценка
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("titan")
@@ -80,9 +79,10 @@ loop = None
 client_manager = None
 workers = {}
 worker_stops = {}
-bot_states = {}
-phone_flows = {}
-qr_flows = {}
+
+# Временные состояния для авторизации на сайте
+web_states = {} 
+web_flows = {}
 
 def utcnow(): return dt.datetime.now(dt.timezone.utc)
 def iso_now(): return utcnow().isoformat()
@@ -415,16 +415,7 @@ class ClientManager:
             async with self._lock: self.active = max(0, self.active - 1)
             self.semaphore.release()
 
-# -------------------- BOT LOGIC --------------------
-
-def bot_main_menu(uid):
-    rows = [
-        [Button.inline("🌐 Веб-панель", b"web_login")],
-        [Button.inline("📱 Подключить аккаунт", b"connect_account")],
-        [Button.inline("🛒 Магазин аккаунтов", b"bot_shop")],
-        [Button.inline("ℹ️ Помощь", b"bot_help")]
-    ]
-    return rows
+# -------------------- BOT LOGIC (ТОЛЬКО ССЫЛКА) --------------------
 
 async def issue_web_login(event):
     uid = int(event.sender_id)
@@ -440,7 +431,7 @@ async def issue_web_login(event):
         await event.respond("Не задан PUBLIC_BASE_URL в переменных Render.")
         return
     link = f"{base}/login?token={raw}"
-    await event.respond(f"🔐 Ссылка для входа:\n{link}")
+    await event.respond(f"🔐 Ссылка для входа в личный кабинет:\n{link}\n\nВесь функционал доступен на сайте.")
     await db.audit(uid, "WEB_LOGIN_TOKEN_ISSUED")
 
 async def setup_bot():
@@ -456,100 +447,17 @@ async def setup_bot():
         if not user["approved"] and not is_admin(event.sender_id):
             await event.respond(f"Доступ не активирован.\nВаш ID: {event.sender_id}")
             return
-        await event.respond("TITAN Enterprise\nУправление ботом и магазин аккаунтов.", buttons=bot_main_menu(event.sender_id))
+        await event.respond("TITAN Enterprise\nНажмите кнопку ниже, чтобы перейти в веб-панель.", buttons=[[Button.inline("🌐 Войти в панель", b"web_login")]])
 
     @bot.on(events.CallbackQuery)
     async def callback_handler(event):
-        uid = int(event.sender_id)
         data = event.data.decode("utf-8", "ignore")
-        await db.ensure_user(uid)
-        user = await db.get_user(uid)
-
         if data == "web_login":
             await issue_web_login(event)
             await event.answer("Ссылка отправлена")
-        
-        elif data == "connect_account":
-            bot_states[uid] = "PHONE"
+        else:
             await event.answer()
-            await event.respond("Отправьте номер телефона в формате (+...).")
-            
-        elif data == "bot_shop":
-            balance = user["balance"]
-            await event.answer()
-            await event.respond(f"🛒 Магазин аккаунтов\nВаш баланс: {balance}₽\n\nВыберите товар:", buttons=[[Button.inline("🇧🇩 Бангладеш — 100₽", b"buy_bd")], [Button.inline("🇺🇸 США — 105₽", b"buy_us")], [Button.inline("🔙 Назад", b"back_menu")]])
-            
-        elif data in ("buy_bd", "buy_us"):
-            country = "Бангладеш" if data == "buy_bd" else "США"
-            price = 100 if data == "buy_bd" else 105
-            if user["balance"] < price:
-                await event.answer("Недостаточно средств! Пополните баланс в веб-панели.", alert=True)
-                return
-            await db.update_balance(uid, -price)
-            oid = await db.create_order(uid, f"bot_{data}", country, price - 50, price)
-            await event.respond(f"✅ Заказ #{oid} на {country} оформлен! Ожидайте выдачи (админ получил уведомление).", buttons=[[Button.inline("🔙 В меню", b"back_menu")]])
-            try: await bot.send_message(SUPER_ADMINS[0], f"🚨 Новый заказ в боте! Юзер {uid} купил {country} за {price}₽. Спиши баланс, купи на sms-pro и выдай.")
-            except: pass
 
-        elif data == "back_menu":
-            await event.edit("Главное меню", buttons=bot_main_menu(uid))
-            
-        elif data == "bot_help":
-            await event.answer()
-            await event.respond("Вся подробная инструкция находится в веб-панели (раздел «Помощь»).")
-
-    @bot.on(events.NewMessage)
-    async def account_login_handler(event):
-        if not event.is_private: return
-        uid = int(event.sender_id)
-        state = bot_states.get(uid)
-        if state not in ("PHONE", "CODE", "2FA"): return
-        value = (event.raw_text or "").strip()
-        if not value or value.startswith("/"): return
-
-        if state == "PHONE":
-            if not re.fullmatch(r"\+[1-9]\d{6,14}", value):
-                await event.respond("Неверный формат.")
-                return
-            client = TelegramClient(StringSession(), API_ID, API_HASH, connection_retries=1, request_retries=1)
-            try:
-                await client.connect()
-                sent = await client.send_code_request(value)
-                phone_flows[uid] = {"client": client, "phone": value, "phone_code_hash": sent.phone_code_hash}
-                bot_states[uid] = "CODE"
-                await event.respond("Введите код подтверждения.")
-            except Exception as exc:
-                await client.disconnect()
-                bot_states.pop(uid, None)
-                await event.respond(f"Ошибка: {str(exc)[:180]}")
-            return
-
-        flow = phone_flows.get(uid)
-        if not flow:
-            bot_states.pop(uid, None)
-            await event.respond("Авторизация истекла.")
-            return
-
-        client = flow["client"]
-        try:
-            if state == "CODE":
-                await client.sign_in(phone=flow["phone"], code=value, phone_code_hash=flow["phone_code_hash"])
-            else:
-                await client.sign_in(password=value)
-            saved = client.session.save()
-            await db.set_session(uid, saved)
-            await client.disconnect()
-            phone_flows.pop(uid, None)
-            bot_states.pop(uid, None)
-            await event.respond("✅ Аккаунт подключён. Сессия сохранена. Можете запускать рассылку в веб-панели.")
-        except SessionPasswordNeededError:
-            bot_states[uid] = "2FA"
-            await event.respond("Введите пароль 2FA.")
-        except Exception as exc:
-            await client.disconnect()
-            phone_flows.pop(uid, None)
-            bot_states.pop(uid, None)
-            await event.respond(f"Ошибка: {str(exc)[:180]}")
     return bot
 
 # -------------------- FLASK AUTH HELPERS --------------------
@@ -598,7 +506,7 @@ def csrf_required(fn):
         return fn(*args, **kwargs)
     return wrapper
 
-# -------------------- WEB UI --------------------
+# -------------------- WEB UI (ГЛАВНОЕ) --------------------
 
 LOGIN_HTML = r"""
 <!doctype html><html lang="ru"><head><meta charset="utf-8">
@@ -654,6 +562,8 @@ border-radius:50%;background:linear-gradient(135deg,#9333ea,#ec4899);font-weight
 .actions{display:flex;gap:7px;flex-wrap:wrap}.status{color:var(--green)}.status.off{color:var(--red)}
 .help-box{background:#111113;border:1px solid var(--line);border-radius:16px;padding:20px;margin-bottom:15px;line-height:1.6}
 .help-box h3{color:#e879f9;margin-top:0}
+.modal{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:#000000bb;backdrop-filter:blur(5px);z-index:100;place-items:center}
+.modal-content{background:#18181b;border:1px solid var(--line);padding:25px;border-radius:20px;width:100%;max-width:400px}
 @media(max-width:760px){.layout{display:block}aside{width:100%;padding:13px;border-right:0;border-bottom:1px solid var(--line)}
 .brand{margin:5px 8px 10px}.nav{display:inline-block;padding:9px 10px;margin:2px;font-size:13px}
 main{padding:19px 14px}h1{font-size:23px}.grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}
@@ -662,6 +572,7 @@ main{padding:19px 14px}h1{font-size:23px}.grid{grid-template-columns:repeat(2,mi
 <div class="brand">TITAN <b>ENTERPRISE</b></div>
 <a class="nav active" href="#overview">Обзор</a>
 <a class="nav" href="#settings">Мои настройки</a>
+<a class="nav" href="#shop">Магазин аккаунтов</a>
 <a class="nav" href="#orders">Мои заказы</a>
 <a class="nav" href="#help">Помощь / Инструкция</a>
 <a class="nav admin-only hidden" href="#users">Пользователи</a>
@@ -675,7 +586,7 @@ main{padding:19px 14px}h1{font-size:23px}.grid{grid-template-columns:repeat(2,mi
 <div class="card">Мой баланс<div class="metric" id="balance">—</div><div class="muted"><button class="secondary" style="margin-top:8px; padding:4px 8px; font-size:12px;" onclick="showPayment()">Пополнить</button></div></div>
 <div class="card">Отправлено<div class="metric" id="sent">—</div></div>
 <div class="card">Ошибки<div class="metric" id="errors">—</div></div>
-<div class="card">Telegram-аккаунт<div class="metric" id="account">—</div><div class="muted"><button class="secondary" style="margin-top:8px; padding:4px 8px; font-size:12px;" onclick="alert('Используйте бота!')">Подключить</button></div></div>
+<div class="card">Telegram-аккаунт<div class="metric" id="account">—</div><div class="muted"><button class="secondary" style="margin-top:8px; padding:4px 8px; font-size:12px;" onclick="openAccModal()">Подключить</button></div></div>
 </div>
 
 <div class="section" id="settings"><h2>Мои настройки</h2><div class="grid">
@@ -691,6 +602,14 @@ main{padding:19px 14px}h1{font-size:23px}.grid{grid-template-columns:repeat(2,mi
 <div class="row"><button onclick="jobAction('start')">Запустить</button>
 <button class="danger" onclick="jobAction('stop')">Остановить</button></div><div class="notice" id="notice"></div></div>
 
+<div class="section hidden" id="shop"><h2>Магазин аккаунтов</h2>
+<p class="muted">Цены уже включают наценку. Для покупки нужен баланс.</p>
+<div class="tablewrap"><table><thead><tr><th>Страна</th><th>Цена</th><th>Действие</th></tr></thead>
+<tbody id="shopRows">
+<tr><td>🇧🇩 Бангладеш</td><td>100 ₽</td><td><button onclick="buyAcc('Бангладеш', 100, 'bd')">Купить</button></td></tr>
+<tr><td>🇺🇸 США</td><td>105 ₽</td><td><button onclick="buyAcc('США', 105, 'us')">Купить</button></td></tr>
+</tbody></table></div></div>
+
 <div class="section hidden" id="orders"><h2>Мои заказы</h2>
 <div class="tablewrap"><table><thead><tr><th>Дата</th><th>Товар</th><th>Сумма</th><th>Статус</th><th>Данные</th></tr></thead>
 <tbody id="orderRows"><tr><td colspan="5" class="muted">Загрузка...</td></tr></tbody></table></div></div>
@@ -698,7 +617,7 @@ main{padding:19px 14px}h1{font-size:23px}.grid{grid-template-columns:repeat(2,mi
 <div class="section hidden" id="help"><h2>Инструкция по использованию</h2>
 <div class="help-box">
 <h3>1. Как подключить аккаунт?</h3>
-<p>Перейдите в Telegram-бота и нажмите <b>«Подключить аккаунт»</b>. Введите номер в формате +7999..., затем код из СМС. Если включена 2FA — введите пароль.</p>
+<p>В разделе «Обзор» нажмите кнопку <b>«Подключить»</b>. Откроется модальное окно. Введите номер в формате +7999..., затем код из СМС. Если включена 2FA — введите пароль.</p>
 </div>
 <div class="help-box">
 <h3>2. Как вставлять шаблоны?</h3>
@@ -741,6 +660,29 @@ main{padding:19px 14px}h1{font-size:23px}.grid{grid-template-columns:repeat(2,mi
 <thead><tr><th>ID</th><th>Юзер</th><th>Товар</th><th>Сумма</th><th>Статус</th><th>Действие</th></tr></thead>
 <tbody id="adminOrderRows"></tbody></table></div></div>
 
+<!-- МОДАЛЬНОЕ ОКНО ДЛЯ ПОДКЛЮЧЕНИЯ АККАУНТА -->
+<div class="modal" id="accModal">
+<div class="modal-content">
+<h3 style="margin-top:0">Подключение аккаунта</h3>
+<div id="accStep1">
+<p class="muted">Введите номер телефона (в формате +7999...)</p>
+<input type="text" id="phoneInput" placeholder="+79991234567" style="margin-bottom:10px;">
+<div class="row"><button onclick="sendCode()">Получить код</button><button class="secondary" onclick="closeAccModal()">Отмена</button></div>
+<p class="notice" id="accNotice"></p>
+</div>
+<div id="accStep2" class="hidden">
+<p class="muted">Введите код из СМС/Telegram</p>
+<input type="text" id="codeInput" placeholder="12345" style="margin-bottom:10px;">
+<div class="row"><button onclick="verifyCode()">Войти</button><button class="secondary" onclick="closeAccModal()">Отмена</button></div>
+</div>
+<div id="accStep3" class="hidden">
+<p class="muted">Введите пароль 2FA</p>
+<input type="password" id="passInput" placeholder="Пароль" style="margin-bottom:10px;">
+<div class="row"><button onclick="verify2FA()">Войти</button><button class="secondary" onclick="closeAccModal()">Отмена</button></div>
+</div>
+</div>
+</div>
+
 </main></div>
 <script>
 let csrf='', role='USER';
@@ -771,6 +713,38 @@ async function saveDelay(){try{await api('/api/delay',{method:'POST',body:JSON.s
 async function jobAction(action){try{const r=await api('/api/job/'+action,{method:'POST',body:'{}'});msg(r.message);await load()}catch(e){msg(e.message)}}
 
 async function showPayment(){const r=await api('/api/payment_details');alert("Реквизиты для оплаты:\\n" + r.details + "\\n\\nПосле перевода напишите @apemiru")}
+async function buyAcc(country, price, id){
+  if(!confirm(`Купить ${country} за ${price}₽?`))return;
+  try{
+    const r=await api('/api/buy_acc',{method:'POST',body:JSON.stringify({country,price,item_id:id})});
+    if(r.ok){msg('Заказ создан! Ожидайте выдачи.');await load()}else alert(r.error);
+  }catch(e){alert(e.message)}
+}
+
+// Модальное окно подключения аккаунта
+function openAccModal(){document.getElementById('accModal').style.display='grid';document.getElementById('accStep1').classList.remove('hidden');document.getElementById('accStep2').classList.add('hidden');document.getElementById('accStep3').classList.add('hidden');document.getElementById('accNotice').textContent=''}
+function closeAccModal(){document.getElementById('accModal').style.display='none'}
+async function sendCode(){
+  const phone=document.getElementById('phoneInput').value;
+  try{const r=await api('/api/auth/send_code',{method:'POST',body:JSON.stringify({phone})});
+    document.getElementById('accStep1').classList.add('hidden');
+    document.getElementById('accStep2').classList.remove('hidden');
+    document.getElementById('accNotice').textContent='';
+  }catch(e){document.getElementById('accNotice').textContent=e.message}
+}
+async function verifyCode(){
+  const code=document.getElementById('codeInput').value;
+  try{const r=await api('/api/auth/verify_code',{method:'POST',body:JSON.stringify({code})});
+    if(r.need_2fa){document.getElementById('accStep2').classList.add('hidden');document.getElementById('accStep3').classList.remove('hidden');}
+    else{closeAccModal();await load();}
+  }catch(e){document.getElementById('accNotice').textContent=e.message}
+}
+async function verify2FA(){
+  const pass=document.getElementById('passInput').value;
+  try{const r=await api('/api/auth/verify_2fa',{method:'POST',body:JSON.stringify({pass})});
+    closeAccModal();await load();
+  }catch(e){document.getElementById('accNotice').textContent=e.message}
+}
 
 async function loadAdmin(){
 const stats=await api('/api/admin/stats');if(stats){
@@ -800,7 +774,7 @@ load();setInterval(load,30000);
 
 @app.get("/")
 def login_page():
-    return render_template_string(LOGIN_HTML, message="Откройте бота TITAN Enterprise, нажмите «🌐 Веб-панель» и перейдите по ссылке.")
+    return render_template_string(LOGIN_HTML, message="Откройте бота TITAN Enterprise, нажмите «🌐 Войти в панель» и перейдите по ссылке.")
 
 @app.get("/login")
 def consume_login():
@@ -854,6 +828,7 @@ def api_me():
         "csrf": session["csrf"]
     })
 
+# --- ЗАПРОСЫ НАСТРОЕК ---
 @app.post("/api/templates")
 @login_required
 @csrf_required
@@ -883,31 +858,90 @@ def api_delay():
     run_async(db.update_user_lists(uid, delay=delay))
     return jsonify({"ok": True})
 
+# --- АВТОРИЗАЦИЯ TELEGRAM (ВЕБ) ---
+@app.post("/api/auth/send_code")
+@login_required
+@csrf_required
+def api_auth_send_code():
+    uid = int(request.titan_user["user_id"])
+    phone = (request.get_json(silent=True) or {}).get("phone", "")
+    if not re.fullmatch(r"\+[1-9]\d{6,14}", phone): return jsonify({"error": "Неверный формат"}), 400
+    async def _send():
+        client = TelegramClient(StringSession(), API_ID, API_HASH)
+        await client.connect()
+        sent = await client.send_code_request(phone)
+        web_flows[uid] = {"client": client, "phone": phone, "hash": sent.phone_code_hash}
+        return True
+    try:
+        asyncio.run_coroutine_threadsafe(_send(), loop).result(timeout=20)
+        return jsonify({"ok": True})
+    except Exception as e: return jsonify({"error": str(e)[:100]}), 400
+
+@app.post("/api/auth/verify_code")
+@login_required
+@csrf_required
+def api_auth_verify_code():
+    uid = int(request.titan_user["user_id"])
+    code = (request.get_json(silent=True) or {}).get("code", "")
+    flow = web_flows.get(uid)
+    if not flow: return jsonify({"error": "Сессия истекла"}), 400
+    async def _verify():
+        try:
+            await flow["client"].sign_in(phone=flow["phone"], code=code, phone_code_hash=flow["hash"])
+            await db.set_session(uid, flow["client"].session.save())
+            await flow["client"].disconnect()
+            return {"ok": True, "need_2fa": False}
+        except SessionPasswordNeededError:
+            return {"ok": True, "need_2fa": True}
+    res = asyncio.run_coroutine_threadsafe(_verify(), loop).result(timeout=20)
+    if res.get("need_2fa"): return jsonify(res)
+    web_flows.pop(uid, None)
+    return jsonify(res)
+
+@app.post("/api/auth/verify_2fa")
+@login_required
+@csrf_required
+def api_auth_verify_2fa():
+    uid = int(request.titan_user["user_id"])
+    passwd = (request.get_json(silent=True) or {}).get("pass", "")
+    flow = web_flows.get(uid)
+    if not flow: return jsonify({"error": "Сессия истекла"}), 400
+    async def _verify():
+        try:
+            await flow["client"].sign_in(password=passwd)
+            await db.set_session(uid, flow["client"].session.save())
+            await flow["client"].disconnect()
+            return {"ok": True}
+        except Exception as e: return {"error": str(e)[:100]}
+    res = asyncio.run_coroutine_threadsafe(_verify(), loop).result(timeout=20)
+    web_flows.pop(uid, None)
+    return jsonify(res)
+
+# --- МАГАЗИН И ЗАКАЗЫ ---
 @app.get("/api/payment_details")
 @login_required
 def api_payment_details():
-    details = run_async(db.get_setting("payment_details", "Реквизиты не заданы"))
-    return jsonify({"details": details})
+    return jsonify({"details": run_async(db.get_setting("payment_details", "Реквизиты не заданы"))})
 
-@app.get("/api/admin/payment_details")
-@admin_required
-def api_admin_payment_details():
-    details = run_async(db.get_setting("payment_details", "Реквизиты не заданы"))
-    return jsonify({"details": details})
-
-@app.post("/api/admin/set_payment")
-@admin_required
+@app.post("/api/buy_acc")
+@login_required
 @csrf_required
-def api_admin_set_payment():
-    details = (request.get_json(silent=True) or {}).get("details", "")
-    run_async(db.set_setting("payment_details", details))
+def api_buy_acc():
+    uid = int(request.titan_user["user_id"])
+    data = request.get_json(silent=True) or {}
+    country, price = data.get("country"), int(data.get("price", 0))
+    user = run_async(db.get_user(uid))
+    if user["balance"] < price: return jsonify({"error": "Недостаточно средств"}), 400
+    run_async(db.update_balance(uid, -price))
+    oid = run_async(db.create_order(uid, f"web_{data.get('item_id')}", country, price - 50, price))
+    run_async(db.audit(uid, "ORDER_CREATED", f"id={oid}, {country}"))
+    try: asyncio.run_coroutine_threadsafe(bot.send_message(SUPER_ADMINS[0], f"🚨 Новый заказ в вебе #{oid}! Юзер {uid} купил {country} за {price}₽."), loop)
+    except: pass
     return jsonify({"ok": True})
 
 @app.get("/api/admin/orders")
 @admin_required
-def api_admin_orders():
-    rows = run_async(db.get_orders())
-    return jsonify({"orders": [dict(x) for x in rows]})
+def api_admin_orders(): return jsonify({"orders": [dict(x) for x in run_async(db.get_orders())]})
 
 @app.post("/api/admin/complete_order")
 @admin_required
@@ -922,27 +956,37 @@ def api_admin_complete_order():
 @csrf_required
 def api_admin_add_balance():
     payload = request.get_json(silent=True) or {}
-    uid, amount = int(payload["user_id"]), int(payload["amount"])
-    run_async(db.update_balance(uid, amount))
+    run_async(db.update_balance(int(payload["user_id"]), int(payload["amount"])))
     return jsonify({"ok": True})
 
+@app.get("/api/admin/payment_details")
+@admin_required
+def api_admin_payment_details(): return jsonify({"details": run_async(db.get_setting("payment_details", "Реквизиты не заданы"))})
+
+@app.post("/api/admin/set_payment")
+@admin_required
+@csrf_required
+def api_admin_set_payment():
+    run_async(db.set_setting("payment_details", (request.get_json(silent=True) or {}).get("details", "")))
+    return jsonify({"ok": True})
+
+# --- РАССЫЛКА ---
 @app.post("/api/job/start")
 @login_required
 @csrf_required
 def api_job_start():
     uid = int(request.titan_user["user_id"])
     u = run_async(db.get_user(uid))
-    if not u["session_string"]: return jsonify({"error": "telegram_account_not_connected"}), 400
+    if not u["session_string"]: return jsonify({"error": "Подключите аккаунт"}), 400
     templates = json.loads(u["templates"] or "[]")
     targets = json.loads(u["targets"] or "[]")
-    if not templates or not targets: return jsonify({"error": "add_templates_and_targets_first"}), 400
+    if not templates or not targets: return jsonify({"error": "Добавьте шаблоны и цели"}), 400
     old = workers.get(uid)
-    if old and not old.done(): return jsonify({"error": "already_running"}), 409
+    if old and not old.done(): return jsonify({"error": "Уже запущено"}), 409
     stop_event = asyncio.Event()
     worker_stops[uid] = stop_event
     run_async(db.set_job_status(uid, "running"))
-    future = asyncio.run_coroutine_threadsafe(notification_worker(uid, stop_event), loop)
-    workers[uid] = future
+    workers[uid] = asyncio.run_coroutine_threadsafe(notification_worker(uid, stop_event), loop)
     return jsonify({"ok": True, "message": "Запущено"})
 
 @app.post("/api/job/stop")
@@ -961,15 +1005,15 @@ def api_admin_users(): return jsonify({"users": [dict(x) for x in run_async(db.a
 @app.get("/api/admin/stats")
 @admin_required
 def api_admin_stats():
-    result = run_async(db.admin_stats())
+    res = run_async(db.admin_stats())
     if psutil:
         try:
-            result["ram_mb"] = round(psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024, 1)
-            result["cpu_percent"] = psutil.cpu_percent(interval=None)
-        except Exception: result["ram_mb"], result["cpu_percent"] = None, None
-    else: result["ram_mb"], result["cpu_percent"] = None, None
-    result["active_clients"] = 0; result["waiting_clients"] = 0; result["client_limit"] = 10
-    return jsonify(result)
+            res["ram_mb"] = round(psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024, 1)
+            res["cpu_percent"] = psutil.cpu_percent(interval=None)
+        except: res["ram_mb"], res["cpu_percent"] = None, None
+    else: res["ram_mb"], res["cpu_percent"] = None, None
+    res["active_clients"] = 0; res["waiting_clients"] = 0; res["client_limit"] = 10
+    return jsonify(res)
 
 # -------------------- NOTIFICATION WORKER --------------------
 
