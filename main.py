@@ -1,27 +1,23 @@
 # =====================================================================
-# TITAN Enterprise v15.0 — Omni-Core (Ultimate Mega-Monolith)
+# TITAN Enterprise v15.1 — Omni-Core (Ultimate Monolith)
 # =====================================================================
-# Установка: pip install telethon flask waitress aiosqlite psutil aiohttp aiofiles
+# Установка: pip install telethon flask waitress aiosqlite psutil aiohttp
 
-import os, re, json, time, hmac, asyncio, secrets, hashlib, logging, threading, random, string
+import os, re, json, time, hmac, asyncio, secrets, hashlib, logging, threading, random
 import datetime as dt
 import urllib.request
 from functools import wraps
 from collections import deque, defaultdict
 import aiosqlite
-import aiofiles
-from flask import Flask, request, jsonify, redirect, render_template_string, Response, session
+from flask import Flask, request, jsonify, redirect, render_template_string, session
 from waitress import serve
-from telethon import TelegramClient, events, Button, functions, types
+from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
 from telethon.errors import (
     SessionPasswordNeededError, FloodWaitError, SlowModeWaitError, 
     ChatWriteForbiddenError, UserBannedInChannelError, PeerFloodError,
-    ChannelPrivateError, InviteHashExpiredError, PhoneCodeInvalidError,
-    PasswordHashInvalidError
+    ChannelPrivateError, PhoneCodeInvalidError
 )
-from telethon.tl.functions.channels import JoinChannelRequest
-from telethon.tl.functions.messages import ImportChatInviteRequest
 
 try:
     import psutil
@@ -36,11 +32,8 @@ FLASK_SECRET = os.getenv("FLASK_SECRET", "titan_v15_omnicore_secret")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 DB_PATH = os.getenv("DB_PATH", "titan_v15.db")
 WEB_PORT = int(os.getenv("PORT", "10000"))
-MAX_CONCURRENT_CLIENTS = 20
 
 SUPER_ADMINS = {int(x) for x in os.getenv("SUPER_ADMINS", "8655682794,8773171051").split(",") if x.strip().isdigit()}
-OWNER_CONTACT = "@apemiru"
-CHANNEL_LINK = "https://t.me/titan_enterprise"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] OMNI: %(message)s")
 log = logging.getLogger("OMNI")
@@ -53,8 +46,7 @@ bot = None
 db = None
 loop = None
 auth_flows = {}
-task_queue = asyncio.Queue()
-system_logs = deque(maxlen=200)
+system_logs = deque(maxlen=100)
 active_engines = {}
 
 def utcnow(): return dt.datetime.now(dt.timezone.utc)
@@ -74,7 +66,9 @@ class OmniDB:
 
     async def init(self):
         async with self.conn() as db:
-            await db.execute("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+            # Исправлено: PRAGMA выполняется по одной команде
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute("PRAGMA synchronous=NORMAL")
             await db.executescript("""
                 CREATE TABLE IF NOT EXISTS users(
                     id INTEGER PRIMARY KEY, username TEXT, role TEXT DEFAULT 'USER',
@@ -82,30 +76,23 @@ class OmniDB:
                 );
                 CREATE TABLE IF NOT EXISTS accounts(
                     id INTEGER PRIMARY KEY AUTOINCREMENT, uid INTEGER, session TEXT, 
-                    status TEXT DEFAULT 'active', phone TEXT, proxy TEXT, last_active TEXT
+                    status TEXT DEFAULT 'active', phone TEXT, last_active TEXT
                 );
                 CREATE TABLE IF NOT EXISTS configs(
                     uid INTEGER PRIMARY KEY, templates TEXT DEFAULT '[]', targets TEXT DEFAULT '[]',
                     delay_ms INTEGER DEFAULT 10000, mode TEXT DEFAULT 'AUTO', 
                     randomize INTEGER DEFAULT 0, warmup INTEGER DEFAULT 1, 
-                    auto_reply INTEGER DEFAULT 0, schedule TEXT DEFAULT '{}', webhook TEXT DEFAULT ''
+                    auto_reply INTEGER DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS stats(
-                    uid INTEGER PRIMARY KEY, sent INTEGER DEFAULT 0, errors INTEGER DEFAULT 0, 
-                    parsed INTEGER DEFAULT 0, invited INTEGER DEFAULT 0
-                );
-                CREATE TABLE IF NOT EXISTS audit(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, uid INTEGER, action TEXT, details TEXT, time TEXT
+                    uid INTEGER PRIMARY KEY, sent INTEGER DEFAULT 0, errors INTEGER DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS tokens(token TEXT PRIMARY KEY, uid INTEGER, exp REAL);
                 CREATE TABLE IF NOT EXISTS sessions(sid TEXT PRIMARY KEY, uid INTEGER, exp REAL);
                 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, val TEXT);
-                CREATE TABLE IF NOT EXISTS tasks(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, uid INTEGER, type TEXT, 
-                    status TEXT DEFAULT 'pending', data TEXT, created_at TEXT
-                );
             """)
             await db.commit()
+        
         for admin in SUPER_ADMINS:
             await self.ensure_user(admin, "admin")
             await self.set_user(admin, role="ADMIN", approved=1)
@@ -115,7 +102,7 @@ class OmniDB:
             db.row_factory = aiosqlite.Row
             async with db.execute("""
                 SELECT u.*, c.templates, c.targets, c.delay_ms, c.mode, c.randomize, 
-                c.warmup, c.auto_reply, c.schedule, c.webhook
+                c.warmup, c.auto_reply
                 FROM users u LEFT JOIN configs c ON u.id = c.uid WHERE u.id=?
             """, (uid,)) as cur: return await cur.fetchone()
 
@@ -137,7 +124,7 @@ class OmniDB:
             await db.commit()
 
     async def set_config(self, uid, **kwargs):
-        allowed = {"templates", "targets", "delay_ms", "mode", "randomize", "warmup", "auto_reply", "schedule", "webhook"}
+        allowed = {"templates", "targets", "delay_ms", "mode", "randomize", "warmup", "auto_reply"}
         f = {k: v for k, v in kwargs.items() if k in allowed}
         if not f: return
         cols = ", ".join(f"{k}=?" for k in f)
@@ -155,6 +142,11 @@ class OmniDB:
     async def add_account(self, uid, session, phone):
         async with self.conn() as db:
             await db.execute("INSERT INTO accounts(uid, session, phone) VALUES(?,?,?)", (uid, session, phone))
+            await db.commit()
+
+    async def add_stat(self, uid, key):
+        async with self.conn() as db:
+            await db.execute(f"UPDATE stats SET {key}={key}+1 WHERE uid=?", (uid,))
             await db.commit()
 
     async def create_token(self, uid):
@@ -186,11 +178,6 @@ class OmniDB:
                 r = await cur.fetchone()
                 return r[0] if r else None
 
-    async def add_stat(self, uid, key):
-        async with self.conn() as db:
-            await db.execute(f"UPDATE stats SET {key}={key}+1 WHERE uid=?", (uid,))
-            await db.commit()
-
 # -------------------- OMNICORE ENGINE --------------------
 class OmniEngine:
     def __init__(self, uid, config, accounts):
@@ -221,7 +208,7 @@ class OmniEngine:
             dialogs = await client.get_dialogs(limit=5)
             for d in dialogs:
                 await client.get_messages(d.id, limit=2)
-                await asyncio.sleep(random.uniform(1, 3))
+                await asyncio.sleep(random.uniform(1, 2))
             log_omni(self.uid, "Прогрев завершен.")
         except Exception as e:
             log_omni(self.uid, f"Ошибка прогрева: {e}", "WARNING")
