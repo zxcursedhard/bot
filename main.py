@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-TITAN Enterprise v21.0 — Classic UI + Modern Core
+TITAN Enterprise v22.0 — Direct ID Auth + Classic UI
 """
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import hashlib
-import hmac
 import json
 import logging
 import os
@@ -21,7 +19,7 @@ from datetime import datetime, timezone
 from functools import wraps
 
 import aiosqlite
-from flask import Flask, abort, jsonify, redirect, render_template_string, request, session, url_for
+from flask import Flask, abort, jsonify, redirect, render_template_string, request, session
 from telethon import TelegramClient, events, Button
 from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
@@ -36,14 +34,13 @@ DB_PATH = os.getenv("DATABASE_PATH", "titan_database.db")
 HOST, PORT = os.getenv("HOST", "0.0.0.0"), int(os.getenv("PORT", "10000"))
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 SUPER_ADMINS = {int(x) for x in os.getenv("SUPER_ADMINS", "8655682794,8773171051").split(",") if x.strip().isdigit()}
-COOKIE_DAYS, TOKEN_TTL = 14, 86400
+COOKIE_DAYS = 14
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("titan")
 
 # ------------------------------- UTILS -------------------------------
 def now(): return datetime.now(timezone.utc).isoformat(timespec="seconds")
-def digest(v): return hashlib.sha256(v.encode()).hexdigest()
 def jdump(v): return json.dumps(v, ensure_ascii=False, separators=(",", ":"))
 def jload(v, d):
     try: return json.loads(v or "")
@@ -123,10 +120,6 @@ class Database:
                 CREATE TABLE IF NOT EXISTS stats(
                     owner_id INTEGER PRIMARY KEY, sent INTEGER DEFAULT 0, failed INTEGER DEFAULT 0, updated_at TEXT
                 );
-                CREATE TABLE IF NOT EXISTS tokens(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER, token_hash TEXT UNIQUE,
-                    expires_at REAL, used INTEGER DEFAULT 0, created_at TEXT
-                );
             """)
             await conn.commit()
             await conn.close()
@@ -173,16 +166,12 @@ async def on_command(event):
         await event.respond("TITAN Enterprise", buttons=[[Button.inline("🌐 Войти в панель", b"login")]])
     elif event.raw_text.startswith("/panel"):
         if uid not in SUPER_ADMINS: return await event.respond("Доступ запрещён.")
-        raw = secrets.token_urlsafe(32)
-        await database.execute("INSERT INTO tokens(owner_id,token_hash,expires_at,created_at) VALUES(?,?,?,?)", (uid, digest(raw), time.time()+TOKEN_TTL, now()))
-        await event.respond(f"Ссылка (24 часа):\n{PUBLIC_BASE_URL}/login?token={raw}")
+        await event.respond(f"Ссылка для входа:\n{PUBLIC_BASE_URL}/login?uid={uid}")
 
 async def on_callback(event):
     if event.data == b"login":
         uid = int(event.sender_id)
-        raw = secrets.token_urlsafe(32)
-        await database.execute("INSERT INTO tokens(owner_id,token_hash,expires_at,created_at) VALUES(?,?,?,?)", (uid, digest(raw), time.time()+TOKEN_TTL, now()))
-        await event.respond(f"Ссылка (24 часа):\n{PUBLIC_BASE_URL}/login?token={raw}")
+        await event.respond(f"Ссылка для входа:\n{PUBLIC_BASE_URL}/login?uid={uid}")
         await event.answer()
 
 async def telegram_start():
@@ -240,7 +229,7 @@ class SpamEngine:
                     except: pass
         await client.disconnect()
 
-# ------------------------------ WEB UI (CLASSIC DARK) ------------------------------
+# ------------------------------ WEB UI ------------------------------
 app = Flask(__name__)
 app.secret_key = FLASK_SECRET
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax", PERMANENT_SESSION_LIFETIME=COOKIE_DAYS*86400)
@@ -465,13 +454,16 @@ load(); setInterval(load, 5000);
 
 @app.route("/login")
 def login():
-    token = request.args.get("token", "")
-    if not token: return "Токен отсутствует. Запросите ссылку в боте (/panel)."
-    row = submit(database.one("SELECT * FROM tokens WHERE token_hash=? AND used=0 AND expires_at>?", (digest(token), time.time()))).result()
-    if not row: return "Ссылка истекла или недействительна."
-    submit(database.execute("UPDATE tokens SET used=1 WHERE id=?", (row["id"],))).result()
+    uid = request.args.get("uid")
+    if not uid or not uid.isdigit():
+        return "Неверный ID. Запросите ссылку в боте (/panel)."
+    
+    # Проверка, что этот ID есть в базе админов (чтобы никто чужой не зашел)
+    if int(uid) not in SUPER_ADMINS:
+        return "Доступ к панели разрешен только администраторам."
+        
     session.permanent = True
-    session["user_id"] = row["owner_id"]
+    session["user_id"] = int(uid)
     session["csrf"] = secrets.token_urlsafe(32)
     return redirect("/")
 
