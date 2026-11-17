@@ -1039,7 +1039,7 @@ main{padding:18px 14px}h1{font-size:20px}.grid{grid-template-columns:repeat(2,mi
 <button id="modeAuto" onclick="setMode('AUTO')">AUTO // БЕЗОПАСНЫЙ</button>
 <button id="modeExtreme" onclick="setMode('EXTREME')">EXTREME // ЭКСТРИМ</button></div>
 <p class="muted" style="font-size:12px;margin-top:10px">AUTO: плавная отправка. EXTREME: минимальная задержка, спит ровно по требованию Telegram.</p></div>
-<div class="section"><h2>Шаблоны (строго по очереди через deque)</h2>
+<div class="section"><h2>Шаблоны (строго по очереди)</h2>
 <textarea id="templates" placeholder="Шаблон #1&#10;Шаблон #2"></textarea>
 <div class="row" style="margin-top:10px"><button onclick="saveTemplates()">СОХРАНИТЬ ШАБЛОНЫ</button>
 <label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted)">
@@ -1517,16 +1517,12 @@ def api_templates():
     uid = int(request.titan_user["user_id"])
     raw = (request.get_json(silent=True) or {}).get("text", "")
 
-    # FIX: превращаем литеральные "\n", "\r\n", "\r" в реальные переносы.
-    # Это спасает кейс, когда в textarea вставили "тест1\ntест2".
-    raw = raw.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
-
+    # FIX: просто режем по строкам. Пользователь сам разделяет шаблоны Enter-ом.
     chunks = []
-    for part in raw.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
-        for sub in part.splitlines():
-            s = sub.strip()
-            if s:
-                chunks.append(s)
+    for line in raw.split("\n"):
+        s = line.strip()
+        if s:
+            chunks.append(s)
 
     values = list(dict.fromkeys(chunks))[:MAX_TEMPLATES]
     run_async(db.update_user_lists(uid, templates=values))
@@ -1922,10 +1918,6 @@ async def warmup_client(client):
         log.warning(f"Warmup skipped: {e}")
 
 async def send_to_target(uid, session_str, target, message, delay, stop_event, mode):
-    """
-    FIX: entity инициализируется заранее — иначе при FloodWaitError
-    до присвоения entity будет UnboundLocalError.
-    """
     entity = None
     try:
         async with client_manager.acquire(session_str) as client:
@@ -1973,6 +1965,11 @@ async def notification_worker(uid, stop_event):
     log.info(f"Engine started for user {uid}")
     sent_before = (await db.get_stats(uid))["sent"]
     errors_before = (await db.get_stats(uid))["errors"]
+    
+    # FIX: глобальный счётчик шаблонов. Растёт с КАЖДОЙ отправкой,
+    # независимо от количества целей. Шаблоны идут строго по кругу.
+    tpl_idx = 0 
+    
     try:
         while not stop_event.is_set():
             user = await db.get_user(uid)
@@ -1995,14 +1992,16 @@ async def notification_worker(uid, stop_event):
                 except Exception as e:
                     log.warning(f"Warmup failed: {e}")
 
-            # FIX: честный round-robin по шаблонам, независимо от числа целей.
-            # Раньше deque пересоздавался только при опустошении, и если целей
-            # меньше, чем шаблонов — второй шаблон НИКОГДА не брался.
             tasks = []
-            for i, target in enumerate(targets):
+            for target in targets:
                 if stop_event.is_set():
                     break
-                tpl_raw = templates[i % len(templates)]
+                
+                # FIX: берем шаблон по глобальному счётчику (tpl_idx), 
+                # а не по индексу цели (i).
+                tpl_raw = templates[tpl_idx % len(templates)]
+                tpl_idx += 1
+                
                 tpl = randomize_text(tpl_raw, randomize)
                 if len(tpl) > 4000:
                     tpl = tpl[:4000]
