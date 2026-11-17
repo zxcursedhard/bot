@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TITAN Enterprise v24.0 — Classic Dark WebUI + Direct Auth
+TITAN Enterprise v25.0 — Classic UI + Direct Auth + 2FA Support
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from functools import wraps
 import aiosqlite
 from flask import Flask, abort, jsonify, redirect, render_template_string, request, session
 from telethon import TelegramClient, events, Button
-from telethon.errors import FloodWaitError
+from telethon.errors import FloodWaitError, SessionPasswordNeededError
 from telethon.sessions import StringSession
 from waitress import serve
 
@@ -229,7 +229,7 @@ class SpamEngine:
                     except: pass
         await client.disconnect()
 
-# ------------------------------ WEB UI (CLASSIC DASHBOARD) ------------------------------
+# ------------------------------ WEB UI ------------------------------
 app = Flask(__name__)
 app.secret_key = FLASK_SECRET
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax", PERMANENT_SESSION_LIFETIME=COOKIE_DAYS*86400)
@@ -302,6 +302,11 @@ th{color:#9da9bd;font-weight:600;font-size:11px;text-transform:uppercase;letter-
 <div id="acc-code-div" class="hidden">
 <input id="acc-code" placeholder="Код из Telegram">
 <button class="green" onclick="verifyAuth()">Войти</button>
+</div>
+<div id="acc-2fa-div" class="hidden">
+<p class="muted" style="margin-bottom:10px;">На аккаунте включена 2FA. Введите пароль:</p>
+<input id="acc-2fa" type="password" placeholder="Пароль 2FA">
+<button class="green" onclick="verify2FA()">Подтвердить</button>
 </div>
 </div>
 </div>
@@ -392,8 +397,26 @@ async function startAuth(){
     if(r.ok) document.getElementById('acc-code-div').classList.remove('hidden');
 }
 async function verifyAuth(){
-    const r=await api('/api/auth/verify',{method:'POST',body:JSON.stringify({code:document.getElementById('acc-code').value})});
-    if(r.ok) { alert('Аккаунт добавлен!'); load(); }
+    const r = await api('/api/auth/verify', {method:'POST', body:JSON.stringify({code:document.getElementById('acc-code').value})});
+    
+    if (r.error) { alert(r.error); return; }
+
+    if (r.need_2fa) {
+        document.getElementById('acc-code-div').classList.add('hidden');
+        document.getElementById('acc-2fa-div').classList.remove('hidden');
+    } else if (r.ok) {
+        alert('Аккаунт добавлен!'); load();
+    }
+}
+async function verify2FA(){
+    const r = await api('/api/auth/2fa', {method:'POST', body:JSON.stringify({password: document.getElementById('acc-2fa').value})});
+    if (r.ok) {
+        alert('Аккаунт успешно добавлен!');
+        document.getElementById('acc-2fa-div').classList.add('hidden');
+        load();
+    } else {
+        alert(r.error || 'Ошибка');
+    }
 }
 async function saveCfg(){
     await api('/api/cfg',{method:'POST',body:JSON.stringify({mode:document.getElementById('cfg-mode').value,delay:parseFloat(document.getElementById('cfg-delay').value),warmup:parseInt(document.getElementById('cfg-warmup').value)})});
@@ -552,16 +575,45 @@ def api_auth_verify():
     uid = get_u()["user_id"]
     code = request.json.get("code")
     f = rt.active_engines.get(f"auth_{uid}")
-    if not f: return jsonify({"error": "Expired"}), 400
+    if not f: return jsonify({"error": "Сессия истекла."}), 400
+    
     async def _v():
         try:
             await f["c"].sign_in(phone=f["phone"], code=code, phone_code_hash=f["hash"])
             sess = f["c"].session.save()
             await database.execute("INSERT INTO accounts(owner_id,session,phone,created_at) VALUES(?,?,?,?)", (uid, sess, f["phone"], now()))
             await f["c"].disconnect()
-            return {"ok": True}
-        except Exception as e: return {"error": str(e)[:50]}
+            return {"ok": True, "need_2fa": False}
+        except SessionPasswordNeededError:
+            return {"ok": False, "need_2fa": True}
+        except Exception as e:
+            await f["c"].disconnect()
+            return {"error": str(e)[:100]}
+            
     res = submit(_v()).result(20)
+    if not res.get("need_2fa"):
+        rt.active_engines.pop(f"auth_{uid}", None)
+    return jsonify(res)
+
+@app.route("/api/auth/2fa", methods=["POST"])
+@login_req
+def api_auth_2fa():
+    uid = get_u()["user_id"]
+    password = request.json.get("password")
+    f = rt.active_engines.get(f"auth_{uid}")
+    if not f: return jsonify({"error": "Сессия истекла"}), 400
+    
+    async def _v2fa():
+        try:
+            await f["c"].sign_in(password=password)
+            sess = f["c"].session.save()
+            await database.execute("INSERT INTO accounts(owner_id,session,phone,created_at) VALUES(?,?,?,?)", (uid, sess, f["phone"], now()))
+            await f["c"].disconnect()
+            return {"ok": True}
+        except Exception as e:
+            return {"error": "Неверный пароль"}
+            
+    res = submit(_v2fa()).result(20)
     rt.active_engines.pop(f"auth_{uid}", None)
     return jsonify(res)
 
