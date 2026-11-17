@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TITAN Enterprise v15.5 (GPT UI Edition) — True Omni-Core
+TITAN Enterprise v16.0 — GPT UI Mobile Edition
 Single-file high-performance Telegram automation platform.
 """
 from __future__ import annotations
@@ -37,7 +37,7 @@ from telethon.sessions import StringSession
 from waitress import serve
 
 # ------------------------------- Configuration -------------------------------
-APP_NAME, VERSION = "TITAN Enterprise", "15.5 Omni-Core"
+APP_NAME, VERSION = "TITAN Enterprise", "16.0 GPT Mobile"
 API_ID = int(os.getenv("API_ID", "2040") or "2040")
 API_HASH = os.getenv("API_HASH", "b18441a1ff607e10a989891a5462e627")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8732669492:AAGjBx_kMW4JRpo4DyhCoRwAISSS-lJ1IhE")
@@ -208,15 +208,6 @@ class Database:
           WHERE owner_id=?""",
           (bounded_float(gap), jdump(templates), jdump(targets), mode, int(randomize), int(warmup), now(), uid))
 
-    async def backup(self):
-        filename = os.path.join(BACKUP_DIR, f"titan_{datetime.now():%Y%m%d_%H%M%S}.db")
-        async with self.lock:
-            src = await self.connect()
-            dst = await aiosqlite.connect(filename)
-            try: await src.backup(dst)
-            finally: await dst.close(); await src.close()
-        return filename
-
 database = Database(DB_PATH)
 
 # ------------------------------ Runtime manager ------------------------------
@@ -363,16 +354,15 @@ class SpamEngine:
 # -------------------------------- Web dashboard -------------------------------
 app = Flask(__name__)
 app.secret_key = FLASK_SECRET
-app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SECURE=os.getenv("COOKIE_SECURE", "1") == "1",
-                  SESSION_COOKIE_SAMESITE="Lax", PERMANENT_SESSION_LIFETIME=COOKIE_DAYS * 86400,
-                  MAX_CONTENT_LENGTH=1024 * 1024)
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SECURE=False, SESSION_COOKIE_SAMESITE="Lax",
+                  PERMANENT_SESSION_LIFETIME=COOKIE_DAYS * 86400, MAX_CONTENT_LENGTH=1024 * 1024)
 
 CSS = """
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Space+Mono:wght@400;700&display=swap');
 :root{--bg:#050505;--panel:#0d1118;--line:#252c38;--red:#ff003c;--cyan:#00f0ff;--green:#35ff9a;--muted:#8994a5;--text:#eef3fa}
 *{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at 80% 0%,#1b0710,transparent 38%),var(--bg);color:var(--text);font-family:Inter,sans-serif}
-a{color:var(--cyan);text-decoration:none}button{border:1px solid #6b1630;background:linear-gradient(135deg,#ff003c,#a0002b);color:#fff;padding:11px 16px;border-radius:8px;font-weight:700;cursor:pointer}
-input,textarea,select{width:100%;background:#070a0f;border:1px solid var(--line);color:var(--text);padding:12px;border-radius:8px;font:inherit}textarea{min-height:125px}
+a{color:var(--cyan);text-decoration:none}button{border:1px solid #6b1630;background:linear-gradient(135deg,#ff003c,#a0002b);color:#fff;padding:11px 16px;border-radius:8px;font-weight:700;cursor:pointer;width:100%}
+input,textarea,select{width:100%;background:#070a0f;border:1px solid var(--line);color:var(--text);padding:12px;border-radius:8px;font:inherit;margin-bottom:10px}textarea{min-height:125px}
 .shell{display:flex;min-height:100vh}.side{position:fixed;inset:0 auto 0 0;width:235px;padding:25px 17px;background:#080a0e;border-right:1px solid var(--line)}
 .brand{font:700 17px 'Space Mono';letter-spacing:1px}.brand b{color:var(--red)}.tag{font:10px 'Space Mono';color:var(--cyan);margin:8px 0 28px}
 .nav a{display:block;padding:12px;border-radius:8px;color:#aeb8c6;margin:5px 0}.nav a:hover{background:#1b1018;color:white;border-left:2px solid var(--red)}
@@ -392,7 +382,7 @@ table{width:100%;border-collapse:collapse;font-size:12px}th,td{text-align:left;p
 
 LAYOUT = """<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{{ title }} | TITAN</title><style>""" + CSS + """</style></head><body><div class="shell">
-<aside class="side"><div class="brand">TITAN <b>ENTERPRISE</b></div><div class="tag">OMNI-CORE // v15.5</div><nav class="nav">
+<aside class="side"><div class="brand">TITAN <b>ENTERPRISE</b></div><div class="tag">OMNI-CORE // v16.0</div><nav class="nav">
 <a href="/">◈ Дашборд</a><a href="/accounts">▣ Аккаунты</a><a href="/config">⚙ Конфигурация</a><a href="/terminal">⌁ Терминал</a>
 {% if admin %}<a href="/admin">♜ Админка</a>{% endif %}<a href="/logout">↗ Выход</a></nav><div class="footer">SECURE CONTROL SURFACE<br>ALL SYSTEMS MONITORED</div></aside>
 <main class="main"><header class="top"><div><h1>{{ title }}</h1><div class="muted">TITAN Enterprise / Control Center</div></div>
@@ -600,6 +590,11 @@ def err403(error): return page("Доступ запрещён", '<div class="not
 @app.errorhandler(404)
 def err404(error): return page("Не найдено", '<div class="notice">404 // NOT FOUND</div>'), 404
 
+@app.errorhandler(500)
+def err500(error):
+    session.pop("_flashes", None)
+    return page("Ошибка сервера", '<div class="notice">500 // INTERNAL SERVER ERROR</div>'), 500
+
 def run_web():
     try: serve(app, host=HOST, port=PORT, threads=8, connection_limit=100)
     except Exception: log.exception("Waitress server failed")
@@ -623,6 +618,25 @@ async def queue_broadcast(uid, body):
     await rt.queue.put({"id": bid, "owner_id": uid, "body": body})
     await database.audit(uid, "broadcast_queued", {"id": bid})
     return bid
+
+async def broadcast(job):
+    uid, bid = int(job["owner_id"]), job["id"]
+    recipients = await database.all("SELECT user_id FROM users WHERE subscribed=1")
+    total = len(recipients)
+    await database.execute("UPDATE broadcasts SET status='running',total=? WHERE id=?", (total, bid))
+    sent = failed = 0
+    rt.active += 1
+    try:
+        for row in recipients:
+            if rt.stop.is_set(): break
+            try:
+                await rt.bot.send_message(row["user_id"], job["body"])
+                sent += 1
+            except: failed += 1
+            await asyncio.sleep(0.05)
+        await database.execute("UPDATE broadcasts SET status='finished',sent=?,failed=?,finished_at=? WHERE id=?", (sent, failed, now(), bid))
+    finally:
+        rt.active -= 1
 
 async def maintenance():
     while not rt.stop.is_set():
