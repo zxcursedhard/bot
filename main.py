@@ -1,4 +1,4 @@
-# TITAN Enterprise v15.1 Omni-Core + Admin Logs
+# TITAN Enterprise v15.1 Omni-Core + Admin Logs + EXTREME BURST
 # pip install telethon flask waitress aiosqlite psutil aiohttp
 
 import os
@@ -63,6 +63,10 @@ MAX_TARGETS = 9999
 MAX_TEMPLATES = 9999
 MAX_LOGS = 500
 LOG_TABLE_LIMIT = 5000
+
+# FIX: параметры "пулемётного" режима EXTREME
+EXTREME_BURST_SIZE = 10      # сколько сообщений летят одновременно
+EXTREME_BURST_INTERVAL = 0.3 # пауза между пачками (сек)
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -1517,7 +1521,6 @@ def api_templates():
     uid = int(request.titan_user["user_id"])
     raw = (request.get_json(silent=True) or {}).get("text", "")
 
-    # FIX: просто режем по строкам. Пользователь сам разделяет шаблоны Enter-ом.
     chunks = []
     for line in raw.split("\n"):
         s = line.strip()
@@ -1555,7 +1558,6 @@ def api_config():
     run_async(db.set_config(uid, delay=delay,
                              randomize=1 if randomize else 0,
                              warmup=1 if payload.get("warmup") else 0))
-    # FIX: возвращаем randomize, чтобы фронт синхронизировал чекбокс
     return jsonify({"ok": True, "randomize": randomize})
 
 @app.post("/api/mode")
@@ -1954,20 +1956,20 @@ async def send_to_target(uid, session_str, target, message, delay, stop_event, m
         await db.inc_stat(uid, "errors", 1)
         await db.audit(uid, "NOTIFY_ERROR", f"{target}: {str(exc)[:300]}")
 
-    actual_delay = max(1, delay) if mode == "AUTO" else 0
-    if actual_delay > 0:
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=actual_delay)
-        except asyncio.TimeoutError:
-            pass
+    # В режиме EXTREME пауза НЕ применяется вообще
+    if mode == "AUTO":
+        actual_delay = max(1, delay)
+        if actual_delay > 0:
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=actual_delay)
+            except asyncio.TimeoutError:
+                pass
 
 async def notification_worker(uid, stop_event):
     log.info(f"Engine started for user {uid}")
     sent_before = (await db.get_stats(uid))["sent"]
     errors_before = (await db.get_stats(uid))["errors"]
     
-    # FIX: глобальный счётчик шаблонов. Растёт с КАЖДОЙ отправкой,
-    # независимо от количества целей. Шаблоны идут строго по кругу.
     tpl_idx = 0 
     
     try:
@@ -1992,24 +1994,53 @@ async def notification_worker(uid, stop_event):
                 except Exception as e:
                     log.warning(f"Warmup failed: {e}")
 
-            tasks = []
-            for target in targets:
-                if stop_event.is_set():
-                    break
-                
-                # FIX: берем шаблон по глобальному счётчику (tpl_idx), 
-                # а не по индексу цели (i).
-                tpl_raw = templates[tpl_idx % len(templates)]
-                tpl_idx += 1
-                
-                tpl = randomize_text(tpl_raw, randomize)
-                if len(tpl) > 4000:
-                    tpl = tpl[:4000]
-                tasks.append(asyncio.create_task(
-                    send_to_target(uid, user["session_string"], target,
-                                   tpl, delay, stop_event, mode)
-                ))
-            await asyncio.gather(*tasks, return_exceptions=True)
+            # FIX: Для EXTREME используем пачки (concurrent), чтобы получить 5+ сообщений в секунду
+            if mode == "EXTREME":
+                batch = []
+                for target in targets:
+                    if stop_event.is_set():
+                        break
+                    
+                    tpl_raw = templates[tpl_idx % len(templates)]
+                    tpl_idx += 1
+                    tpl = randomize_text(tpl_raw, randomize)
+                    if len(tpl) > 4000: tpl = tpl[:4000]
+                    
+                    batch.append(asyncio.create_task(
+                        send_to_target(uid, user["session_string"], target,
+                                       tpl, delay, stop_event, mode)
+                    ))
+                    
+                    # Отправляем пачками по 10 штук
+                    if len(batch) >= EXTREME_BURST_SIZE:
+                        await asyncio.gather(*batch, return_exceptions=True)
+                        batch = []
+                        # Пауза между пачками (можно убрать в 0)
+                        await asyncio.sleep(EXTREME_BURST_INTERVAL)
+                        
+                # Остаток
+                if batch:
+                    await asyncio.gather(*batch, return_exceptions=True)
+                    
+            # Для AUTO — классическая последовательная отправка
+            else:
+                tasks = []
+                for target in targets:
+                    if stop_event.is_set():
+                        break
+                    
+                    tpl_raw = templates[tpl_idx % len(templates)]
+                    tpl_idx += 1
+                    
+                    tpl = randomize_text(tpl_raw, randomize)
+                    if len(tpl) > 4000: tpl = tpl[:4000]
+                    
+                    tasks.append(asyncio.create_task(
+                        send_to_target(uid, user["session_string"], target,
+                                       tpl, delay, stop_event, mode)
+                    ))
+                await asyncio.gather(*tasks, return_exceptions=True)
+
             engine_state["cycles"] += 1
             engine_state["last_cycle_at"] = iso_now()
             engine_state["mode"] = mode
