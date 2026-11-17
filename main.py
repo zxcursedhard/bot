@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-TITAN Enterprise v20.0 — Secure Auth + Chat Picker
-Single-file high-performance Telegram automation platform.
+TITAN Enterprise v21.0 — Classic UI + Modern Core
 """
 from __future__ import annotations
 
@@ -17,36 +16,32 @@ import re
 import secrets
 import threading
 import time
-import uuid
 from collections import deque
 from datetime import datetime, timezone
 from functools import wraps
 
 import aiosqlite
-import aiohttp
-import psutil
-from flask import Flask, abort, jsonify, request, session, Response, redirect
+from flask import Flask, abort, jsonify, redirect, render_template_string, request, session, url_for
 from telethon import TelegramClient, events, Button
-from telethon.errors import FloodWaitError, SessionPasswordNeededError
+from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
 from waitress import serve
 
-# ------------------------------- Configuration -------------------------------
+# ------------------------------- CONFIG -------------------------------
 API_ID = int(os.getenv("API_ID", "2040") or "2040")
 API_HASH = os.getenv("API_HASH", "b18441a1ff607e10a989891a5462e627")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8732669492:AAGjBx_kMW4JRpo4DyhCoRwAISSS-lJ1IhE")
 FLASK_SECRET = os.getenv("FLASK_SECRET", secrets.token_urlsafe(48))
-DB_PATH = os.getenv("DATABASE_PATH", "titan_omnicore.db")
+DB_PATH = os.getenv("DATABASE_PATH", "titan_database.db")
 HOST, PORT = os.getenv("HOST", "0.0.0.0"), int(os.getenv("PORT", "10000"))
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 SUPER_ADMINS = {int(x) for x in os.getenv("SUPER_ADMINS", "8655682794,8773171051").split(",") if x.strip().isdigit()}
-COOKIE_DAYS = 14
-TOKEN_TTL = 86400  # 24 часа
+COOKIE_DAYS, TOKEN_TTL = 14, 86400
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("titan")
 
-# --------------------------------- Utilities ----------------------------------
+# ------------------------------- UTILS -------------------------------
 def now(): return datetime.now(timezone.utc).isoformat(timespec="seconds")
 def digest(v): return hashlib.sha256(v.encode()).hexdigest()
 def jdump(v): return json.dumps(v, ensure_ascii=False, separators=(",", ":"))
@@ -69,16 +64,18 @@ def parse_targets(text):
         elif re.match(r"^https?://t\.me/", x): out.append("@" + x.split("/")[-1])
     return out
 
-# ------------------------------- Database --------------------------------
+# ------------------------------- DATABASE -------------------------------
 class Database:
     def __init__(self, path):
         self.path = path
         self.lock = asyncio.Lock()
+    
     async def connect(self):
         conn = await aiosqlite.connect(self.path, timeout=30)
         conn.row_factory = aiosqlite.Row
         await conn.execute("PRAGMA journal_mode=WAL")
         return conn
+
     async def execute(self, sql, params=()):
         async with self.lock:
             conn = await self.connect()
@@ -87,6 +84,7 @@ class Database:
                 await conn.commit()
                 return cur.rowcount
             finally: await conn.close()
+
     async def one(self, sql, params=()):
         async with self.lock:
             conn = await self.connect()
@@ -95,6 +93,7 @@ class Database:
                 r = await cur.fetchone()
                 return dict(r) if r else None
             finally: await conn.close()
+
     async def all(self, sql, params=()):
         async with self.lock:
             conn = await self.connect()
@@ -107,11 +106,27 @@ class Database:
         async with self.lock:
             conn = await self.connect()
             await conn.executescript("""
-                CREATE TABLE IF NOT EXISTS users(user_id INTEGER PRIMARY KEY, username TEXT DEFAULT '', first_name TEXT DEFAULT '', subscribed INTEGER DEFAULT 0, balance INTEGER DEFAULT 0, plan TEXT DEFAULT 'FREE', created_at TEXT, updated_at TEXT);
-                CREATE TABLE IF NOT EXISTS accounts(id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER, session TEXT, phone TEXT, status TEXT DEFAULT 'active', created_at TEXT);
-                CREATE TABLE IF NOT EXISTS configs(owner_id INTEGER PRIMARY KEY, mode TEXT DEFAULT 'AUTO', send_gap REAL DEFAULT 3, templates TEXT DEFAULT '[]', targets TEXT DEFAULT '[]', randomize INTEGER DEFAULT 0, warmup INTEGER DEFAULT 1, updated_at TEXT);
-                CREATE TABLE IF NOT EXISTS stats(owner_id INTEGER PRIMARY KEY, sent INTEGER DEFAULT 0, failed INTEGER DEFAULT 0, updated_at TEXT);
-                CREATE TABLE IF NOT EXISTS tokens(id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER, token_hash TEXT UNIQUE, expires_at REAL, used INTEGER DEFAULT 0, created_at TEXT);
+                CREATE TABLE IF NOT EXISTS users(
+                    user_id INTEGER PRIMARY KEY, username TEXT DEFAULT '', first_name TEXT DEFAULT '',
+                    subscribed INTEGER DEFAULT 0, balance INTEGER DEFAULT 0, plan TEXT DEFAULT 'FREE',
+                    created_at TEXT, updated_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS accounts(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER, session TEXT, 
+                    phone TEXT, status TEXT DEFAULT 'active', created_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS configs(
+                    owner_id INTEGER PRIMARY KEY, mode TEXT DEFAULT 'AUTO', send_gap REAL DEFAULT 3,
+                    templates TEXT DEFAULT '[]', targets TEXT DEFAULT '[]', randomize INTEGER DEFAULT 0,
+                    warmup INTEGER DEFAULT 1, updated_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS stats(
+                    owner_id INTEGER PRIMARY KEY, sent INTEGER DEFAULT 0, failed INTEGER DEFAULT 0, updated_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS tokens(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER, token_hash TEXT UNIQUE,
+                    expires_at REAL, used INTEGER DEFAULT 0, created_at TEXT
+                );
             """)
             await conn.commit()
             await conn.close()
@@ -137,20 +152,18 @@ class Database:
 
 database = Database(DB_PATH)
 
-# ------------------------------ Runtime ------------------------------
+# ------------------------------ RUNTIME ------------------------------
 class Runtime:
     def __init__(self):
         self.loop = None
         self.bot = None
         self.started = time.time()
-        self.logs = deque(maxlen=200)
         self.active_engines = {}
 
 rt = Runtime()
-def submit(coro):
-    return asyncio.run_coroutine_threadsafe(coro, rt.loop)
+def submit(coro): return asyncio.run_coroutine_threadsafe(coro, rt.loop)
 
-# ------------------------------ Bot ------------------------------
+# ------------------------------ BOT ------------------------------
 async def on_command(event):
     uid = int(event.sender_id)
     sender = await event.get_sender()
@@ -178,7 +191,7 @@ async def telegram_start():
     rt.bot.add_event_handler(on_command, events.NewMessage(incoming=True, pattern=r"^/(start|panel)"))
     rt.bot.add_event_handler(on_callback, events.CallbackQuery())
 
-# ------------------------------ Engine ------------------------------
+# ------------------------------ ENGINE ------------------------------
 class SpamEngine:
     def __init__(self, uid, config, accounts):
         self.uid = uid
@@ -227,7 +240,7 @@ class SpamEngine:
                     except: pass
         await client.disconnect()
 
-# ------------------------------ Web ------------------------------
+# ------------------------------ WEB UI (CLASSIC DARK) ------------------------------
 app = Flask(__name__)
 app.secret_key = FLASK_SECRET
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax", PERMANENT_SESSION_LIFETIME=COOKIE_DAYS*86400)
@@ -237,54 +250,63 @@ HTML = r"""
 <title>TITAN Enterprise</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
 <style>
-:root{--bg:#050505;--panel:#111;--line:#222;--txt:#eee;--muted:#666;--red:#ff003c;--cyan:#00f0ff}
-*{box-sizing:border-box;margin:0;padding:0}body{background:var(--bg);color:var(--txt);font:14px 'Inter',sans-serif;display:flex;min-height:100vh}
+:root{--bg:#0a0e14;--panel:#141a22;--line:#1f2933;--txt:#e8eef5;--muted:#7a8899;--acc:#4ea8de;--ok:#3ddc97;--warn:#ffb703;--err:#ef476f}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--txt);font:14px -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;min-height:100vh;display:flex}
 .side{width:220px;background:var(--panel);border-right:1px solid var(--line);padding:20px;display:flex;flex-direction:column}
-.logo{font-weight:800;font-size:18px;margin-bottom:30px;letter-spacing:1px}.logo span{color:var(--red)}
-.nav a{display:block;padding:12px;color:var(--muted);text-decoration:none;border-radius:8px;cursor:pointer;margin-bottom:5px;transition:0.2s}
-.nav a:hover,.nav a.active{background:#222;color:#fff}
-.main{flex:1;padding:20px;overflow-y:auto}
-.header{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px}
-h1{font-size:22px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:15px;margin-bottom:20px}
+.logo{font-weight:800;font-size:18px;margin-bottom:30px;letter-spacing:1px;color:var(--acc)}
+.nav a{display:block;padding:12px;color:var(--muted);text-decoration:none;border-radius:8px;cursor:pointer;margin-bottom:5px;transition:0.2s;font-weight:500}
+.nav a:hover,.nav a.active{background:var(--line);color:var(--txt)}
+.main{flex:1;padding:30px;overflow-y:auto;max-width:1400px}
+.header{display:flex;justify-content:space-between;align-items:center;margin-bottom:25px}
+h1{font-size:24px;font-weight:700;color:#fff}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:15px;margin-bottom:25px}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px}
-.metric{font-size:28px;font-weight:800;color:var(--red);margin-top:10px}
+.metric{font-size:28px;font-weight:700;margin-top:10px;color:var(--acc)}
+.label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:1.5px}
 .panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px;margin-bottom:20px}
-input,textarea,select{width:100%;background:#000;border:1px solid var(--line);color:#fff;padding:12px;border-radius:8px;margin-bottom:10px;font-family:inherit}
-button{width:100%;padding:12px;background:var(--red);color:#fff;border:none;border-radius:8px;font-weight:800;cursor:pointer;margin-bottom:10px}
-button.gray{background:#222}
-button.cyan{background:var(--cyan);color:#000}
-.chat-list{max-height:300px;overflow-y:auto;border:1px solid var(--line);border-radius:8px;padding:10px;margin-bottom:15px;background:#000}
-.chat-item{display:flex;align-items:center;gap:10px;padding:8px;border-bottom:1px solid #111}
-.chat-item input{width:auto;margin:0}
+input,textarea,select{width:100%;background:#0a0e14;border:1px solid var(--line);color:var(--txt);padding:12px;border-radius:8px;margin-bottom:10px;font-family:inherit;outline:none}
+input:focus,textarea:focus,select:focus{border-color:var(--acc)}
+button{width:100%;padding:12px;background:var(--acc);color:#0a0e14;border:none;border-radius:8px;font-weight:700;cursor:pointer;margin-bottom:10px;transition:0.2s}
+button:hover{filter:brightness(1.1)}
+button.gray{background:var(--line);color:var(--txt)}
+button.red{background:var(--err);color:#fff}
+button.ok{background:var(--ok);color:#0a0e14}
+.chat-list{max-height:300px;overflow-y:auto;border:1px solid var(--line);border-radius:8px;padding:10px;margin-bottom:15px;background:#0a0e14}
+.chat-item{display:flex;align-items:center;gap:10px;padding:8px;border-bottom:1px solid var(--line);color:var(--muted)}
+.chat-item input{width:auto;margin:0;accent-color:var(--acc)}
 .hidden{display:none!important}
 table{width:100%;border-collapse:collapse;font-size:13px}
-th,td{text-align:left;padding:10px;border-bottom:1px solid var(--line)}
-@media(max-width:768px){body{flex-direction:column}.side{width:100%;border-right:none;border-bottom:1px solid var(--line);padding:10px}.nav{display:flex;overflow-x:auto;gap:5px}.nav a{white-space:nowrap;padding:8px 12px}.logo{margin-bottom:10px}.main{padding:15px}}
+th,td{text-align:left;padding:12px;border-bottom:1px solid var(--line)}
+th{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:1px}
+.dummy{text-align:center;padding:60px;color:var(--muted)}
+.dummy h2{color:var(--warn);margin-bottom:10px;font-size:20px}
+@media(max-width:768px){body{flex-direction:column}.side{width:100%;border-right:none;border-bottom:1px solid var(--line);padding:15px}.nav{display:flex;overflow-x:auto;gap:5px}.nav a{white-space:nowrap;padding:8px 12px}.logo{margin-bottom:15px}.main{padding:20px}}
 </style></head><body>
 <div class="side">
-<div class="logo">TITAN <span>ENTERPRISE</span></div>
+<div class="logo">TITAN ENTERPRISE</div>
 <div class="nav">
-<a class="active" onclick="tab('dash')">Обзор</a>
-<a onclick="tab('acc')">Аккаунты</a>
-<a onclick="tab('chats')">Мои чаты</a>
-<a onclick="tab('cfg')">Настройки</a>
-<a id="admin-btn" class="hidden" onclick="tab('adm')">Админка</a>
-<a href="/logout">Выход</a>
+<a class="active" onclick="tab('dash')">📊 Обзор</a>
+<a onclick="tab('acc')">👤 Аккаунты</a>
+<a onclick="tab('chats')">💬 Мои чаты</a>
+<a onclick="tab('cfg')">⚙️ Настройки</a>
+<a onclick="tab('shop')">🛒 Магазин</a>
+<a id="admin-btn" class="hidden" onclick="tab('adm')">👑 Админка</a>
+<a href="/logout">🚪 Выход</a>
 </div>
 </div>
 <div class="main">
-<div class="header"><h1 id="title">Обзор</h1><span id="status" style="color:var(--cyan)">ONLINE</span></div>
+<div class="header"><h1 id="title">Обзор</h1></div>
 
 <div id="tab-dash" class="tab-content">
 <div class="grid">
-<div class="card"><div>Отправлено</div><div class="metric" id="m-sent">0</div></div>
-<div class="card"><div>Ошибки</div><div class="metric" id="m-err">0</div></div>
-<div class="card"><div>Аккаунты</div><div class="metric" id="m-acc">0</div></div>
+<div class="card"><div class="label">Отправлено</div><div class="metric" id="m-sent">0</div></div>
+<div class="card"><div class="label">Ошибки</div><div class="metric" style="color:var(--err)" id="m-err">0</div></div>
+<div class="card"><div class="label">Аккаунты</div><div class="metric" style="color:var(--ok)" id="m-acc">0</div></div>
 </div>
 <div class="panel">
 <h3>Статус движка</h3>
-<p id="eng-status" style="margin-top:10px;font-weight:800;">ОСТАНОВЛЕН</p>
+<p id="eng-status" style="margin-top:10px;font-weight:700;color:var(--warn);">ОСТАНОВЛЕН</p>
 </div>
 </div>
 
@@ -294,8 +316,8 @@ th,td{text-align:left;padding:10px;border-bottom:1px solid var(--line)}
 <input id="acc-phone" placeholder="+79990000000">
 <button onclick="startAuth()">Получить код</button>
 <div id="acc-code-div" class="hidden">
-<input id="acc-code" placeholder="Код">
-<button onclick="verifyAuth()">Войти</button>
+<input id="acc-code" placeholder="Код из Telegram">
+<button class="ok" onclick="verifyAuth()">Войти</button>
 </div>
 </div>
 </div>
@@ -303,30 +325,37 @@ th,td{text-align:left;padding:10px;border-bottom:1px solid var(--line)}
 <div id="tab-chats" class="tab-content hidden">
 <div class="panel">
 <h3>Выберите чаты для рассылки</h3>
-<button class="gray" onclick="loadChats()">Обновить список</button>
+<button class="gray" onclick="loadChats()">🔄 Обновить список</button>
 <div class="chat-list" id="chat-list">Нажмите "Обновить список"</div>
-<button class="cyan" onclick="saveSelectedChats()">Сохранить выбранные в цели</button>
+<button class="ok" onclick="saveSelectedChats()">Сохранить выбранные в цели</button>
 </div>
 </div>
 
 <div id="tab-cfg" class="tab-content hidden">
 <div class="panel">
 <h3>Режим</h3>
-<select id="cfg-mode"><option value="AUTO">AUTO</option><option value="EXTREME">EXTREME</option></select>
+<select id="cfg-mode"><option value="AUTO">AUTO (Безопасный)</option><option value="EXTREME">EXTREME (Скорость)</option></select>
 <h3>Задержка (сек)</h3><input id="cfg-delay" type="number" step="0.1">
 <h3>Прогрев</h3><select id="cfg-warmup"><option value="1">Вкл</option><option value="0">Выкл</option></select>
 <button onclick="saveCfg()">Сохранить</button>
 </div>
-<div class="panel"><h3>Шаблоны</h3><textarea id="cfg-tpl" rows="3"></textarea><button onclick="saveTpl()">Сохранить</button></div>
-<div class="panel"><h3>Цели (вручную)</h3><textarea id="cfg-tgt" rows="3"></textarea><button onclick="saveTgt()">Сохранить</button></div>
-<button onclick="engine('start')" class="cyan">ЗАПУСТИТЬ</button>
-<button onclick="engine('stop')" class="gray">ОСТАНОВИТЬ</button>
+<div class="panel"><h3>Шаблоны</h3><textarea id="cfg-tpl" rows="3" placeholder="Каждая строка - новый шаблон"></textarea><button onclick="saveTpl()">Сохранить</button></div>
+<div class="panel"><h3>Цели (вручную)</h3><textarea id="cfg-tgt" rows="3" placeholder="@username или -100..."></textarea><button onclick="saveTgt()">Сохранить</button></div>
+<button class="ok" onclick="engine('start')">🚀 ЗАПУСТИТЬ</button>
+<button class="red" onclick="engine('stop')">🛑 ОСТАНОВИТЬ</button>
+</div>
+
+<div id="tab-shop" class="tab-content hidden">
+<div class="panel dummy">
+<h2>Магазин в разработке</h2>
+<p>Скоро здесь появится возможность покупать готовые аккаунты напрямую через панель.</p>
+</div>
 </div>
 
 <div id="tab-adm" class="tab-content hidden">
 <div class="panel">
 <h3>Пользователи</h3>
-<table id="adm-table"></table>
+<table id="adm-table"><thead><tr><th>ID</th><th>Баланс</th><th>Действия</th></tr></thead><tbody></tbody></table>
 </div>
 </div>
 
@@ -338,7 +367,7 @@ function tab(id){
     document.getElementById('tab-'+id).classList.remove('hidden');
     document.querySelectorAll('.nav a').forEach(x=>x.classList.remove('active'));
     event.target.classList.add('active');
-    document.getElementById('title').textContent=event.target.textContent;
+    document.getElementById('title').textContent=event.target.textContent.replace(/[^\w\sА-Яа-я]/g, '').trim();
 }
 async function api(url,opts={}){
     const r=await fetch(url,{...opts,headers:{'Content-Type':'application/json','X-CSRF-Token':csrf,...opts.headers}});
@@ -353,7 +382,9 @@ async function load(){
         document.getElementById('m-sent').textContent=u.stats.sent||0;
         document.getElementById('m-err').textContent=u.stats.failed||0;
         document.getElementById('m-acc').textContent=u.accounts;
-        document.getElementById('eng-status').textContent=u.running?'РАБОТАЕТ':'ОСТАНОВЛЕН';
+        const st = document.getElementById('eng-status');
+        st.textContent = u.running ? 'РАБОТАЕТ' : 'ОСТАНОВЛЕН';
+        st.style.color = u.running ? 'var(--ok)' : 'var(--warn)';
         document.getElementById('cfg-mode').value=u.mode;
         document.getElementById('cfg-delay').value=u.gap;
         document.getElementById('cfg-warmup').value=u.warmup;
@@ -362,7 +393,13 @@ async function load(){
         if(u.admin){
             document.getElementById('admin-btn').classList.remove('hidden');
             const d=await api('/api/admin/users');
-            document.getElementById('adm-table').innerHTML=d.users.map(x=>`<tr><td>${x.user_id}</td><td>${x.balance}₽</td></tr>`).join('');
+            document.getElementById('adm-table').querySelector('tbody').innerHTML=d.users.map(x=>`
+                <tr>
+                    <td>${x.user_id}</td>
+                    <td>${x.balance} ₽</td>
+                    <td><button class="ok" style="padding:5px;font-size:11px;width:auto;margin:0" onclick="addBal(${x.user_id})">+Баланс</button></td>
+                </tr>
+            `).join('');
         }
     }catch(e){console.error(e)}
 }
@@ -416,6 +453,12 @@ async function saveSelectedChats(){
     alert('Добавлено в цели!');
     load();
 }
+async function addBal(id){
+    const a = prompt("Сумма для начисления:");
+    if(!a) return;
+    await api('/api/admin/bal',{method:'POST',body:JSON.stringify({user_id:id,amount:parseInt(a)})});
+    load();
+}
 load(); setInterval(load, 5000);
 </script></body></html>
 """
@@ -423,16 +466,10 @@ load(); setInterval(load, 5000);
 @app.route("/login")
 def login():
     token = request.args.get("token", "")
-    if not token:
-        return "Токен отсутствует."
-    
+    if not token: return "Токен отсутствует. Запросите ссылку в боте (/panel)."
     row = submit(database.one("SELECT * FROM tokens WHERE token_hash=? AND used=0 AND expires_at>?", (digest(token), time.time()))).result()
-    if not row:
-        return "Ссылка истекла или недействительна. Запросите новую в боте (/panel)."
-    
-    # Помечаем как использованный (но он живет 24 часа, так что можно зайти по нему только раз)
+    if not row: return "Ссылка истекла или недействительна."
     submit(database.execute("UPDATE tokens SET used=1 WHERE id=?", (row["id"],))).result()
-    
     session.permanent = True
     session["user_id"] = row["owner_id"]
     session["csrf"] = secrets.token_urlsafe(32)
@@ -480,7 +517,6 @@ def api_chats():
     uid = get_u()["user_id"]
     accs = submit(database.all("SELECT * FROM accounts WHERE owner_id=?", (uid,))).result()
     if not accs: return jsonify({"error": "Нет аккаунтов"}), 400
-
     async def _get_chats():
         client = TelegramClient(StringSession(accs[0]["session"]), API_ID, API_HASH)
         await client.connect()
@@ -594,6 +630,14 @@ def api_admin_users():
     if get_u()["user_id"] not in SUPER_ADMINS: return jsonify({"error": "403"}), 403
     users = submit(database.all("SELECT user_id, balance FROM users LIMIT 100")).result()
     return jsonify({"users": users})
+
+@app.route("/api/admin/bal", methods=["POST"])
+@login_req
+def api_admin_bal():
+    if get_u()["user_id"] not in SUPER_ADMINS: return jsonify({"error": "403"}), 403
+    d = request.json
+    submit(database.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (d.get("amount", 0), d.get("user_id", 0)))).result()
+    return jsonify({"ok": True})
 
 def run_web(): serve(app, host=HOST, port=PORT, threads=8)
 
