@@ -1,223 +1,333 @@
-# =====================================================================
-# TITAN Enterprise v15.1 — Omni-Core (Ultimate Monolith)
-# =====================================================================
-# Установка: pip install telethon flask waitress aiosqlite psutil aiohttp
+#!/usr/bin/env python3
+"""
+TITAN Enterprise v15.5 — True Omni-Core
+Single-file high-performance Telegram automation platform.
+Features: Multi-account, Extreme Mode, Warmup, Queue Rotation, Deep Analytics.
+"""
+from __future__ import annotations
 
-import os, re, json, time, hmac, asyncio, secrets, hashlib, logging, threading, random
-import datetime as dt
-import urllib.request
+import asyncio
+import contextlib
+import hashlib
+import hmac
+import html
+import json
+import logging
+import os
+import random
+import re
+import secrets
+import threading
+import time
+import uuid
+from collections import deque
+from datetime import datetime, timezone
 from functools import wraps
-from collections import deque, defaultdict
+from urllib.parse import urlparse
+
 import aiosqlite
-from flask import Flask, request, jsonify, redirect, render_template_string, session
-from waitress import serve
+import aiohttp
+import psutil
+from flask import Flask, abort, jsonify, redirect, render_template_string, request, session
 from telethon import TelegramClient, events, Button
-from telethon.sessions import StringSession
 from telethon.errors import (
-    SessionPasswordNeededError, FloodWaitError, SlowModeWaitError, 
-    ChatWriteForbiddenError, UserBannedInChannelError, PeerFloodError,
-    ChannelPrivateError, PhoneCodeInvalidError
+    FloodWaitError, RPCError, SessionPasswordNeededError,
+    ChatWriteForbiddenError, SlowModeWaitError
 )
+from telethon.sessions import StringSession
+from waitress import serve
 
-try:
-    import psutil
-except ImportError:
-    psutil = None
-
-# -------------------- CONFIG --------------------
-API_ID = int(os.getenv("API_ID", "2040"))
+# ------------------------------- Configuration -------------------------------
+APP_NAME, VERSION = "TITAN Enterprise", "15.5 True Omni-Core"
+API_ID = int(os.getenv("API_ID", "2040") or "2040")
 API_HASH = os.getenv("API_HASH", "b18441a1ff607e10a989891a5462e627")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8732669492:AAGjBx_kMW4JRpo4DyhCoRwAISSS-lJ1IhE")
-FLASK_SECRET = os.getenv("FLASK_SECRET", "titan_v15_omnicore_secret")
+FLASK_SECRET = os.getenv("FLASK_SECRET", secrets.token_urlsafe(48))
+DB_PATH = os.getenv("DATABASE_PATH", "titan_omnicore.db")
+BACKUP_DIR = os.getenv("BACKUP_DIR", "database_backups")
+HOST, PORT = os.getenv("HOST", "0.0.0.0"), int(os.getenv("PORT", "10000"))
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
-DB_PATH = os.getenv("DB_PATH", "titan_v15.db")
-WEB_PORT = int(os.getenv("PORT", "10000"))
-
 SUPER_ADMINS = {int(x) for x in os.getenv("SUPER_ADMINS", "8655682794,8773171051").split(",") if x.strip().isdigit()}
+COOKIE_DAYS, TOKEN_TTL = 14, 300
+MAX_CLIENTS, MAX_TEMPLATES = 20, 5000
+os.makedirs(BACKUP_DIR, exist_ok=True)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] OMNI: %(message)s")
-log = logging.getLogger("OMNI")
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
+                    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+log = logging.getLogger("titan")
 
-app = Flask(__name__)
-app.secret_key = FLASK_SECRET
-app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SECURE=False, SESSION_COOKIE_SAMESITE="Lax")
+# --------------------------------- Utilities ----------------------------------
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-bot = None
-db = None
-loop = None
-auth_flows = {}
-system_logs = deque(maxlen=100)
-active_engines = {}
+def digest(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
 
-def utcnow(): return dt.datetime.now(dt.timezone.utc)
-def iso_now(): return utcnow().isoformat()
-def is_admin(uid): return int(uid) in SUPER_ADMINS
-def sha256(v): return hashlib.sha256(v.encode()).hexdigest()
+def jdump(value) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
-def log_omni(uid, msg, level="INFO"):
-    entry = {"time": dt.datetime.now().strftime("%H:%M:%S"), "uid": uid, "msg": msg, "level": level}
-    system_logs.append(entry)
-    getattr(log, level.lower(), log.info)(f"[{uid}] {msg}")
+def jload(value, default):
+    try: return json.loads(value or "")
+    except (TypeError, ValueError): return default
 
-# -------------------- DATABASE --------------------
-class OmniDB:
-    def __init__(self, path): self.path = path
-    def conn(self): return aiosqlite.connect(self.path, timeout=30)
+def bounded_float(value, default=3.0, low=0.0, high=60.0):
+    try: value = float(value)
+    except (TypeError, ValueError): value = default
+    return min(high, max(low, value))
+
+def bounded_int(value, default=0, low=0, high=1_000_000):
+    try: value = int(value)
+    except (TypeError, ValueError): value = default
+    return min(high, max(low, value))
+
+def parse_targets(text):
+    out = []
+    for line in text.splitlines():
+        x = line.strip()
+        if not x: continue
+        if x.startswith("tg://chat?id="):
+            try:
+                out.append(int(x.split("=")[1]))
+                continue
+            except: pass
+        m = re.match(r"^(?:https?://)?t\.me/c/(\d+)", x)
+        if m: out.append(int("-100" + m.group(1))); continue
+        if re.match(r"^-?\d+$", x): out.append(int(x))
+        elif x.startswith("@"): out.append(x)
+        elif re.match(r"^https?://t\.me/", x): out.append("@" + x.split("/")[-1])
+    return out
+
+# ------------------------------- Async SQLite --------------------------------
+class Database:
+    def __init__(self, path):
+        self.path = path
+        self.lock = asyncio.Lock()
+
+    async def connect(self):
+        conn = await aiosqlite.connect(self.path, timeout=30)
+        conn.row_factory = aiosqlite.Row
+        for pragma in ["journal_mode=WAL", "foreign_keys=ON", "busy_timeout=30000", "synchronous=NORMAL"]:
+            await conn.execute(f"PRAGMA {pragma}")
+        return conn
 
     async def init(self):
-        async with self.conn() as db:
-            # Исправлено: PRAGMA выполняется по одной команде
-            await db.execute("PRAGMA journal_mode=WAL")
-            await db.execute("PRAGMA synchronous=NORMAL")
-            await db.executescript("""
-                CREATE TABLE IF NOT EXISTS users(
-                    id INTEGER PRIMARY KEY, username TEXT, role TEXT DEFAULT 'USER',
-                    approved INTEGER DEFAULT 0, balance INTEGER DEFAULT 0, created_at TEXT
-                );
-                CREATE TABLE IF NOT EXISTS accounts(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, uid INTEGER, session TEXT, 
-                    status TEXT DEFAULT 'active', phone TEXT, last_active TEXT
-                );
-                CREATE TABLE IF NOT EXISTS configs(
-                    uid INTEGER PRIMARY KEY, templates TEXT DEFAULT '[]', targets TEXT DEFAULT '[]',
-                    delay_ms INTEGER DEFAULT 10000, mode TEXT DEFAULT 'AUTO', 
-                    randomize INTEGER DEFAULT 0, warmup INTEGER DEFAULT 1, 
-                    auto_reply INTEGER DEFAULT 0
-                );
-                CREATE TABLE IF NOT EXISTS stats(
-                    uid INTEGER PRIMARY KEY, sent INTEGER DEFAULT 0, errors INTEGER DEFAULT 0
-                );
-                CREATE TABLE IF NOT EXISTS tokens(token TEXT PRIMARY KEY, uid INTEGER, exp REAL);
-                CREATE TABLE IF NOT EXISTS sessions(sid TEXT PRIMARY KEY, uid INTEGER, exp REAL);
-                CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, val TEXT);
-            """)
-            await db.commit()
-        
-        for admin in SUPER_ADMINS:
-            await self.ensure_user(admin, "admin")
-            await self.set_user(admin, role="ADMIN", approved=1)
+        schema = [
+            """CREATE TABLE IF NOT EXISTS users(
+              user_id INTEGER PRIMARY KEY, username TEXT DEFAULT '',
+              first_name TEXT DEFAULT '', subscribed INTEGER NOT NULL DEFAULT 0,
+              balance INTEGER NOT NULL DEFAULT 0, plan TEXT NOT NULL DEFAULT 'FREE',
+              plan_until TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""",
+            """CREATE TABLE IF NOT EXISTS accounts(
+              id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER NOT NULL,
+              session TEXT NOT NULL, phone TEXT DEFAULT '', status TEXT NOT NULL DEFAULT 'active',
+              created_at TEXT NOT NULL)""",
+            """CREATE TABLE IF NOT EXISTS configs(
+              owner_id INTEGER PRIMARY KEY, mode TEXT NOT NULL DEFAULT 'AUTO',
+              send_gap REAL NOT NULL DEFAULT 3, templates TEXT NOT NULL DEFAULT '[]',
+              targets TEXT NOT NULL DEFAULT '[]', randomize INTEGER DEFAULT 0,
+              warmup INTEGER DEFAULT 1, updated_at TEXT NOT NULL)""",
+            """CREATE TABLE IF NOT EXISTS stats(
+              owner_id INTEGER PRIMARY KEY, sent INTEGER NOT NULL DEFAULT 0,
+              failed INTEGER NOT NULL DEFAULT 0, broadcasts INTEGER NOT NULL DEFAULT 0,
+              updated_at TEXT NOT NULL)""",
+            """CREATE TABLE IF NOT EXISTS tokens(
+              id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER NOT NULL,
+              token_hash TEXT NOT NULL UNIQUE, expires_at REAL NOT NULL,
+              used INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL)""",
+            """CREATE TABLE IF NOT EXISTS sessions(
+              id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER NOT NULL,
+              session_id TEXT NOT NULL UNIQUE, expires_at REAL NOT NULL,
+              created_at TEXT NOT NULL, last_seen TEXT NOT NULL)""",
+            """CREATE TABLE IF NOT EXISTS audit(
+              id INTEGER PRIMARY KEY AUTOINCREMENT, actor_id INTEGER,
+              action TEXT NOT NULL, details TEXT NOT NULL DEFAULT '{}',
+              created_at TEXT NOT NULL)""",
+            """CREATE TABLE IF NOT EXISTS broadcasts(
+              id TEXT PRIMARY KEY, owner_id INTEGER NOT NULL, body TEXT NOT NULL,
+              status TEXT NOT NULL DEFAULT 'queued', total INTEGER DEFAULT 0,
+              sent INTEGER DEFAULT 0, failed INTEGER DEFAULT 0,
+              created_at TEXT NOT NULL, finished_at TEXT)""",
+        ]
+        async with self.lock:
+            conn = await self.connect()
+            try:
+                for statement in schema:
+                    await conn.execute(statement)
+                await conn.commit()
+            finally:
+                await conn.close()
 
-    async def get_user(self, uid):
-        async with self.conn() as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute("""
-                SELECT u.*, c.templates, c.targets, c.delay_ms, c.mode, c.randomize, 
-                c.warmup, c.auto_reply
-                FROM users u LEFT JOIN configs c ON u.id = c.uid WHERE u.id=?
-            """, (uid,)) as cur: return await cur.fetchone()
+    async def execute(self, sql, params=()):
+        async with self.lock:
+            conn = await self.connect()
+            try:
+                cur = await conn.execute(sql, params)
+                await conn.commit()
+                return cur.rowcount
+            finally:
+                await conn.close()
 
-    async def ensure_user(self, uid, username=""):
-        async with self.conn() as db:
-            await db.execute("INSERT OR IGNORE INTO users(id, username, created_at) VALUES(?,?,?)", (uid, username, iso_now()))
-            await db.execute("INSERT OR IGNORE INTO configs(uid) VALUES(?)", (uid,))
-            await db.execute("INSERT OR IGNORE INTO stats(uid) VALUES(?)", (uid,))
-            await db.commit()
+    async def one(self, sql, params=()):
+        async with self.lock:
+            conn = await self.connect()
+            try:
+                cur = await conn.execute(sql, params)
+                row = await cur.fetchone()
+                return dict(row) if row else None
+            finally:
+                await conn.close()
 
-    async def set_user(self, uid, **kwargs):
-        allowed = {"role", "approved", "balance"}
-        f = {k: v for k, v in kwargs.items() if k in allowed}
-        if not f: return
-        cols = ", ".join(f"{k}=?" for k in f)
-        vals = list(f.values()) + [uid]
-        async with self.conn() as db:
-            await db.execute(f"UPDATE users SET {cols} WHERE id=?", vals)
-            await db.commit()
+    async def all(self, sql, params=()):
+        async with self.lock:
+            conn = await self.connect()
+            try:
+                cur = await conn.execute(sql, params)
+                return [dict(row) for row in await cur.fetchall()]
+            finally:
+                await conn.close()
 
-    async def set_config(self, uid, **kwargs):
-        allowed = {"templates", "targets", "delay_ms", "mode", "randomize", "warmup", "auto_reply"}
-        f = {k: v for k, v in kwargs.items() if k in allowed}
-        if not f: return
-        cols = ", ".join(f"{k}=?" for k in f)
-        vals = [json.dumps(v) if isinstance(v, (list, dict)) else v for v in f.values()] + [uid]
-        async with self.conn() as db:
-            await db.execute(f"UPDATE configs SET {cols} WHERE uid=?", vals)
-            await db.commit()
+    async def ensure_user(self, uid, username="", first_name=""):
+        stamp = now()
+        await self.execute("""INSERT INTO users(user_id,username,first_name,created_at,updated_at)
+          VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET username=excluded.username,
+          first_name=excluded.first_name,updated_at=excluded.updated_at""",
+          (uid, username or "", first_name or "", stamp, stamp))
+        await self.execute("INSERT OR IGNORE INTO configs(owner_id,updated_at) VALUES(?,?)", (uid, stamp))
+        await self.execute("INSERT OR IGNORE INTO stats(owner_id,updated_at) VALUES(?,?)", (uid, stamp))
 
-    async def get_accounts(self, uid):
-        async with self.conn() as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute("SELECT * FROM accounts WHERE uid=?", (uid,)) as cur: 
-                return await cur.fetchall()
+    async def config(self, uid):
+        row = await self.one("SELECT * FROM configs WHERE owner_id=?", (uid,))
+        if not row:
+            await self.execute("INSERT OR IGNORE INTO configs(owner_id,updated_at) VALUES(?,?)", (uid, now()))
+            row = await self.one("SELECT * FROM configs WHERE owner_id=?", (uid,))
+        row["templates"] = jload(row["templates"], [])
+        row["targets"] = jload(row["targets"], [])
+        return row
 
-    async def add_account(self, uid, session, phone):
-        async with self.conn() as db:
-            await db.execute("INSERT INTO accounts(uid, session, phone) VALUES(?,?,?)", (uid, session, phone))
-            await db.commit()
+    async def save_config(self, uid, gap, templates, targets, mode, randomize, warmup):
+        await self.execute("""UPDATE configs SET send_gap=?,templates=?,targets=?,mode=?,randomize=?,warmup=?,updated_at=?
+          WHERE owner_id=?""",
+          (bounded_float(gap), jdump(templates), jdump(targets), mode, int(randomize), int(warmup), now(), uid))
 
-    async def add_stat(self, uid, key):
-        async with self.conn() as db:
-            await db.execute(f"UPDATE stats SET {key}={key}+1 WHERE uid=?", (uid,))
-            await db.commit()
+    async def backup(self):
+        filename = os.path.join(BACKUP_DIR, f"titan_{datetime.now():%Y%m%d_%H%M%S}.db")
+        async with self.lock:
+            src = await self.connect()
+            dst = await aiosqlite.connect(filename)
+            try: await src.backup(dst)
+            finally: await dst.close(); await src.close()
+        return filename
 
-    async def create_token(self, uid):
-        raw = secrets.token_urlsafe(32)
-        async with self.conn() as db:
-            await db.execute("DELETE FROM tokens WHERE exp<?", (time.time(),))
-            await db.execute("INSERT INTO tokens VALUES(?,?,?)", (sha256(raw), uid, time.time()+3600))
-            await db.commit()
-        return raw
+database = Database(DB_PATH)
 
-    async def verify_token(self, raw):
-        async with self.conn() as db:
-            async with db.execute("SELECT uid, exp FROM tokens WHERE token=?", (sha256(raw),)) as cur:
-                r = await cur.fetchone()
-                return r[0] if r and time.time() < r[1] else None
+# ------------------------------ Runtime manager ------------------------------
+class Runtime:
+    def __init__(self):
+        self.loop = None
+        self.bot = None
+        self.http = None
+        self.started = time.time()
+        self.state = "BOOTING"
+        self.logs = deque(maxlen=1000)
+        self.semaphore = None
+        self.queue = None
+        self.stop = None
+        self.template_queues = {}
+        self.active = 0
+        self.active_engines = {}
 
-    async def create_session(self, uid):
-        raw = secrets.token_urlsafe(40)
-        async with self.conn() as db:
-            await db.execute("DELETE FROM sessions WHERE exp<?", (time.time(),))
-            await db.execute("INSERT INTO sessions VALUES(?,?,?)", (sha256(raw), uid, time.time()+14*86400))
-            await db.commit()
-        return raw
+    def write(self, message, level="INFO"):
+        line = f"{datetime.now():%H:%M:%S} [{level}] {message}"
+        self.logs.appendleft(line)
+        getattr(log, level.lower(), log.info)(message)
 
-    async def get_session(self, raw):
-        if not raw: return None
-        async with self.conn() as db:
-            async with db.execute("SELECT uid FROM sessions WHERE sid=? AND exp>?", (sha256(raw), time.time())) as cur:
-                r = await cur.fetchone()
-                return r[0] if r else None
+rt = Runtime()
 
-# -------------------- OMNICORE ENGINE --------------------
-class OmniEngine:
+def submit(coro):
+    if not rt.loop or not rt.loop.is_running():
+        raise RuntimeError("Async runtime is not ready")
+    return asyncio.run_coroutine_threadsafe(coro, rt.loop)
+
+# ------------------------------ Telegram bot ---------------------------------
+def bot_keyboard():
+    return [[Button.inline("🌐 Войти в панель", b"panel")]]
+
+async def magic_link(uid):
+    if not PUBLIC_BASE_URL:
+        raise RuntimeError("Set PUBLIC_BASE_URL, e.g. https://your-domain.example")
+    raw = secrets.token_urlsafe(36)
+    await database.execute("INSERT INTO tokens(owner_id,token_hash,expires_at,created_at) VALUES(?,?,?,?)",
+                           (uid, digest(raw), time.time() + TOKEN_TTL, now()))
+    return f"{PUBLIC_BASE_URL}/login?token={raw}"
+
+async def on_command(event):
+    uid = int(event.sender_id)
+    sender = await event.get_sender()
+    await database.ensure_user(uid, getattr(sender, "username", "") or "", getattr(sender, "first_name", "") or "")
+    command = (event.raw_text or "").split(maxsplit=1)[0].split("@")[0].lower()
+    
+    if command == "/start":
+        await event.respond(f"**{APP_NAME} // {VERSION}**\nНажми кнопку ниже для входа в панель.", buttons=bot_keyboard(), parse_mode="md")
+    elif command == "/panel":
+        if uid not in SUPER_ADMINS:
+            return await event.respond("Доступ запрещён.")
+        try:
+            await event.respond("Одноразовая ссылка (5 минут):\n" + await magic_link(uid))
+        except Exception as exc:
+            await event.respond(f"Ошибка: {exc}")
+
+async def on_callback(event):
+    uid = int(event.sender_id)
+    action = event.data.decode(errors="ignore")
+    if action == "panel":
+        if uid not in SUPER_ADMINS:
+            return await event.answer("Доступ запрещён", alert=True)
+        await event.respond("Одноразовая ссылка:\n" + await magic_link(uid))
+        await event.answer("Ссылка отправлена")
+
+async def telegram_start():
+    rt.bot = TelegramClient(StringSession(), API_ID, API_HASH, connection_retries=5, request_retries=3, auto_reconnect=True)
+    await rt.bot.start(bot_token=BOT_TOKEN)
+    rt.bot.add_event_handler(on_command, events.NewMessage(incoming=True, pattern=r"^/(start|panel)(?:@\w+)?"))
+    rt.bot.add_event_handler(on_callback, events.CallbackQuery())
+    rt.state = "ONLINE"
+    rt.write("Telegram bot connected")
+
+# ------------------------------ Broadcast engine -----------------------------
+class SpamEngine:
     def __init__(self, uid, config, accounts):
         self.uid = uid
         self.config = config
         self.accounts = accounts
-        self.running = False
         self.stop_event = asyncio.Event()
-        self.templates = json.loads(config["templates"] or "[]")
-        self.targets = json.loads(config["targets"] or "[]")
+        self.templates = config["templates"]
+        self.targets = config["targets"]
         self.t_queue = deque(self.templates)
-
-    def _rand_text(self, t):
-        if not self.config["randomize"]: return t
-        repl = {'а': 'a', 'е': 'e', 'о': 'o', 'р': 'p', 'с': 'c', 'у': 'y', 'х': 'x'}
-        return ''.join(repl.get(c, c) for c in t)
 
     def _next_tpl(self):
         if not self.t_queue: return "..."
         t = self.t_queue.popleft()
         self.t_queue.append(t)
-        return self._rand_text(t)
+        if self.config["randomize"]:
+            repl = {'а': 'a', 'е': 'e', 'о': 'o', 'р': 'p', 'с': 'c', 'у': 'y', 'х': 'x'}
+            return ''.join(repl.get(c, c) for c in t)
+        return t
 
     async def _warmup(self, client):
         if not self.config["warmup"]: return
-        log_omni(self.uid, "Запуск прогрева аккаунта...")
+        rt.write(f"[{self.uid}] Запуск прогрева аккаунта...")
         try:
             dialogs = await client.get_dialogs(limit=5)
             for d in dialogs:
                 await client.get_messages(d.id, limit=2)
-                await asyncio.sleep(random.uniform(1, 2))
-            log_omni(self.uid, "Прогрев завершен.")
+                await asyncio.sleep(random.uniform(1, 3))
+            rt.write(f"[{self.uid}] Прогрев завершен.")
         except Exception as e:
-            log_omni(self.uid, f"Ошибка прогрева: {e}", "WARNING")
+            rt.write(f"[{self.uid}] Ошибка прогрева: {e}", "WARNING")
 
     async def start(self):
-        self.running = True
         tasks = [asyncio.create_task(self._worker(acc)) for acc in self.accounts]
         await asyncio.gather(*tasks, return_exceptions=True)
-        self.running = False
 
     async def _worker(self, acc):
         client = TelegramClient(StringSession(acc["session"]), API_ID, API_HASH, connection_retries=1)
@@ -228,23 +338,21 @@ class OmniEngine:
             for target in self.targets:
                 if self.stop_event.is_set(): break
                 msg = self._next_tpl()
-                
                 try:
                     entity = target
                     if isinstance(target, int):
                         try: entity = await client.get_entity(target)
                         except: pass
-                    
                     await client.send_message(entity, msg)
-                    await db.add_stat(self.uid, "sent")
+                    await database.execute("UPDATE stats SET sent=sent+1,updated_at=? WHERE owner_id=?", (now(), self.uid))
                 except FloodWaitError as e:
-                    log_omni(self.uid, f"FloodWait {e.seconds}s", "WARNING")
+                    rt.write(f"[{self.uid}] FloodWait {e.seconds}s", "WARNING")
                     await asyncio.sleep(e.seconds + 2)
                 except Exception as e:
-                    await db.add_stat(self.uid, "errors")
-                    log_omni(self.uid, f"Error: {e}", "ERROR")
+                    await database.execute("UPDATE stats SET failed=failed+1,updated_at=? WHERE owner_id=?", (now(), self.uid))
+                    rt.write(f"[{self.uid}] Ошибка: {e}", "WARNING")
                 
-                delay = 0.05 if self.config["mode"] == "EXTREME" else self.config["delay_ms"]/1000.0
+                delay = 0.05 if self.config["mode"] == "EXTREME" else self.config["send_gap"]
                 if delay > 0:
                     try: await asyncio.wait_for(self.stop_event.wait(), timeout=delay)
                     except asyncio.TimeoutError: pass
@@ -253,39 +361,21 @@ class OmniEngine:
     def stop(self):
         self.stop_event.set()
 
-# -------------------- BOT --------------------
-async def setup_bot():
-    global bot
-    bot = TelegramClient("titan_v15_bot", API_ID, API_HASH)
-    await bot.start(bot_token=BOT_TOKEN)
+# -------------------------------- Web dashboard -------------------------------
+app = Flask(__name__)
+app.secret_key = FLASK_SECRET
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SECURE=os.getenv("COOKIE_SECURE", "1") == "1",
+                  SESSION_COOKIE_SAMESITE="Lax", PERMANENT_SESSION_LIFETIME=COOKIE_DAYS * 86400,
+                  MAX_CONTENT_LENGTH=1024 * 1024)
 
-    @bot.on(events.NewMessage(pattern=r"^/start$"))
-    async def start(e):
-        await db.ensure_user(e.sender_id)
-        u = await db.get_user(e.sender_id)
-        if not u["approved"] and not is_admin(e.sender_id):
-            return await e.respond(f"⛔ Доступ закрыт. ID: {e.sender_id}")
-        await e.respond("TITAN v15 Omni-Core", buttons=[[Button.inline("🚀 Панель", b"login")]])
-
-    @bot.on(events.CallbackQuery)
-    async def cb(e):
-        if e.data == b"login":
-            token = await db.create_token(e.sender_id)
-            await e.respond(f"🔗 {PUBLIC_BASE_URL}/login?t={token}")
-            await e.answer()
-
-# -------------------- WEB UI --------------------
-UI_HTML = r"""
-<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>TITAN v15 // Omni-Core</title>
-<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
-<style>
+CSS = """
+@import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap');
 :root{--bg:#050505;--panel:#0f0f12;--line:#222;--txt:#e0e0e0;--muted:#666;--primary:#ff003c;--accent:#00f0ff}
 *{box-sizing:border-box;margin:0;padding:0}body{background:var(--bg);color:var(--txt);font:14px 'Inter',sans-serif;display:flex;height:100vh;overflow:hidden}
 .sidebar{width:260px;background:var(--panel);border-right:1px solid var(--line);padding:30px;display:flex;flex-direction:column}
 .logo{font-family:'Space Mono';font-size:24px;font-weight:700;color:#fff;margin-bottom:40px;border-bottom:1px solid var(--line);padding-bottom:20px}
 .logo span{color:var(--primary)}
-.nav-item{padding:12px 15px;border-radius:8px;color:var(--muted);cursor:pointer;transition:0.2s;font-weight:600;margin-bottom:5px}
+.nav-item{padding:12px 15px;border-radius:8px;color:var(--muted);cursor:pointer;transition:0.2s;font-weight:600;margin-bottom:5px;text-decoration:none;display:block}
 .nav-item:hover,.nav-item.active{background:rgba(255,0,60,0.1);color:#fff;border-left:2px solid var(--primary)}
 .main{flex:1;padding:40px;overflow-y:auto}
 .header{display:flex;justify-content:space-between;align-items:center;margin-bottom:30px}
@@ -303,18 +393,26 @@ button:hover{opacity:0.8}
 button.outline{background:transparent;border:1px solid var(--line);color:var(--txt)}
 button.green{background:var(--accent);color:#000}
 .hidden{display:none!important}
-.terminal{background:#000;color:#00ff00;font-family:'Space Mono';padding:15px;border-radius:8px;height:300px;overflow-y:auto;font-size:12px;line-height:1.5}
-</style></head><body>
+.terminal{background:#000;color:#00ff00;font-family:'Space Mono';padding:15px;border-radius:8px;height:400px;overflow-y:auto;font-size:12px;line-height:1.5}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:12px;border-bottom:1px solid var(--line);font-size:13px}
+th{color:var(--muted);font-size:11px;text-transform:uppercase}
+"""
+
+UI_HTML = r"""
+<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TITAN // Omni-Core</title><style>""" + CSS + r"""</style></head><body>
 <div class="sidebar">
 <div class="logo">TITAN<span>//15</span></div>
-<div class="nav-item active" onclick="tab('dash')">Обзор</div>
-<div class="nav-item" onclick="tab('acc')">Аккаунты</div>
-<div class="nav-item" onclick="tab('cfg')">Конфигурация</div>
-<div class="nav-item" onclick="tab('term')">Терминал</div>
-<div style="margin-top:auto"><div class="nav-item" onclick="location.href='/logout'">Выход</div></div>
+<a class="nav-item active" onclick="tab('dash')">Обзор</a>
+<a class="nav-item" onclick="tab('acc')">Аккаунты</a>
+<a class="nav-item" onclick="tab('cfg')">Конфигурация</a>
+<a class="nav-item" onclick="tab('term')">Терминал</a>
+{% if admin %}<a class="nav-item" onclick="tab('adm')">Админка</a>{% endif %}
+<div style="margin-top:auto"><a class="nav-item" href="/logout">Выход</a></div>
 </div>
 <div class="main">
-<div class="header"><h1 id="title">Обзор системы</h1></div>
+<div class="header"><h1 id="title">Обзор системы</h1><span class="label" style="color:var(--accent)">● ONLINE</span></div>
 
 <div id="tab-dash" class="tab">
 <div class="grid">
@@ -331,7 +429,7 @@ button.green{background:var(--accent);color:#000}
 <input type="text" id="acc-phone" placeholder="+79990000000">
 <button onclick="startAuth()">Получить код</button>
 <div id="auth-code-div" class="hidden" style="margin-top:15px">
-<input type="text" id="acc-code" placeholder="Код">
+<input type="text" id="acc-code" placeholder="Код из Telegram">
 <button onclick="verifyAuth()">Войти</button>
 </div>
 </div>
@@ -340,9 +438,9 @@ button.green{background:var(--accent);color:#000}
 <div id="tab-cfg" class="tab hidden">
 <div class="panel">
 <h3>Режим</h3>
-<select id="cfg-mode"><option value="AUTO">AUTO</option><option value="EXTREME">EXTREME</option></select>
-<h3>Задержка (мс)</h3><input type="number" id="cfg-delay" value="10000">
-<h3>Рандомизация</h3><select id="cfg-rand"><option value="0">Выкл</option><option value="1">Вкл</option></select>
+<select id="cfg-mode"><option value="AUTO">AUTO (Безопасный)</option><option value="EXTREME">EXTREME (Максимальная скорость)</option></select>
+<h3>Задержка (сек)</h3><input type="number" id="cfg-delay" value="3" step="0.1">
+<h3>Рандомизация букв</h3><select id="cfg-rand"><option value="0">Выкл</option><option value="1">Вкл</option></select>
 <h3>Прогрев (Анти-бан)</h3><select id="cfg-warmup"><option value="1">Вкл</option><option value="0">Выкл</option></select>
 <button onclick="saveCfg()">Сохранить</button>
 </div>
@@ -356,28 +454,43 @@ button.green{background:var(--accent);color:#000}
 <div class="panel"><h3>Логи</h3><div class="terminal" id="term-out"></div></div>
 </div>
 
+{% if admin %}
+<div id="tab-adm" class="tab hidden">
+<div class="panel">
+<h3>Пользователи</h3>
+<table><thead><tr><th>ID</th><th>Роль</th><th>Баланс</th><th>Подписка</th><th>Действия</th></tr></thead>
+<tbody id="adm-rows"></tbody></table>
+</div>
+</div>
+{% endif %}
+
 </div>
 <script>
 let csrf="";
 function tab(id){document.querySelectorAll('.tab').forEach(x=>x.classList.add('hidden'));document.getElementById('tab-'+id).classList.remove('hidden');document.querySelectorAll('.nav-item').forEach(x=>x.classList.remove('active'));event.target.classList.add('active');document.getElementById('title').textContent=event.target.textContent}
-async function api(url,opts={}){const r=await fetch(url,{...opts,headers:{'Content-Type':'application/json','X-CSRF-Token':csrf,...opts.headers}});if(r.status===401){location.href='/';return}const d=await r.json();if(!r.ok)throw new Error(d.error);return d}
+async function api(url,opts={}){const r=await fetch(url,{...opts,headers:{'Content-Type':'application/json','X-CSRF-Token':csrf,...opts.headers}});if(r.status===401){location.href='/';return}const t=await r.text();try{const d=JSON.parse(t);if(!r.ok)throw new Error(d.error||r.status);return d}catch(e){alert(t);throw e}}
 async function load(){
     try{
         const u=await api('/api/me'); csrf=u.csrf;
         document.getElementById('m-sent').textContent=u.stats.sent;
-        document.getElementById('m-err').textContent=u.stats.errors;
+        document.getElementById('m-err').textContent=u.stats.failed;
         document.getElementById('m-acc').textContent=u.accounts;
         document.getElementById('eng-status').textContent=u.running?'РАБОТАЕТ':'ОСТАНОВЛЕН';
         document.getElementById('eng-status').style.color=u.running?'var(--accent)':'var(--muted)';
         document.getElementById('cfg-mode').value=u.mode;
-        document.getElementById('cfg-delay').value=u.delay_ms;
+        document.getElementById('cfg-delay').value=u.gap;
         document.getElementById('cfg-rand').value=u.randomize;
         document.getElementById('cfg-warmup').value=u.warmup;
         document.getElementById('cfg-tpl').value=u.templates.join('\n');
         document.getElementById('cfg-tgt').value=u.targets.join('\n');
         
         const logs=await api('/api/logs');
-        document.getElementById('term-out').innerHTML=logs.logs.map(l=>`<div>[${l.time}] [${l.uid}] ${l.msg}</div>`).join('');
+        document.getElementById('term-out').innerHTML=logs.logs.map(l=>`<div>${l}</div>`).join('');
+        
+        if(u.admin){
+            const d=await api('/api/admin/users');
+            document.getElementById('adm-rows').innerHTML=d.users.map(x=>`<tr><td>${x.user_id}</td><td>${x.plan}</td><td>${x.balance}₽</td><td>${x.subscribed?'Да':'Нет'}</td><td><button onclick="addBal(${x.user_id})">+Бал</button> <button onclick="addSub(${x.user_id})">+30д</button></td></tr>`).join('');
+        }
     }catch(e){}
 }
 async function startAuth(){
@@ -390,164 +503,236 @@ async function verifyAuth(){
     const r=await api('/api/auth/verify',{method:'POST',body:JSON.stringify({code})});
     if(r.ok) alert('Аккаунт добавлен!'); load();
 }
-async function saveCfg(){await api('/api/cfg',{method:'POST',body:JSON.stringify({mode:document.getElementById('cfg-mode').value,delay:parseInt(document.getElementById('cfg-delay').value),randomize:document.getElementById('cfg-rand').value,warmup:document.getElementById('cfg-warmup').value})});alert('OK')}
-async function saveTpl(){await api('/api/tpl',{method:'POST',body:JSON.stringify({text:document.getElementById('cfg-tpl').value})});alert('OK')}
-async function saveTgt(){await api('/api/tgt',{method:'POST',body:JSON.stringify({text:document.getElementById('cfg-tgt').value})});alert('OK')}
+async function saveCfg(){await api('/api/cfg',{method:'POST',body:JSON.stringify({mode:document.getElementById('cfg-mode').value,delay:parseFloat(document.getElementById('cfg-delay').value),randomize:document.getElementById('cfg-rand').value,warmup:document.getElementById('cfg-warmup').value})});alert('Сохранено')}
+async function saveTpl(){await api('/api/tpl',{method:'POST',body:JSON.stringify({text:document.getElementById('cfg-tpl').value})});alert('Сохранено')}
+async function saveTgt(){await api('/api/tgt',{method:'POST',body:JSON.stringify({text:document.getElementById('cfg-tgt').value})});alert('Сохранено')}
 async function engine(a){await api('/api/engine/'+a,{method:'POST'});load()}
+async function addBal(id){const a=prompt("Сумма для начисления:");if(!a)return;await api('/api/admin/bal',{method:'POST',body:JSON.stringify({user_id:id,amount:parseInt(a)})});load()}
+async function addSub(id){await api('/api/admin/sub',{method:'POST',body:JSON.stringify({user_id:id})});load()}
 load();setInterval(load,5000);
 </script></body></html>
 """
 
-@app.route("/")
-def index(): return "Auth"
-@app.route("/login")
+def csrf_token():
+    if "csrf" not in session: session["csrf"] = secrets.token_urlsafe(32)
+    return session["csrf"]
+
+def check_csrf():
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        given = request.form.get("csrf") or request.headers.get("X-CSRF-Token", "")
+        expected = session.get("csrf", "")
+        if not given or not expected or not hmac.compare_digest(given, expected):
+            abort(400, "CSRF validation failed")
+
+def uid():
+    value = session.get("user_id")
+    return int(value) if value is not None else None
+
+def login_required(fn):
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        if uid() is None: return redirect("/login")
+        return fn(*args, **kwargs)
+    return wrapped
+
+def admin_required(fn):
+    @wraps(fn)
+    @login_required
+    def wrapped(*args, **kwargs):
+        if uid() not in SUPER_ADMINS: abort(403)
+        return fn(*args, **kwargs)
+    return wrapped
+
+@app.before_request
+def before_request(): check_csrf()
+
+@app.get("/login")
 def login():
-    t = request.args.get("t", "")
-    uid = asyncio.run_coroutine_threadsafe(db.verify_token(t), loop).result()
-    if not uid: return "Error"
-    sid = asyncio.run_coroutine_threadsafe(db.create_session(uid), loop).result()
-    resp = redirect("/panel")
-    resp.set_cookie("titan_v15", sid, max_age=14*86400)
-    return resp
-@app.route("/panel")
-def panel():
-    raw = request.cookies.get("titan_v15")
-    uid = asyncio.run_coroutine_threadsafe(db.get_session(raw), loop).result() if raw else None
-    if not uid: return redirect("/")
-    return render_template_string(UI_HTML)
-@app.route("/logout")
+    return render_template_string("""<!doctype html><html><head><title>TITAN Login</title><style>""" + CSS + """</style></head>
+<body style="display:grid;place-items:center"><div class="card" style="width:400px;margin-top:20vh">
+<h1>Вход в панель</h1><p class="label">Введите токен из бота</p>
+<form method="post" action="/login"><input type="hidden" name="csrf" value="{{ csrf }}"><input name="token" placeholder="Токен" required><button>Войти</button></form>
+</div></body></html>""", csrf=csrf_token())
+
+@app.post("/login")
+def login_post():
+    raw = request.form.get("token", "").strip()
+    record = submit(database.one("SELECT * FROM tokens WHERE token_hash=? AND used=0 AND expires_at>?", (digest(raw), time.time()))).result(10)
+    if not record: return "Токен недействителен"
+    submit(database.execute("UPDATE tokens SET used=1 WHERE id=?", (record["id"],))).result(10)
+    session.clear()
+    session.permanent = True
+    session["user_id"] = int(record["owner_id"])
+    session["csrf"] = secrets.token_urlsafe(32)
+    submit(database.execute("INSERT INTO sessions(owner_id,session_id,expires_at,created_at,last_seen) VALUES(?,?,?,?,?)",
+                            (record["owner_id"], session["csrf"], time.time()+COOKIE_DAYS*86400, now(), now()))).result(10)
+    return redirect("/")
+
+@app.get("/logout")
 def logout():
-    resp = redirect("/")
-    resp.delete_cookie("titan_v15")
-    return resp
+    session.clear(); return redirect("/login")
+
+@app.get("/")
+@login_required
+def dashboard():
+    return render_template_string(UI_HTML, admin=uid() in SUPER_ADMINS)
 
 # --- API ---
 def get_u():
-    raw = request.cookies.get("titan_v15")
-    uid = asyncio.run_coroutine_threadsafe(db.get_session(raw), loop).result() if raw else None
-    if not uid: return None
-    return asyncio.run_coroutine_threadsafe(db.get_user(uid), loop).result()
-
-def login_required(f):
-    @wraps(f)
-    def w(*a, **kw):
-        u = get_u()
-        if not u: return jsonify({"error":"401"}), 401
-        request.user = u
-        return f(*a, **kw)
-    return w
+    value = session.get("user_id")
+    if value is None: return None
+    return submit(database.one("SELECT * FROM users WHERE user_id=?", (int(value),))).result(5)
 
 @app.get("/api/me")
 @login_required
 def api_me():
-    u = request.user
-    if "csrf" not in session: session["csrf"] = secrets.token_urlsafe(16)
-    accs = asyncio.run_coroutine_threadsafe(db.get_accounts(u["id"]), loop).result()
+    u = get_u()
+    cfg = submit(database.config(uid())).result(5)
+    accs = submit(database.all("SELECT id FROM accounts WHERE owner_id=?", (uid(),))).result(5)
+    stats = submit(database.one("SELECT sent,failed FROM stats WHERE owner_id=?", (uid(),))).result(5) or {}
     return jsonify({
-        "id": u["id"], "accounts": len(accs), "running": u["id"] in active_engines,
-        "mode": u["mode"], "delay_ms": u["delay_ms"], "randomize": u["randomize"], "warmup": u["warmup"],
-        "templates": json.loads(u["templates"] or "[]"),
-        "targets": json.loads(u["targets"] or "[]"),
-        "stats": asyncio.run_coroutine_threadsafe(db.get_user(u["id"]), loop).result() and {"sent": 0, "errors": 0},
-        "csrf": session["csrf"]
+        "admin": uid() in SUPER_ADMINS, "accounts": len(accs),
+        "running": uid() in rt.active_engines,
+        "mode": cfg["mode"], "gap": cfg["send_gap"], "randomize": cfg["randomize"], "warmup": cfg["warmup"],
+        "templates": cfg["templates"], "targets": cfg["targets"],
+        "stats": stats, "csrf": csrf_token()
     })
 
 @app.get("/api/logs")
+@login_required
 def api_logs():
-    return jsonify({"logs": list(system_logs)})
+    return jsonify({"logs": list(rt.logs)})
 
 @app.post("/api/auth/start")
 @login_required
 def api_auth_start():
-    uid = request.user["id"]
-    data = request.json
-    phone = data["phone"]
+    data = request.get_json() or {}
+    phone = data.get("phone", "")
+    if not re.match(r"^\+\d{10,15}$", phone): return jsonify({"error":"Формат +7999..."}), 400
     async def _s():
         client = TelegramClient(StringSession(), API_ID, API_HASH)
         await client.connect()
         s = await client.send_code_request(phone)
-        auth_flows[uid] = {"client": client, "phone": phone, "hash": s.phone_code_hash}
+        rt.template_queues[f"auth_{uid()}"] = {"client": client, "phone": phone, "hash": s.phone_code_hash}
         return True
-    try: asyncio.run_coroutine_threadsafe(_s(), loop).result(20); return jsonify({"ok":True})
+    try: submit(_s()).result(20); return jsonify({"ok":True})
     except Exception as e: return jsonify({"error":str(e)[:50]}), 400
 
 @app.post("/api/auth/verify")
 @login_required
 def api_auth_verify():
-    uid = request.user["id"]
-    code = request.json["code"]
-    f = auth_flows.get(uid)
-    if not f: return jsonify({"error":"Expired"}), 400
+    code = (request.get_json() or {}).get("code", "")
+    f = rt.template_queues.get(f"auth_{uid()}")
+    if not f: return jsonify({"error":"Истекло"}), 400
     async def _v():
         try:
             await f["client"].sign_in(phone=f["phone"], code=code, phone_code_hash=f["hash"])
             sess = f["client"].session.save()
-            async with db.conn() as c:
-                await c.execute("INSERT INTO accounts(uid, session, phone) VALUES(?,?,?)", (uid, sess, f["phone"]))
-                await c.commit()
+            await database.execute("INSERT INTO accounts(owner_id, session, phone, created_at) VALUES(?,?,?,?)", (uid(), sess, f["phone"], now()))
             await f["client"].disconnect()
             return {"ok": True}
         except Exception as e: return {"error":str(e)[:50]}
-    res = asyncio.run_coroutine_threadsafe(_v(), loop).result(20)
-    auth_flows.pop(uid, None)
+    res = submit(_v()).result(20)
+    rt.template_queues.pop(f"auth_{uid()}", None)
     return jsonify(res)
 
 @app.post("/api/cfg")
 @login_required
 def api_cfg():
-    d = request.json
-    asyncio.run_coroutine_threadsafe(db.set_config(request.user["id"], mode=d["mode"], delay_ms=d["delay"], randomize=d["randomize"], warmup=d["warmup"]), loop).result()
+    d = request.get_json() or {}
+    cfg = submit(database.config(uid())).result(5)
+    submit(database.save_config(uid(), d.get("delay", 3), cfg["templates"], cfg["targets"], d.get("mode", "AUTO"), d.get("randomize", 0), d.get("warmup", 1))).result(5)
     return jsonify({"ok":True})
 
 @app.post("/api/tpl")
 @login_required
 def api_tpl():
-    v = list(dict.fromkeys(x.strip() for x in request.json["text"].splitlines() if x.strip()))
-    asyncio.run_coroutine_threadsafe(db.set_config(request.user["id"], templates=v), loop).result()
+    v = list(dict.fromkeys(x.strip() for x in (request.get_json() or {}).get("text","").splitlines() if x.strip()))
+    cfg = submit(database.config(uid())).result(5)
+    submit(database.save_config(uid(), cfg["send_gap"], v, cfg["targets"], cfg["mode"], cfg["randomize"], cfg["warmup"])).result(5)
     return jsonify({"ok":True})
 
 @app.post("/api/tgt")
 @login_required
 def api_tgt():
-    v = []
-    for line in request.json["text"].splitlines():
-        x = line.strip()
-        if re.match(r"^-?\d+$", x): v.append(int(x))
-        elif x.startswith("@"): v.append(x)
-        elif re.match(r"^https?://t\.me/", x): v.append("@" + x.split("/")[-1])
-    asyncio.run_coroutine_threadsafe(db.set_config(request.user["id"], targets=v), loop).result()
+    v = parse_targets((request.get_json() or {}).get("text",""))
+    cfg = submit(database.config(uid())).result(5)
+    submit(database.save_config(uid(), cfg["send_gap"], cfg["templates"], v, cfg["mode"], cfg["randomize"], cfg["warmup"])).result(5)
     return jsonify({"ok":True})
 
 @app.post("/api/engine/<action>")
 @login_required
 def api_engine(action):
-    uid = request.user["id"]
     if action == "start":
-        if uid in active_engines: return jsonify({"error":"Running"})
-        accs = asyncio.run_coroutine_threadsafe(db.get_accounts(uid), loop).result()
-        if not accs: return jsonify({"error":"No accounts"}), 400
-        engine = OmniEngine(uid, request.user, accs)
-        active_engines[uid] = engine
-        asyncio.run_coroutine_threadsafe(engine.start(), loop)
+        if uid() in rt.active_engines: return jsonify({"error":"Уже запущено"})
+        accs = submit(database.all("SELECT * FROM accounts WHERE owner_id=?", (uid(),))).result(5)
+        if not accs: return jsonify({"error":"Нет аккаунтов"}), 400
+        cfg = submit(database.config(uid())).result(5)
+        engine = SpamEngine(uid(), cfg, accs)
+        rt.active_engines[uid()] = engine
+        submit(engine.start())
     else:
-        if uid in active_engines:
-            active_engines[uid].stop()
-            del active_engines[uid]
+        if uid() in rt.active_engines:
+            rt.active_engines[uid()].stop()
+            del rt.active_engines[uid()]
     return jsonify({"ok":True})
 
-# -------------------- STARTUP --------------------
-def web_server(): serve(app, host="0.0.0.0", port=WEB_PORT, threads=8)
+@app.get("/api/admin/users")
+@admin_required
+def api_admin_users():
+    users = submit(database.all("SELECT user_id,plan,balance,subscribed FROM users LIMIT 100")).result(5)
+    return jsonify({"users": users})
+
+@app.post("/api/admin/bal")
+@admin_required
+def api_admin_bal():
+    d = request.get_json() or {}
+    submit(database.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (d.get("amount",0), d.get("user_id",0)))).result(5)
+    return jsonify({"ok":True})
+
+@app.post("/api/admin/sub")
+@admin_required
+def api_admin_sub():
+    d = request.get_json() or {}
+    submit(database.execute("UPDATE users SET subscribed=1 WHERE user_id=?", (d.get("user_id",0),))).result(5)
+    return jsonify({"ok":True})
+
+# ------------------------------ Background tasks -----------------------------
+async def maintenance():
+    while not rt.stop.is_set():
+        try:
+            await database.execute("DELETE FROM tokens WHERE expires_at<? OR used=1", (time.time()-3600,))
+            await asyncio.sleep(300)
+        except asyncio.CancelledError: raise
+        except Exception as e: rt.write(f"Maintenance: {e}", "WARNING"); await asyncio.sleep(30)
+
+async def shutdown(tasks):
+    rt.state = "SHUTTING_DOWN"
+    rt.stop.set()
+    for task in tasks: task.cancel()
+    for task in tasks:
+        with contextlib.suppress(asyncio.CancelledError, Exception): await task
+    if rt.bot:
+        with contextlib.suppress(Exception): await rt.bot.disconnect()
+    rt.state = "OFFLINE"
 
 async def main():
-    global db, loop, bot
-    loop = asyncio.get_running_loop()
-    db = OmniDB(DB_PATH)
-    await db.init()
-    threading.Thread(target=web_server, daemon=True).start()
-    log.info(f"WEB STARTED ON {WEB_PORT}")
-    await setup_bot()
-    await bot.run_until_disconnected()
+    rt.loop = asyncio.get_running_loop()
+    rt.semaphore = asyncio.Semaphore(MAX_CLIENTS)
+    rt.queue = asyncio.Queue()
+    rt.stop = asyncio.Event()
+    await database.init()
+    await telegram_start()
+    threading.Thread(target=lambda: serve(app, host=HOST, port=PORT, threads=8), name="titan-waitress", daemon=True).start()
+    rt.write(f"{APP_NAME} {VERSION} initialized")
+    tasks = [asyncio.create_task(maintenance())]
+    try:
+        await rt.bot.run_until_disconnected()
+    except KeyboardInterrupt: rt.write("Shutdown requested", "WARNING")
+    except Exception as exc: rt.write(f"Main loop failed: {exc}", "ERROR")
+    finally: await shutdown(tasks)
 
 if __name__ == "__main__":
     try: asyncio.run(main())
     except KeyboardInterrupt: pass
+    except Exception: log.exception("Fatal startup error")
