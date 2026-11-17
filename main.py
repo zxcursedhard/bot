@@ -1,4 +1,4 @@
-# TITAN Enterprise — compact Flask + Telethon + SQLite (FULL FIXED v10.5)
+# TITAN Enterprise — compact Flask + Telethon + SQLite (FULL FIXED v10.6)
 # Install: pip install telethon flask waitress aiosqlite psutil aiohttp
 
 import os
@@ -81,7 +81,7 @@ workers = {}
 worker_stops = {}
 web_states = {} 
 web_flows = {}
-admin_flows = {} # Для выдачи заказов
+admin_flows = {}
 
 def utcnow(): return dt.datetime.now(dt.timezone.utc)
 def iso_now(): return utcnow().isoformat()
@@ -829,7 +829,7 @@ document.getElementById('activeClients').textContent=stats.active_clients+' / '+
 document.getElementById('waitingClients').textContent=stats.waiting_clients;
 }
 const d=await api('/api/admin/users');if(d){
-document.getElementById('userRows').innerHTML=d.users.map(u=>`<tr><td>${esc(u.username||u.user_id)}<br><small>${u.user_id}</small></td><td>${u.role}</td><td>${u.balance} ₽</td><td>${esc(u.subscription_until||'—')}</td><td>${u.sent}/${u.errors}</td><td>${u.has_session?'✅':'❌'}</td><td><button onclick="addBal(${u.user_id})">+Баланс</button></td></tr>`).join('');
+document.getElementById('userRows').innerHTML=d.users.map(u=>`<tr><td>${esc(u.username||u.user_id)}<br><small>${u.user_id}</small></td><td>${u.role}</td><td>${u.balance} ₽</td><td>${esc(u.subscription_until||'—')}</td><td>${u.sent}/${u.errors}</td><td>${u.has_session?'✅':'❌'}</td><td><div class="actions"><button onclick="addBal(${u.user_id})">+Баланс</button><button onclick="addSub(${u.user_id})">+30 дней</button></div></td></tr>`).join('');
 }
 const pd=await api('/api/admin/payment_details');if(pd)document.getElementById('payment_details').value=pd.details;
 const ao=await api('/api/admin/orders');if(ao){
@@ -838,6 +838,7 @@ document.getElementById('adminOrderRows').innerHTML=ao.orders.map(o=>`<tr><td>${
 }
 function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 async function addBal(id){const amount=prompt("Сумма для начисления (₽):");if(!amount)return;try{await api('/api/admin/add_balance',{method:'POST',body:JSON.stringify({user_id:id,amount:parseInt(amount)})});await load()}catch(e){msg(e.message)}}
+async function addSub(id){if(!confirm('Выдать подписку на 30 дней пользователю '+id+'?'))return;try{await api('/api/admin/add_subscription',{method:'POST',body:JSON.stringify({user_id:id,days:30})});await load()}catch(e){msg(e.message)}}
 async function savePayment(){try{await api('/api/admin/set_payment',{method:'POST',body:JSON.stringify({details:document.getElementById('payment_details').value})});msg('Реквизиты сохранены')}catch(e){msg(e.message)}}
 
 // Выдача заказа Админом
@@ -1080,6 +1081,14 @@ def api_admin_add_balance():
     run_async(db.update_balance(int(payload["user_id"]), int(payload["amount"])))
     return jsonify({"ok": True})
 
+@app.post("/api/admin/add_subscription")
+@admin_required
+@csrf_required
+def api_admin_add_subscription():
+    payload = request.get_json(silent=True) or {}
+    run_async(db.grant_subscription(int(payload["user_id"]), int(payload.get("days", 30))))
+    return jsonify({"ok": True})
+
 @app.get("/api/admin/payment_details")
 @admin_required
 def api_admin_payment_details(): return jsonify({"details": run_async(db.get_setting("payment_details", "Реквизиты не заданы"))})
@@ -1098,7 +1107,6 @@ def api_admin_set_payment():
 def api_admin_start_order():
     payload = request.get_json(silent=True) or {}
     oid, phone = int(payload.get("order_id")), payload.get("phone")
-    order = run_async(db.get_orders()) # Просто для проверки существования
     admin_flows[oid] = {"phone": phone}
     return jsonify({"ok": True})
 
@@ -1111,16 +1119,9 @@ def api_admin_send_code():
     flow = admin_flows.get(oid, {})
     flow["code"] = code
     admin_flows[oid] = flow
-    
-    # По факту тут бот должен отправлять данные клиенту в ЛС или на почту,
-    # но так как чата с клиентом у нас нет (он на сайте), мы просто сохраняем в заказ.
-    # В реальности тут нужно дергать API sms-pro, чтобы отправить код на номер.
-    # Для теста мы просто сохраняем в order.data
     order_data = f"Тел: {flow.get('phone')} | Код: {code}"
     run_async(db.update_order(oid, "processing", order_data))
-    
-    # Если есть 2FA (заглушка, всегда False для теста)
-    return jsonify({"ok": True, "need_2fa": True}) # Всегда просим ввести 2FA, чтоб показать окно
+    return jsonify({"ok": True, "need_2fa": True})
 
 @app.post("/api/admin/send_2fa")
 @admin_required
@@ -1140,6 +1141,8 @@ def api_admin_send_2fa():
 def api_job_start():
     uid = int(request.titan_user["user_id"])
     u = run_async(db.get_user(uid))
+    if not u["subscription_active"] and u["role"] != "ADMIN":
+        return jsonify({"error": "Подписка истекла. Продлите подписку."}), 403
     if not u["session_string"]: return jsonify({"error": "Подключите аккаунт"}), 400
     templates = json.loads(u["templates"] or "[]")
     targets = json.loads(u["targets"] or "[]")
