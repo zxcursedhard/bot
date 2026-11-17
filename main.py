@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TITAN Enterprise v25.0 — Classic UI + Direct Auth + 2FA Support
+TITAN Enterprise v27.0 — Single PRO Plan + Test Access
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ import secrets
 import threading
 import time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from functools import wraps
 
 import aiosqlite
@@ -106,7 +106,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS users(
                     user_id INTEGER PRIMARY KEY, username TEXT DEFAULT '', first_name TEXT DEFAULT '',
                     subscribed INTEGER DEFAULT 0, balance INTEGER DEFAULT 0, plan TEXT DEFAULT 'FREE',
-                    created_at TEXT, updated_at TEXT
+                    plan_until TEXT, created_at TEXT, updated_at TEXT
                 );
                 CREATE TABLE IF NOT EXISTS accounts(
                     id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER, session TEXT, 
@@ -165,7 +165,6 @@ async def on_command(event):
     if event.raw_text.startswith("/start"):
         await event.respond("TITAN Enterprise", buttons=[[Button.inline("🌐 Войти в панель", b"login")]])
     elif event.raw_text.startswith("/panel"):
-        if uid not in SUPER_ADMINS: return await event.respond("Доступ запрещён.")
         await event.respond(f"Ссылка для входа:\n{PUBLIC_BASE_URL}/login?uid={uid}")
 
 async def on_callback(event):
@@ -386,7 +385,11 @@ async function load(){
                 <tr>
                     <td>${x.user_id}</td>
                     <td>${x.balance} ₽</td>
-                    <td><button class="gray" style="padding:5px;font-size:11px;width:auto;margin:0" onclick="addBal(${x.user_id})">+Баланс</button></td>
+                    <td>
+                        <button class="gray" style="padding:5px;font-size:11px;width:auto;margin:0" onclick="addBal(${x.user_id})">+Баланс</button>
+                        <button class="green" style="padding:5px;font-size:11px;width:auto;margin:0" onclick="givePro(${x.user_id}, 60)">+60 дней</button>
+                        <button class="gray" style="padding:5px;font-size:11px;width:auto;margin:0" onclick="givePro(${x.user_id}, 0)">+20 мин</button>
+                    </td>
                 </tr>
             `).join('');
         }
@@ -466,6 +469,11 @@ async function addBal(id){
     await api('/api/admin/bal',{method:'POST',body:JSON.stringify({user_id:id,amount:parseInt(a)})});
     load();
 }
+async function givePro(id, days){
+    await api('/api/admin/pro',{method:'POST',body:JSON.stringify({user_id:id,days:days})});
+    alert(days === 0 ? 'Выдан тестовый доступ на 20 минут' : `Выдан PRO на ${days} дней`);
+    load();
+}
 load(); setInterval(load, 5000);
 </script></body></html>
 """
@@ -476,9 +484,6 @@ def login():
     if not uid or not uid.isdigit():
         return "Неверный ID. Запросите ссылку в боте (/panel)."
     
-    if int(uid) not in SUPER_ADMINS:
-        return "Доступ к панели разрешен только администраторам."
-        
     session.permanent = True
     session["user_id"] = int(uid)
     session["csrf"] = secrets.token_urlsafe(32)
@@ -676,6 +681,39 @@ def api_admin_bal():
     d = request.json
     submit(database.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (d.get("amount", 0), d.get("user_id", 0)))).result()
     return jsonify({"ok": True})
+
+@app.route("/api/admin/pro", methods=["POST"])
+@login_req
+def api_admin_pro():
+    if get_u()["user_id"] not in SUPER_ADMINS: return jsonify({"error": "403"}), 403
+    d = request.json
+    target = d.get("user_id")
+    days = d.get("days")
+    
+    if days == 0:
+        # Тестовый доступ (20 минут)
+        delta = timedelta(minutes=20)
+        new_plan = "TEST"
+    else:
+        delta = timedelta(days=days)
+        new_plan = "PRO"
+        
+    # Вычисляем время окончания (если уже есть подписка, добавляем к ней, иначе от текущего)
+    user = submit(database.one("SELECT plan_until FROM users WHERE user_id=?", (target,))).result()
+    now_dt = datetime.now(timezone.utc)
+    
+    start_dt = now_dt
+    if user and user.get("plan_until"):
+        try:
+            old_expire = datetime.fromisoformat(user["plan_until"])
+            if old_expire > now_dt:
+                start_dt = old_expire
+        except: pass
+        
+    expire = (start_dt + delta).isoformat(timespec="seconds")
+    
+    submit(database.execute("UPDATE users SET plan=?, plan_until=? WHERE user_id=?", (new_plan, expire, target))).result()
+    return jsonify({"ok": True, "plan_until": expire})
 
 def run_web(): serve(app, host=HOST, port=PORT, threads=8)
 
