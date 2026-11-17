@@ -175,8 +175,8 @@ RANDOMIZE_MAP = {
 def randomize_text(text, enabled=True):
     """
     FIX: рандомизация теперь:
-      - не трогает первый символ каждого слова (чтобы шаблон оставался узнаваемым);
-      - не делает два искажения подряд (чтобы не было каши);
+      - не трогает первый символ каждого слова (шаблон остаётся узнаваемым);
+      - не делает два искажения подряд;
       - работает только для кириллических букв из карты.
     """
     if not enabled or not text:
@@ -190,13 +190,11 @@ def randomize_text(text, enabled=True):
             at_word_start = True
             last_replaced = False
             continue
-        # Первый символ слова не трогаем
         if at_word_start:
             out.append(ch)
             at_word_start = False
             last_replaced = False
             continue
-        # Не делаем два искажения подряд
         if not last_replaced and ch in RANDOMIZE_MAP and secrets.randbelow(2) == 0:
             out.append(RANDOMIZE_MAP[ch])
             last_replaced = True
@@ -867,11 +865,558 @@ def csrf_required(fn):
     return wrapper
 
 # =====================================================================
-# UI HTML (без изменений, кроме комментариев — см. оригинал)
+# UI HTML
 # =====================================================================
-# ... (LOGIN_HTML и DASHBOARD_HTML — оставь как в исходнике, они не относятся к багу)
-# Здесь для краткости опускаю, но в реальном файле они должны быть полностью.
-# ВАЖНО: не потеряй их, просто скопируй из исходного файла без изменений.
+
+LOGIN_HTML = r"""
+<!doctype html><html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TITAN Omni-Core — Вход</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Inter:wght@400;600;900&display=swap" rel="stylesheet">
+<style>
+:root{color-scheme:dark}*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:grid;place-items:center;padding:20px;
+background:radial-gradient(ellipse at 15% 10%,#ff003c22,transparent 42%),
+radial-gradient(ellipse at 90% 85%,#00f0ff14,transparent 45%),#050505;
+color:#e8f6ff;font:15px Inter,system-ui,Arial;overflow:hidden}
+body::before{content:'';position:fixed;inset:0;pointer-events:none;
+background:repeating-linear-gradient(0deg,rgba(0,240,255,.03) 0 1px,transparent 1px 3px);z-index:1}
+.glass{position:relative;z-index:2;width:min(460px,100%);padding:38px;
+border:1px solid #00f0ff33;border-radius:4px;background:#0a0c10dd;backdrop-filter:blur(14px);
+box-shadow:0 0 0 1px #ff003c22,0 24px 90px #0009,inset 0 0 40px #00f0ff08}
+.logo{font-family:'Space Mono',monospace;font-weight:700;letter-spacing:3px;
+font-size:22px;color:#00f0ff;text-shadow:0 0 12px #00f0ff66}
+.logo span{color:#ff003c;text-shadow:0 0 12px #ff003c66}
+h1{font-family:'Space Mono',monospace;font-size:26px;margin:30px 0 10px}
+.muted{color:#7a8899;line-height:1.7;font-size:14px}
+.pill{display:inline-block;margin-top:22px;padding:9px 14px;border-radius:3px;
+background:#ff003c11;border:1px solid #ff003c44;color:#ff6b86;
+font-family:'Space Mono',monospace;font-size:11px;letter-spacing:2px}
+.pill::before{content:'▮ ';color:#ff003c;animation:blink 1.2s steps(2) infinite}
+@keyframes blink{50%{opacity:0}}
+.scan{position:absolute;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,#00f0ff,#ff003c,transparent);
+animation:scan 3.2s linear infinite;opacity:.8}
+@keyframes scan{0%{top:0}100%{top:100%}}
+</style></head><body><main class="glass"><div class="scan"></div>
+<div class="logo">TITAN <span>// OMNICORE</span></div>
+<h1>Access Gateway</h1><p class="muted">{{ message }}</p>
+<div class="pill">AUTHORIZATION REQUIRED</div></main></body></html>
+"""
+
+DASHBOARD_HTML = r"""
+<!doctype html><html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TITAN Omni-Core v15.1</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Inter:wght@400;500;600;900&display=swap" rel="stylesheet">
+<style>
+:root{color-scheme:dark;--bg:#050505;--panel:#0a0c10;--line:#00f0ff1f;--muted:#7a8899;
+--red:#ff003c;--cyan:#00f0ff;--green:#00ff88;--yellow:#ffd500}
+*{box-sizing:border-box}
+body{margin:0;background:radial-gradient(ellipse at 8% 0%,#ff003c11,transparent 38%),
+radial-gradient(ellipse at 95% 90%,#00f0ff0e,transparent 40%),var(--bg);
+color:#e8f6ff;font:14px Inter,system-ui,Arial;min-height:100vh}
+body::before{content:'';position:fixed;inset:0;pointer-events:none;z-index:0;
+background:repeating-linear-gradient(0deg,rgba(0,240,255,.02) 0 1px,transparent 1px 3px)}
+.layout{display:flex;min-height:100vh;position:relative;z-index:1}
+aside{width:250px;padding:26px 16px;border-right:1px solid var(--line);
+background:#07090cdd;backdrop-filter:blur(12px);flex-shrink:0;position:relative}
+aside::after{content:'';position:absolute;right:-1px;top:0;bottom:0;width:1px;
+background:linear-gradient(180deg,transparent,var(--red),var(--cyan),transparent)}
+.brand{font-family:'Space Mono',monospace;font-size:16px;font-weight:700;
+letter-spacing:2px;margin:4px 8px 30px;color:var(--cyan);text-shadow:0 0 10px #00f0ff55}
+.brand b{color:var(--red);text-shadow:0 0 10px #ff003c55}
+.nav{display:block;padding:12px 13px;color:#9aa8ba;text-decoration:none;border-radius:3px;
+margin:4px 0;cursor:pointer;font-family:'Space Mono',monospace;font-size:12px;
+letter-spacing:1px;border-left:2px solid transparent;transition:.15s}
+.nav:hover,.nav.active{background:linear-gradient(90deg,#ff003c11,#00f0ff08);
+color:#fff;border-left-color:var(--red)}
+main{padding:30px;width:100%;max-width:1500px;margin:auto;min-width:0}
+.top{display:flex;align-items:center;justify-content:space-between;gap:15px;flex-wrap:wrap}
+h1{font-family:'Space Mono',monospace;font-size:24px;margin:0 0 8px;letter-spacing:1px}
+.muted{color:var(--muted)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:14px;margin:25px 0}
+.card{background:linear-gradient(135deg,#0d1016dd,#080a0ecc);border:1px solid var(--line);
+border-radius:3px;padding:19px;backdrop-filter:blur(10px);box-shadow:0 12px 40px #0004,inset 0 0 24px #00f0ff05;
+position:relative;overflow:hidden}
+.card::before{content:'';position:absolute;top:0;left:0;width:34px;height:1px;background:var(--red)}
+.metric{font-family:'Space Mono',monospace;font-size:27px;font-weight:700;margin-top:12px;
+color:var(--cyan);text-shadow:0 0 14px #00f0ff44}
+.metric.red{color:var(--red);text-shadow:0 0 14px #ff003c44}
+.section{margin:25px 0}.section h2{font-family:'Space Mono',monospace;font-size:16px;letter-spacing:1px}
+.section h2::before{content:'// ';color:var(--red)}
+.row{display:flex;gap:10px;flex-wrap:wrap}
+input,textarea,select{width:100%;background:#04060a99;border:1px solid #00f0ff33;color:#e8f6ff;
+padding:12px 13px;border-radius:3px;outline:none;font:inherit}
+input:focus,textarea:focus,select:focus{border-color:var(--cyan);box-shadow:0 0 0 1px #00f0ff44}
+textarea{min-height:110px;resize:vertical;font-family:'Space Mono',monospace;font-size:13px}
+.field{flex:1;min-width:220px}
+button{border:0;border-radius:3px;padding:11px 16px;color:#050505;font-family:'Space Mono',monospace;
+font-weight:700;font-size:12px;letter-spacing:1px;cursor:pointer;
+background:linear-gradient(100deg,var(--cyan),#00a8b8);box-shadow:0 0 16px #00f0ff33;transition:.15s}
+button:hover{box-shadow:0 0 24px #00f0ff55}
+button.secondary{background:#0d1016;color:var(--cyan);border:1px solid #00f0ff44;box-shadow:none}
+button.danger{background:linear-gradient(100deg,var(--red),#a80028);color:#fff;box-shadow:0 0 16px #ff003c33}
+button.success{background:linear-gradient(100deg,var(--green),#009955);color:#050505}
+button.ghost{background:transparent;color:var(--muted);border:1px solid #ffffff18;box-shadow:none}
+table{width:100%;border-collapse:collapse;min-width:650px}
+th,td{text-align:left;padding:12px;border-bottom:1px solid #ffffff0a;font-size:13px}
+th{color:var(--muted);font-weight:600;font-family:'Space Mono',monospace;font-size:11px;letter-spacing:1px}
+.tablewrap{overflow:auto;border:1px solid var(--line);border-radius:3px;background:#080a0ecc}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green);
+margin-right:6px;box-shadow:0 0 8px var(--green)}
+.dot.off{background:var(--red);box-shadow:0 0 8px var(--red)}
+.dot.warn{background:var(--yellow);box-shadow:0 0 8px var(--yellow)}
+.hidden{display:none!important}
+.notice{margin-top:12px;color:var(--cyan);min-height:20px;font-family:'Space Mono',monospace;font-size:12px}
+.modal{display:none;position:fixed;inset:0;background:#000000cc;backdrop-filter:blur(6px);z-index:100;place-items:center;padding:16px}
+.modal-content{background:#080a0e;border:1px solid #00f0ff44;padding:25px;border-radius:3px;width:100%;max-width:420px;
+box-shadow:0 0 40px #00f0ff22}
+.help-box{background:#080a0e;border:1px solid var(--line);border-left:2px solid var(--cyan);
+border-radius:3px;padding:18px;margin-bottom:14px;line-height:1.7}
+.help-box h3{color:var(--cyan);margin-top:0;font-family:'Space Mono',monospace;font-size:14px;letter-spacing:1px}
+.terminal{background:#020403;border:1px solid #00ff8833;border-radius:3px;padding:16px;
+font-family:'Space Mono',monospace;font-size:12px;color:#00ff88;height:520px;overflow-y:auto;
+text-shadow:0 0 6px #00ff8844;line-height:1.6}
+.terminal .err{color:var(--red);text-shadow:0 0 6px #ff003c44}
+.terminal .warn{color:var(--yellow)}
+.terminal .ts{color:#3a5040}
+.mode-toggle{display:flex;gap:8px;flex-wrap:wrap}
+.mode-toggle button{padding:9px 14px;font-size:11px;flex:1;min-width:100px;background:#0d1016;
+color:var(--muted);border:1px solid #ffffff18;box-shadow:none}
+.mode-toggle button.active{background:linear-gradient(100deg,#ff003c22,#00f0ff11);
+color:#fff;border-color:var(--red);box-shadow:0 0 16px #ff003c22}
+.badge{display:inline-block;padding:3px 8px;font-family:'Space Mono',monospace;font-size:10px;
+border:1px solid #00f0ff44;color:var(--cyan);border-radius:2px;letter-spacing:1px}
+.badge.red{border-color:#ff003c55;color:#ff6b86}
+.badge.green{border-color:#00ff8855;color:var(--green)}
+.logfilter{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:14px}
+.logfilter .field{min-width:180px}
+.logtable{font-family:'Space Mono',monospace;font-size:12px}
+.logtable .lv-ERROR{color:var(--red)}
+.logtable .lv-WARNING{color:var(--yellow)}
+.logtable .lv-INFO{color:var(--green)}
+@media(max-width:760px){.layout{display:block}aside{width:100%;padding:13px;border-right:0;
+border-bottom:1px solid var(--line)}.brand{margin:5px 8px 10px}
+.nav{display:inline-block;padding:8px 10px;margin:2px;font-size:11px;border-left:0}
+main{padding:18px 14px}h1{font-size:20px}.grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}
+.card{padding:14px}.metric{font-size:22px}.field{min-width:100%}}
+</style></head><body><div class="layout"><aside>
+<div class="brand">TITAN<b>//OMNICORE</b></div>
+<a class="nav active" onclick="showTab('overview')">[01] ОБЗОР</a>
+<a class="nav" onclick="showTab('accounts')">[02] АККАУНТЫ</a>
+<a class="nav" onclick="showTab('config')">[03] КОНФИГУРАЦИЯ</a>
+<a class="nav" onclick="showTab('parser')">[04] ПАРСИНГ</a>
+<a class="nav" onclick="showTab('inviter')">[05] ИНВАЙТИНГ</a>
+<a class="nav" onclick="showTab('autoresponder')">[06] АВТООТВЕТЧИК</a>
+<a class="nav" onclick="showTab('terminal')">[07] ТЕРМИНАЛ</a>
+<a class="nav admin-only hidden" onclick="showTab('admin')">[08] АДМИНКА</a>
+<a class="nav admin-only hidden" onclick="showTab('adminlogs')">[09] ЛОГИ ЮЗЕРОВ</a>
+<a class="nav" href="/logout">[X] ВЫХОД</a>
+</aside><main><div class="top"><div><h1 id="heading">CONTROL PANEL</h1>
+<div class="muted" id="identity">Загрузка профиля…</div></div>
+<button class="secondary" onclick="load()">↻ ОБНОВИТЬ</button></div>
+
+<!-- 01: ОБЗОР -->
+<div id="tab-overview" class="tab-content">
+<div id="overview" class="grid">
+<div class="card">ПОДПИСКА<div class="metric" id="subscription">—</div><div class="muted" id="expiry" style="font-size:12px"></div></div>
+<div class="card">БАЛАНС<div class="metric" id="balance">—</div><div class="muted" style="font-size:12px">рублей</div></div>
+<div class="card">ОТПРАВЛЕНО<div class="metric" id="sent">—</div></div>
+<div class="card">ОШИБКИ<div class="metric red" id="errors">—</div></div>
+<div class="card">FLOODWAIT<div class="metric red" id="floodwaits">—</div></div>
+<div class="card">ДВИЖОК<div class="metric" id="engineState">—</div><div class="muted" style="font-size:12px" id="engineMode"></div></div>
+</div></div>
+
+<!-- 02: АККАУНТЫ -->
+<div id="tab-accounts" class="tab-content hidden">
+<div class="section"><h2>Подключенные аккаунты</h2>
+<div class="row" style="margin-bottom:14px">
+<button onclick="openAccModal()">+ ДОБАВИТЬ АККАУНТ</button>
+<button class="secondary" onclick="loadAccounts()">↻ ОБНОВИТЬ</button></div>
+<div class="tablewrap"><table><thead><tr><th>ID</th><th>Телефон</th><th>Метка</th><th>Статус</th><th>Действие</th></tr></thead>
+<tbody id="accountRows"><tr><td colspan="5" class="muted">Загрузка...</td></tr></tbody></table></div></div></div>
+
+<!-- 03: КОНФИГУРАЦИЯ -->
+<div id="tab-config" class="tab-content hidden">
+<div class="section"><h2>Режим работы</h2>
+<div class="mode-toggle">
+<button id="modeAuto" onclick="setMode('AUTO')">AUTO // БЕЗОПАСНЫЙ</button>
+<button id="modeExtreme" onclick="setMode('EXTREME')">EXTREME // ЭКСТРИМ</button></div>
+<p class="muted" style="font-size:12px;margin-top:10px">AUTO: плавная отправка. EXTREME: минимальная задержка, спит ровно по требованию Telegram.</p></div>
+<div class="section"><h2>Шаблоны (строго по очереди через deque)</h2>
+<textarea id="templates" placeholder="Шаблон #1&#10;Шаблон #2"></textarea>
+<div class="row" style="margin-top:10px"><button onclick="saveTemplates()">СОХРАНИТЬ ШАБЛОНЫ</button>
+<label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted)">
+<input type="checkbox" id="randomize" style="width:auto">Рандомизация букв</label></div></div>
+<div class="section"><h2>Цели рассылки</h2>
+<textarea id="targets" placeholder="@username&#10;-1001234567890"></textarea>
+<div class="row" style="margin-top:10px"><button onclick="saveTargets()">СОХРАНИТЬ ЦЕЛИ</button></div></div>
+<div class="section"><h2>Параметры двигателя</h2>
+<div class="row">
+<div class="field"><label class="muted" style="font-size:12px">Задержка (сек)</label>
+<input type="number" id="delay" min="0" max="3600" value="10"></div>
+<div class="field"><label class="muted" style="font-size:12px">Webhook URL</label>
+<input type="text" id="webhook_url" placeholder="https://example.com/webhook"></div></div>
+<div class="row" style="margin-top:12px">
+<label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted)">
+<input type="checkbox" id="warmup" style="width:auto">Прогрев</label>
+<label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted)">
+<input type="checkbox" id="autosender_enabled" style="width:auto">Автоответчик</label></div>
+<div class="row" style="margin-top:12px"><button onclick="saveConfig()">СОХРАНИТЬ</button></div></div>
+<div class="section"><h2>Управление движком</h2>
+<div class="row">
+<button onclick="jobAction('start')">▶ ЗАПУСТИТЬ</button>
+<button class="danger" onclick="jobAction('stop')">■ ОСТАНОВИТЬ</button></div>
+<div class="notice" id="notice"></div></div></div>
+
+<!-- 04: ПАРСИНГ -->
+<div id="tab-parser" class="tab-content hidden">
+<div class="section"><h2>Парсинг участников</h2>
+<div class="field"><label class="muted" style="font-size:12px">Чат</label>
+<input type="text" id="parseChat" placeholder="@chatname"></div>
+<div class="row" style="margin-top:10px">
+<div class="field"><label class="muted" style="font-size:12px">Лимит</label>
+<input type="number" id="parseLimit" value="500"></div>
+<button onclick="runParser()" style="align-self:flex-end">▶ ПАРСИТЬ</button></div>
+<div class="notice" id="parseNotice"></div></div></div>
+
+<!-- 05: ИНВАЙТИНГ -->
+<div id="tab-inviter" class="tab-content hidden">
+<div class="section"><h2>Инвайтинг</h2>
+<textarea id="inviteLinks" placeholder="https://t.me/+AbCdEf123"></textarea>
+<div class="row" style="margin-top:10px">
+<button onclick="saveInvites()">СОХРАНИТЬ</button>
+<button onclick="runInviter()">▶ ВСТУПИТЬ</button></div>
+<div class="notice" id="inviteNotice"></div></div></div>
+
+<!-- 06: АВТООТВЕТЧИК -->
+<div id="tab-autoresponder" class="tab-content hidden">
+<div class="section"><h2>Автоответчик</h2>
+<div class="card"><span id="autoresponderStatus" class="badge">ВЫКЛ</span>
+<div class="muted" style="font-size:12px;margin-top:10px">Отвечает на входящие в ЛС первым шаблоном.</div></div></div></div>
+
+<!-- 07: ТЕРМИНАЛ -->
+<div id="tab-terminal" class="tab-content hidden">
+<div class="section"><h2>Терминал логов сервера</h2>
+<div class="terminal" id="terminal">[ init ] waiting for logs...\n</div>
+<div class="row" style="margin-top:12px"><button class="secondary" onclick="clearTerminal()">ОЧИСТИТЬ</button></div></div></div>
+
+<!-- 08: АДМИНКА -->
+<div id="tab-admin" class="tab-content hidden admin-only">
+<div class="section"><h2>Состояние сервера</h2>
+<div class="grid">
+<div class="card">RAM<div class="metric" id="ram">—</div></div>
+<div class="card">CPU<div class="metric" id="cpu">—</div></div>
+<div class="card">АКТИВНЫЕ КЛИЕНТЫ<div class="metric" id="activeClients">—</div></div>
+<div class="card">ОЧЕРЕДЬ<div class="metric" id="waitingClients">—</div></div></div></div>
+<div class="section"><h2>Пользователи</h2>
+<div class="tablewrap"><table>
+<thead><tr><th>Пользователь</th><th>Роль</th><th>Доступ</th><th>Подписка</th>
+<th>Баланс</th><th>Отправки</th><th>Сессия</th><th>Действия</th></tr></thead>
+<tbody id="userRows"><tr><td colspan="8" class="muted">Загрузка...</td></tr></tbody></table></div></div></div>
+
+<!-- 09: ЛОГИ ЮЗЕРОВ (NEW) -->
+<div id="tab-adminlogs" class="tab-content hidden admin-only">
+<div class="section"><h2>Логи по пользователям</h2>
+<div class="logfilter">
+<div class="field"><label class="muted" style="font-size:12px">User ID (пусто = все)</label>
+<input type="text" id="logUserId" placeholder="8655682794"></div>
+<div class="field"><label class="muted" style="font-size:12px">Лимит</label>
+<input type="number" id="logLimit" value="200" min="10" max="2000"></div>
+<button onclick="loadUserLogs()">↻ ЗАГРУЗИТЬ</button>
+<button class="danger" onclick="clearUserLogs()">🗑 ОЧИСТИТЬ ЛОГИ ЮЗЕРА</button></div>
+<div class="muted" style="font-size:12px;margin-bottom:10px">
+Показываются события: NOTIFY_ERROR, FLOODWAIT, PARSER_RUN, INVITER_RUN, ADMIN_*, WEB_LOGIN и др.
+Автообновление каждые 4 сек, пока открыта вкладка.</div>
+<div class="tablewrap"><table class="logtable">
+<thead><tr><th style="width:160px">Время</th><th style="width:110px">User ID</th>
+<th style="width:180px">Действие</th><th>Детали</th></tr></thead>
+<tbody id="userLogRows"><tr><td colspan="4" class="muted">Нет данных</td></tr></tbody></table></div></div></div>
+
+<!-- МОДАЛКА АККАУНТА -->
+<div class="modal" id="accModal"><div class="modal-content">
+<h3 style="margin-top:0;font-family:'Space Mono',monospace">// ПОДКЛЮЧЕНИЕ АККАУНТА</h3>
+<div id="accStep1">
+<p class="muted" style="font-size:13px">Введите номер телефона (+7999...)</p>
+<input type="text" id="phoneInput" placeholder="+79991234567" style="margin-bottom:10px">
+<div class="row"><button onclick="sendCode()">ПОЛУЧИТЬ КОД</button>
+<button class="secondary" onclick="closeAccModal()">ОТМЕНА</button></div>
+<p class="notice" id="accNotice"></p></div>
+<div id="accStep2" class="hidden">
+<p class="muted" style="font-size:13px">Введите код</p>
+<input type="text" id="codeInput" placeholder="12345" style="margin-bottom:10px">
+<div class="row"><button onclick="verifyCode()">ВОЙТИ</button>
+<button class="secondary" onclick="closeAccModal()">ОТМЕНА</button></div></div>
+<div id="accStep3" class="hidden">
+<p class="muted" style="font-size:13px">Пароль 2FA</p>
+<input type="password" id="passInput" placeholder="Пароль" style="margin-bottom:10px">
+<div class="row"><button onclick="verify2FA()">ВОЙТИ</button>
+<button class="secondary" onclick="closeAccModal()">ОТМЕНА</button></div></div>
+</div></div>
+
+</main></div>
+<script>
+let csrf='', role='USER', currentTab='overview';
+const esc = v => String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+function showTab(name){
+  currentTab=name;
+  document.querySelectorAll('.tab-content').forEach(el=>el.classList.add('hidden'));
+  const t=document.getElementById('tab-'+name);
+  if(t) t.classList.remove('hidden');
+  document.querySelectorAll('aside .nav').forEach(el=>el.classList.remove('active'));
+  const clicked=Array.from(document.querySelectorAll('aside .nav'))
+    .find(el=>el.getAttribute('onclick')===`showTab('${name}')`);
+  if(clicked) clicked.classList.add('active');
+  if(name==='terminal') refreshTerminal();
+  if(name==='admin') loadAdmin();
+  if(name==='adminlogs') loadUserLogs();
+  if(name==='accounts') loadAccounts();
+}
+
+async function api(path,opts={}){
+  const r=await fetch(path,{...opts,headers:{
+    'Content-Type':'application/json','X-CSRF-Token':csrf,...(opts.headers||{})}});
+  if(r.status===401){location.href='/';return null}
+  const d=await r.json();
+  if(!r.ok) throw Error(d.error||'Ошибка запроса');
+  return d;
+}
+function msg(s){const el=document.getElementById('notice'); if(el)el.textContent=s;}
+
+async function load(){
+  try{
+    const p=await api('/api/me'); if(!p) return;
+    csrf=p.csrf; role=p.role;
+    document.getElementById('identity').textContent=
+      (p.username?'@'+p.username+' · ':'')+'ID '+p.user_id+' · '+p.role;
+    document.querySelectorAll('.admin-only').forEach(x=>x.classList.toggle('hidden',role!=='ADMIN'));
+    document.getElementById('subscription').textContent=p.subscription_active?'АКТИВНА':'НЕТ';
+    document.getElementById('expiry').textContent=p.subscription_until||'—';
+    document.getElementById('balance').textContent=p.balance+' ₽';
+    document.getElementById('sent').textContent=p.stats.sent;
+    document.getElementById('errors').textContent=p.stats.errors;
+    document.getElementById('floodwaits').textContent=p.stats.floodwaits;
+    document.getElementById('engineState').textContent=p.job_status.toUpperCase();
+    document.getElementById('engineMode').textContent='MODE: '+p.mode;
+    document.getElementById('templates').value=(p.templates||[]).join('\\n');
+    document.getElementById('targets').value=(p.targets||[]).join('\\n');
+    document.getElementById('delay').value=p.delay;
+    document.getElementById('randomize').checked=!!p.randomize;
+    document.getElementById('warmup').checked=!!p.warmup;
+    document.getElementById('autosender_enabled').checked=!!p.autosender_enabled;
+    document.getElementById('webhook_url').value=p.webhook_url||'';
+    document.getElementById('autoresponderStatus').textContent=p.autosender_enabled?'ВКЛ':'ВЫКЛ';
+    document.getElementById('autoresponderStatus').className='badge '+(p.autosender_enabled?'green':'');
+    setModeUI(p.mode);
+    if(role==='ADMIN') await loadAdmin();
+  }catch(e){console.warn(e.message)}
+}
+
+function setModeUI(mode){
+  document.getElementById('modeAuto').classList.toggle('active',mode==='AUTO');
+  document.getElementById('modeExtreme').classList.toggle('active',mode==='EXTREME');
+}
+
+async function saveTemplates(){
+  try{await api('/api/templates',{method:'POST',
+    body:JSON.stringify({text:document.getElementById('templates').value})});
+    msg('Шаблоны сохранены')}catch(e){msg(e.message)}
+}
+async function saveTargets(){
+  try{await api('/api/targets',{method:'POST',
+    body:JSON.stringify({text:document.getElementById('targets').value})});
+    msg('Цели сохранены')}catch(e){msg(e.message)}
+}
+async function saveConfig(){
+  try{await api('/api/config',{method:'POST',body:JSON.stringify({
+    delay:parseInt(document.getElementById('delay').value)||10,
+    randomize:document.getElementById('randomize').checked,
+    warmup:document.getElementById('warmup').checked,
+    autosender_enabled:document.getElementById('autosender_enabled').checked,
+    webhook_url:document.getElementById('webhook_url').value||''
+  })}); msg('Конфигурация сохранена')}catch(e){msg(e.message)}
+}
+async function setMode(mode){
+  try{await api('/api/mode',{method:'POST',body:JSON.stringify({mode})});
+    setModeUI(mode); msg('Режим: '+mode)}catch(e){msg(e.message)}
+}
+async function jobAction(action){
+  try{const r=await api('/api/job/'+action,{method:'POST',body:'{}'});
+    msg(r.message); await load()}catch(e){msg(e.message)}
+}
+
+async function loadAccounts(){
+  try{const d=await api('/api/accounts'); if(!d) return;
+  document.getElementById('accountRows').innerHTML=d.accounts.length?
+    d.accounts.map(a=>`<tr><td>${a.id}</td><td>${esc(a.phone||'—')}</td>
+      <td>${esc(a.label||'—')}</td><td><span class="dot ${a.status==='active'?'':'off'}"></span>${esc(a.status)}</td>
+      <td><button class="danger" onclick="delAccount(${a.id})">УДАЛИТЬ</button></td></tr>`).join('')
+    : '<tr><td colspan="5" class="muted">Аккаунтов нет</td></tr>';
+  }catch(e){console.warn(e.message)}
+}
+async function delAccount(id){
+  if(!confirm('Удалить #'+id+'?'))return;
+  try{await api('/api/accounts/delete',{method:'POST',body:JSON.stringify({id})});
+    await loadAccounts()}catch(e){alert(e.message)}
+}
+
+function openAccModal(){
+  document.getElementById('accModal').style.display='grid';
+  document.getElementById('accStep1').classList.remove('hidden');
+  document.getElementById('accStep2').classList.add('hidden');
+  document.getElementById('accStep3').classList.add('hidden');
+  document.getElementById('accNotice').textContent='';
+}
+function closeAccModal(){document.getElementById('accModal').style.display='none'}
+async function sendCode(){
+  try{await api('/api/auth/send_code',{method:'POST',
+    body:JSON.stringify({phone:document.getElementById('phoneInput').value})});
+    document.getElementById('accStep1').classList.add('hidden');
+    document.getElementById('accStep2').classList.remove('hidden');
+  }catch(e){document.getElementById('accNotice').textContent=e.message}
+}
+async function verifyCode(){
+  try{const r=await api('/api/auth/verify_code',{method:'POST',
+    body:JSON.stringify({code:document.getElementById('codeInput').value})});
+    if(r.need_2fa){
+      document.getElementById('accStep2').classList.add('hidden');
+      document.getElementById('accStep3').classList.remove('hidden');
+    }else{closeAccModal(); await load(); await loadAccounts();}
+  }catch(e){document.getElementById('accNotice').textContent=e.message}
+}
+async function verify2FA(){
+  try{await api('/api/auth/verify_2fa',{method:'POST',
+    body:JSON.stringify({pass:document.getElementById('passInput').value})});
+    closeAccModal(); await load(); await loadAccounts()
+  }catch(e){document.getElementById('accNotice').textContent=e.message}
+}
+
+async function runParser(){
+  try{const r=await api('/api/parser/run',{method:'POST',body:JSON.stringify({
+    chat:document.getElementById('parseChat').value,
+    limit:parseInt(document.getElementById('parseLimit').value)||500
+  })});
+    document.getElementById('parseNotice').textContent='Добавлено: '+(r.added||0)
+  }catch(e){document.getElementById('parseNotice').textContent=e.message}
+}
+async function saveInvites(){
+  try{await api('/api/invites/save',{method:'POST',
+    body:JSON.stringify({text:document.getElementById('inviteLinks').value})});
+    document.getElementById('inviteNotice').textContent='Сохранено'}catch(e){
+    document.getElementById('inviteNotice').textContent=e.message}
+}
+async function runInviter(){
+  try{const r=await api('/api/inviter/run',{method:'POST',body:'{}'});
+    document.getElementById('inviteNotice').textContent=
+      'Вступил: '+(r.ok||0)+', ошибок: '+(r.failed||0)
+  }catch(e){document.getElementById('inviteNotice').textContent=e.message}
+}
+
+async function loadAdmin(){
+  try{
+    const s=await api('/api/admin/stats'); if(!s) return;
+    document.getElementById('ram').textContent=(s.ram_mb??'—')+' MB';
+    document.getElementById('cpu').textContent=(s.cpu_percent??'—')+' %';
+    document.getElementById('activeClients').textContent=s.active_clients+' / '+s.client_limit;
+    document.getElementById('waitingClients').textContent=s.waiting_clients;
+    const u=await api('/api/admin/users');
+    if(u) document.getElementById('userRows').innerHTML=u.users.map(x=>{
+      const approved = x.approved == 1;
+      const btnLabel = approved ? 'ЗАБРАТЬ' : 'ВЫДАТЬ';
+      const btnCls = approved ? 'danger' : 'success';
+      return `<tr>
+        <td>${esc(x.username||x.user_id)}<br><small class="muted">${x.user_id}</small></td>
+        <td>${esc(x.role)}</td>
+        <td><span class="dot ${approved?'':'off'}"></span>${approved?'ON':'OFF'}</td>
+        <td>${esc(x.subscription_until||'—')}</td>
+        <td>${x.balance} ₽</td><td>${x.sent}/${x.errors}</td>
+        <td>${x.has_session?'✅':'❌'}</td>
+        <td><button class="${btnCls}" onclick="toggleApprove(${x.user_id},${approved})">${btnLabel}</button>
+        <button onclick="grantSub(${x.user_id})">+ПОДП</button>
+        <button onclick="addBal(${x.user_id})">+БАЛ</button>
+        <button class="secondary" onclick="jumpToLogs(${x.user_id})">ЛОГИ</button></td>
+      </tr>`;
+    }).join('');
+  }catch(e){console.warn(e.message)}
+}
+async function toggleApprove(id, currentlyApproved){
+  if(!confirm((currentlyApproved?'Забрать доступ у ':'Выдать доступ ')+id+'?')) return;
+  try{await api('/api/admin/approve',{method:'POST',
+    body:JSON.stringify({user_id:id,enabled:!currentlyApproved})});
+    await loadAdmin();
+  }catch(e){alert(e.message)}
+}
+async function grantSub(id){
+  const days=parseInt(prompt('Дней подписки:','30')||'0');
+  if(!days) return;
+  try{await api('/api/admin/grant',{method:'POST',body:JSON.stringify({user_id:id,days})});
+    await loadAdmin()}catch(e){alert(e.message)}
+}
+async function addBal(id){
+  const amount=parseInt(prompt('Сумма (₽):','100')||'0');
+  if(!amount) return;
+  try{await api('/api/admin/balance',{method:'POST',body:JSON.stringify({user_id:id,amount})});
+    await loadAdmin()}catch(e){alert(e.message)}
+}
+function jumpToLogs(id){
+  document.getElementById('logUserId').value=id;
+  showTab('adminlogs');
+}
+
+async function loadUserLogs(){
+  if(role!=='ADMIN') return;
+  try{
+    const uid=document.getElementById('logUserId').value.trim();
+    const limit=parseInt(document.getElementById('logLimit').value)||200;
+    const qs=new URLSearchParams();
+    if(uid) qs.set('user_id',uid);
+    qs.set('limit',limit);
+    const d=await api('/api/admin/logs?'+qs.toString());
+    if(!d) return;
+    document.getElementById('userLogRows').innerHTML=d.entries.length?
+      d.entries.map(e=>{
+        const lv = e.action.includes('ERROR')?'ERROR':
+                   e.action.includes('FLOODWAIT')?'WARNING':'INFO';
+        return `<tr><td>${esc(e.created_at)}</td>
+          <td>${e.user_id}</td>
+          <td class="lv-${lv}">${esc(e.action)}</td>
+          <td>${esc(e.details)}</td></tr>`;
+      }).join('')
+      : '<tr><td colspan="4" class="muted">Пусто</td></tr>';
+  }catch(e){console.warn('logs:',e.message)}
+}
+async function clearUserLogs(){
+  const uid=document.getElementById('logUserId').value.trim();
+  if(!uid){alert('Укажите User ID'); return;}
+  if(!confirm('Удалить ВСЕ логи для '+uid+'?')) return;
+  try{await api('/api/admin/logs/clear',{method:'POST',
+    body:JSON.stringify({user_id:parseInt(uid)})});
+    await loadUserLogs();
+  }catch(e){alert(e.message)}
+}
+
+let terminalTicker=null;
+async function refreshTerminal(){
+  try{const d=await api('/api/terminal'); if(!d) return;
+    const term=document.getElementById('terminal');
+    term.innerHTML=d.lines.map(l=>{
+      const cls=l.level==='ERROR'?'err':l.level==='WARNING'?'warn':'';
+      return `<div class="${cls}"><span class="ts">${esc(l.ts)}</span> ${esc(l.msg)}</div>`;
+    }).join('');
+    term.scrollTop=term.scrollHeight;
+  }catch(e){}
+}
+function clearTerminal(){document.getElementById('terminal').innerHTML=''}
+
+setInterval(()=>{if(currentTab==='terminal') refreshTerminal()},2000);
+setInterval(()=>{if(currentTab==='adminlogs') loadUserLogs()},4000);
+setInterval(load,30000);
+load();
+</script></body></html>
+"""
 
 # =====================================================================
 # ROUTES
@@ -1378,7 +1923,6 @@ async def send_to_target(uid, session_str, target, message, delay, stop_event, m
                 await db.inc_stat(uid, "floodwaits", 1)
                 await db.audit(uid, "FLOODWAIT", f"{target}: {fw.seconds}s")
                 await asyncio.sleep(fw.seconds + 1)
-                # FIX: entity мог не успеть присвоиться — переполучаем
                 if entity is None:
                     try:
                         entity = await client.get_entity(target)
@@ -1421,7 +1965,6 @@ async def notification_worker(uid, stop_event):
             randomize = bool(cfg["randomize"] if cfg else True)
             do_warmup = bool(cfg["warmup"] if cfg else False)
 
-            # FIX: прогреваем один раз за цикл, если включено и AUTO
             if do_warmup and mode == "AUTO":
                 try:
                     async with client_manager.acquire(user["session_string"]) as wcli:
@@ -1429,10 +1972,9 @@ async def notification_worker(uid, stop_event):
                 except Exception as e:
                     log.warning(f"Warmup failed: {e}")
 
-            # FIX: раньше шаблон брался из deque, который пересоздавался только
-            # когда опустеет. Если целей меньше, чем шаблонов, второй шаблон
-            # НИКОГДА не брался. Теперь честный round-robin по индексу,
-            # независимо от количества целей — все шаблоны участвуют.
+            # FIX: честный round-robin по шаблонам, независимо от числа целей.
+            # Раньше deque пересоздавался только при опустошении, и если целей
+            # меньше, чем шаблонов — второй шаблон НИКОГДА не брался.
             tasks = []
             for i, target in enumerate(targets):
                 if stop_event.is_set():
