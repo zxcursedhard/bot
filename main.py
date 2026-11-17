@@ -173,12 +173,6 @@ RANDOMIZE_MAP = {
 }
 
 def randomize_text(text, enabled=True):
-    """
-    FIX: рандомизация теперь:
-      - не трогает первый символ каждого слова (шаблон остаётся узнаваемым);
-      - не делает два искажения подряд;
-      - работает только для кириллических букв из карты.
-    """
     if not enabled or not text:
         return text
     out = []
@@ -1159,6 +1153,7 @@ main{padding:18px 14px}h1{font-size:20px}.grid{grid-template-columns:repeat(2,mi
 </main></div>
 <script>
 let csrf='', role='USER', currentTab='overview';
+let configDirty = false; // FIX: флаг, что юзер менял чекбоксы вручную
 const esc = v => String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
 function showTab(name){
@@ -1203,11 +1198,14 @@ async function load(){
     document.getElementById('engineMode').textContent='MODE: '+p.mode;
     document.getElementById('templates').value=(p.templates||[]).join('\\n');
     document.getElementById('targets').value=(p.targets||[]).join('\\n');
-    document.getElementById('delay').value=p.delay;
-    document.getElementById('randomize').checked=!!p.randomize;
-    document.getElementById('warmup').checked=!!p.warmup;
-    document.getElementById('autosender_enabled').checked=!!p.autosender_enabled;
-    document.getElementById('webhook_url').value=p.webhook_url||'';
+    // FIX: не перезаписываем контролы, если юзер их менял, но ещё не сохранил
+    if(!configDirty){
+      document.getElementById('delay').value=p.delay;
+      document.getElementById('randomize').checked=!!p.randomize;
+      document.getElementById('warmup').checked=!!p.warmup;
+      document.getElementById('autosender_enabled').checked=!!p.autosender_enabled;
+      document.getElementById('webhook_url').value=p.webhook_url||'';
+    }
     document.getElementById('autoresponderStatus').textContent=p.autosender_enabled?'ВКЛ':'ВЫКЛ';
     document.getElementById('autoresponderStatus').className='badge '+(p.autosender_enabled?'green':'');
     setModeUI(p.mode);
@@ -1231,13 +1229,26 @@ async function saveTargets(){
     msg('Цели сохранены')}catch(e){msg(e.message)}
 }
 async function saveConfig(){
-  try{await api('/api/config',{method:'POST',body:JSON.stringify({
-    delay:parseInt(document.getElementById('delay').value)||10,
-    randomize:document.getElementById('randomize').checked,
-    warmup:document.getElementById('warmup').checked,
-    autosender_enabled:document.getElementById('autosender_enabled').checked,
-    webhook_url:document.getElementById('webhook_url').value||''
-  })}); msg('Конфигурация сохранена')}catch(e){msg(e.message)}
+  const randEl = document.getElementById('randomize');
+  const wanted = randEl.checked; // что хочет пользователь СЕЙЧАС
+  try{
+    const res = await api('/api/config',{method:'POST',body:JSON.stringify({
+      delay:parseInt(document.getElementById('delay').value)||10,
+      randomize:wanted,
+      warmup:document.getElementById('warmup').checked,
+      autosender_enabled:document.getElementById('autosender_enabled').checked,
+      webhook_url:document.getElementById('webhook_url').value||''
+    })});
+    // FIX: после сохранения принудительно выставляем чекбокс по ответу сервера,
+    // чтобы UI не «откатывался» на старое значение при следующем load().
+    if (res && typeof res.randomize === 'boolean') {
+      randEl.checked = res.randomize;
+    } else {
+      randEl.checked = wanted; // fallback
+    }
+    configDirty = false; // FIX
+    msg('Конфигурация сохранена');
+  }catch(e){ msg(e.message); }
 }
 async function setMode(mode){
   try{await api('/api/mode',{method:'POST',body:JSON.stringify({mode})});
@@ -1411,6 +1422,12 @@ async function refreshTerminal(){
 }
 function clearTerminal(){document.getElementById('terminal').innerHTML=''}
 
+// FIX: помечаем конфиг грязным при ручном изменении чекбоксов
+['randomize','warmup','autosender_enabled'].forEach(id=>{
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', ()=>{ configDirty = true; });
+});
+
 setInterval(()=>{if(currentTab==='terminal') refreshTerminal()},2000);
 setInterval(()=>{if(currentTab==='adminlogs') loadUserLogs()},4000);
 setInterval(load,30000);
@@ -1500,6 +1517,10 @@ def api_templates():
     uid = int(request.titan_user["user_id"])
     raw = (request.get_json(silent=True) or {}).get("text", "")
 
+    # FIX: превращаем литеральные "\n", "\r\n", "\r" в реальные переносы.
+    # Это спасает кейс, когда в textarea вставили "тест1\ntест2".
+    raw = raw.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
+
     chunks = []
     for part in raw.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
         for sub in part.splitlines():
@@ -1528,16 +1549,18 @@ def api_config():
     uid = int(request.titan_user["user_id"])
     payload = request.get_json(silent=True) or {}
     delay = max(0, min(3600, int(payload.get("delay", 10))))
+    randomize = bool(payload.get("randomize"))
     run_async(db.update_user_lists(
-        uid, delay=delay, randomize=bool(payload.get("randomize")),
+        uid, delay=delay, randomize=randomize,
         warmup=bool(payload.get("warmup")),
         autosender_enabled=bool(payload.get("autosender_enabled")),
         webhook_url=str(payload.get("webhook_url") or "")[:500]
     ))
     run_async(db.set_config(uid, delay=delay,
-                             randomize=1 if payload.get("randomize") else 0,
+                             randomize=1 if randomize else 0,
                              warmup=1 if payload.get("warmup") else 0))
-    return jsonify({"ok": True})
+    # FIX: возвращаем randomize, чтобы фронт синхронизировал чекбокс
+    return jsonify({"ok": True, "randomize": randomize})
 
 @app.post("/api/mode")
 @login_required
