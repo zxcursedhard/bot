@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TITAN Enterprise v22.0 — Direct ID Auth + Classic UI
+TITAN Enterprise v24.0 — Classic Dark WebUI + Direct Auth
 """
 from __future__ import annotations
 
@@ -229,52 +229,50 @@ class SpamEngine:
                     except: pass
         await client.disconnect()
 
-# ------------------------------ WEB UI ------------------------------
+# ------------------------------ WEB UI (CLASSIC DASHBOARD) ------------------------------
 app = Flask(__name__)
 app.secret_key = FLASK_SECRET
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax", PERMANENT_SESSION_LIFETIME=COOKIE_DAYS*86400)
 
 HTML = r"""
 <!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
-<title>TITAN Enterprise</title>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
+<title>TITAN Admin</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-:root{--bg:#0a0e14;--panel:#141a22;--line:#1f2933;--txt:#e8eef5;--muted:#7a8899;--acc:#4ea8de;--ok:#3ddc97;--warn:#ffb703;--err:#ef476f}
+:root{--bg:#08090d;--panel:#10131c;--panel2:#151925;--line:#252b3a;--muted:#858da1;--text:#f4f5f8;--red:#f02d49;--red2:#a90e2b;--green:#37d99a}
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);color:var(--txt);font:14px -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;min-height:100vh;display:flex}
-.side{width:220px;background:var(--panel);border-right:1px solid var(--line);padding:20px;display:flex;flex-direction:column}
-.logo{font-weight:800;font-size:18px;margin-bottom:30px;letter-spacing:1px;color:var(--acc)}
-.nav a{display:block;padding:12px;color:var(--muted);text-decoration:none;border-radius:8px;cursor:pointer;margin-bottom:5px;transition:0.2s;font-weight:500}
-.nav a:hover,.nav a.active{background:var(--line);color:var(--txt)}
-.main{flex:1;padding:30px;overflow-y:auto;max-width:1400px}
-.header{display:flex;justify-content:space-between;align-items:center;margin-bottom:25px}
-h1{font-size:24px;font-weight:700;color:#fff}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:15px;margin-bottom:25px}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px}
-.metric{font-size:28px;font-weight:700;margin-top:10px;color:var(--acc)}
-.label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:1.5px}
-.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px;margin-bottom:20px}
-input,textarea,select{width:100%;background:#0a0e14;border:1px solid var(--line);color:var(--txt);padding:12px;border-radius:8px;margin-bottom:10px;font-family:inherit;outline:none}
-input:focus,textarea:focus,select:focus{border-color:var(--acc)}
-button{width:100%;padding:12px;background:var(--acc);color:#0a0e14;border:none;border-radius:8px;font-weight:700;cursor:pointer;margin-bottom:10px;transition:0.2s}
+body{background:#08090d;color:#f4f5f8;font:14px Inter,system-ui,Arial;display:flex;min-height:100vh}
+aside{width:235px;background:#0d1017;padding:22px;border-right:1px solid #252b3a;display:flex;flex-direction:column}
+.logo{font-size:21px;font-weight:800;letter-spacing:2px;color:#ff354f;margin-bottom:35px}
+.nav a{display:block;padding:12px;color:#aeb7c9;text-decoration:none;border-radius:9px;margin:5px 0;cursor:pointer;font-weight:500}
+.nav a:hover,.nav a.active{background:#28121b;color:#fff;border:1px solid #642334}
+.main{padding:30px;flex:1;max-width:1500px}
+h1{margin:0 0 8px;font-size:27px}
+.muted{color:#8792a8}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:14px;margin:25px 0}
+.card{background:#141824;border:1px solid #252c3b;border-radius:13px;padding:20px}
+.value{font-size:27px;font-weight:800;margin-top:12px;color:#ff5268}
+.panel{background:#141824;border:1px solid #252c3b;border-radius:12px;padding:20px;margin-bottom:20px}
+input,textarea,select{width:100%;background:#0c1018;border:1px solid #30394b;color:#fff;padding:12px;border-radius:8px;margin-bottom:10px;font-family:inherit;outline:none}
+input:focus,textarea:focus,select:focus{border-color:#f02d49}
+button{padding:11px 16px;background:#d92f49;color:#fff;border:0;border-radius:8px;font-weight:700;cursor:pointer;transition:0.2s;width:100%;margin-bottom:10px}
 button:hover{filter:brightness(1.1)}
-button.gray{background:var(--line);color:var(--txt)}
-button.red{background:var(--err);color:#fff}
-button.ok{background:var(--ok);color:#0a0e14}
-.chat-list{max-height:300px;overflow-y:auto;border:1px solid var(--line);border-radius:8px;padding:10px;margin-bottom:15px;background:#0a0e14}
-.chat-item{display:flex;align-items:center;gap:10px;padding:8px;border-bottom:1px solid var(--line);color:var(--muted)}
-.chat-item input{width:auto;margin:0;accent-color:var(--acc)}
+button.gray{background:#252b3a}
+button.green{background:#37d99a;color:#000}
+table{width:100%;border-collapse:collapse;background:#141824;border-radius:12px;overflow:hidden;margin-top:15px}
+th,td{text-align:left;padding:12px;border-bottom:1px solid #252c3b;font-size:13px}
+th{color:#9da9bd;font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:1px}
+.chat-list{max-height:300px;overflow-y:auto;border:1px solid #252c3b;border-radius:8px;padding:10px;margin-bottom:15px;background:#0c1018}
+.chat-item{display:flex;align-items:center;gap:10px;padding:8px;border-bottom:1px solid #1a1f2b;color:#9da9bd}
+.chat-item input{width:auto;margin:0;accent-color:#d92f49}
 .hidden{display:none!important}
-table{width:100%;border-collapse:collapse;font-size:13px}
-th,td{text-align:left;padding:12px;border-bottom:1px solid var(--line)}
-th{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:1px}
-.dummy{text-align:center;padding:60px;color:var(--muted)}
-.dummy h2{color:var(--warn);margin-bottom:10px;font-size:20px}
-@media(max-width:768px){body{flex-direction:column}.side{width:100%;border-right:none;border-bottom:1px solid var(--line);padding:15px}.nav{display:flex;overflow-x:auto;gap:5px}.nav a{white-space:nowrap;padding:8px 12px}.logo{margin-bottom:15px}.main{padding:20px}}
+.dummy{text-align:center;padding:60px;color:#8792a8}
+.dummy h2{color:#ffb703;margin-bottom:10px}
+@media(max-width:768px){body{flex-direction:column}aside{width:100%;border-right:0;border-bottom:1px solid #252b3a;padding:15px}.nav{display:flex;overflow-x:auto;gap:5px}.nav a{white-space:nowrap;padding:8px 12px}.logo{margin-bottom:15px}.main{padding:20px}}
 </style></head><body>
-<div class="side">
-<div class="logo">TITAN ENTERPRISE</div>
-<div class="nav">
+<aside>
+<div class="logo">TITAN Admin</div>
+<nav class="nav">
 <a class="active" onclick="tab('dash')">📊 Обзор</a>
 <a onclick="tab('acc')">👤 Аккаунты</a>
 <a onclick="tab('chats')">💬 Мои чаты</a>
@@ -282,21 +280,18 @@ th{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:1px
 <a onclick="tab('shop')">🛒 Магазин</a>
 <a id="admin-btn" class="hidden" onclick="tab('adm')">👑 Админка</a>
 <a href="/logout">🚪 Выход</a>
-</div>
-</div>
+</nav>
+</aside>
 <div class="main">
-<div class="header"><h1 id="title">Обзор</h1></div>
+<div class="header"><h1 id="title">Обзор</h1><div class="muted" id="subtitle">Панель управления</div></div>
 
 <div id="tab-dash" class="tab-content">
 <div class="grid">
-<div class="card"><div class="label">Отправлено</div><div class="metric" id="m-sent">0</div></div>
-<div class="card"><div class="label">Ошибки</div><div class="metric" style="color:var(--err)" id="m-err">0</div></div>
-<div class="card"><div class="label">Аккаунты</div><div class="metric" style="color:var(--ok)" id="m-acc">0</div></div>
+<div class="card"><div class="label">Отправлено</div><div class="value" id="m-sent">0</div></div>
+<div class="card"><div class="label">Ошибки</div><div class="value" id="m-err">0</div></div>
+<div class="card"><div class="label">Аккаунты</div><div class="value" id="m-acc">0</div></div>
 </div>
-<div class="panel">
-<h3>Статус движка</h3>
-<p id="eng-status" style="margin-top:10px;font-weight:700;color:var(--warn);">ОСТАНОВЛЕН</p>
-</div>
+<div class="panel"><h3>Статус движка</h3><p id="eng-status" style="margin-top:10px;font-weight:700;color:#8792a8">ОСТАНОВЛЕН</p></div>
 </div>
 
 <div id="tab-acc" class="tab-content hidden">
@@ -306,7 +301,7 @@ th{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:1px
 <button onclick="startAuth()">Получить код</button>
 <div id="acc-code-div" class="hidden">
 <input id="acc-code" placeholder="Код из Telegram">
-<button class="ok" onclick="verifyAuth()">Войти</button>
+<button class="green" onclick="verifyAuth()">Войти</button>
 </div>
 </div>
 </div>
@@ -314,24 +309,24 @@ th{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:1px
 <div id="tab-chats" class="tab-content hidden">
 <div class="panel">
 <h3>Выберите чаты для рассылки</h3>
-<button class="gray" onclick="loadChats()">🔄 Обновить список</button>
+<button class="gray" onclick="loadChats()">Обновить список</button>
 <div class="chat-list" id="chat-list">Нажмите "Обновить список"</div>
-<button class="ok" onclick="saveSelectedChats()">Сохранить выбранные в цели</button>
+<button class="green" onclick="saveSelectedChats()">Сохранить в цели</button>
 </div>
 </div>
 
 <div id="tab-cfg" class="tab-content hidden">
 <div class="panel">
 <h3>Режим</h3>
-<select id="cfg-mode"><option value="AUTO">AUTO (Безопасный)</option><option value="EXTREME">EXTREME (Скорость)</option></select>
+<select id="cfg-mode"><option value="AUTO">AUTO</option><option value="EXTREME">EXTREME</option></select>
 <h3>Задержка (сек)</h3><input id="cfg-delay" type="number" step="0.1">
 <h3>Прогрев</h3><select id="cfg-warmup"><option value="1">Вкл</option><option value="0">Выкл</option></select>
 <button onclick="saveCfg()">Сохранить</button>
 </div>
-<div class="panel"><h3>Шаблоны</h3><textarea id="cfg-tpl" rows="3" placeholder="Каждая строка - новый шаблон"></textarea><button onclick="saveTpl()">Сохранить</button></div>
-<div class="panel"><h3>Цели (вручную)</h3><textarea id="cfg-tgt" rows="3" placeholder="@username или -100..."></textarea><button onclick="saveTgt()">Сохранить</button></div>
-<button class="ok" onclick="engine('start')">🚀 ЗАПУСТИТЬ</button>
-<button class="red" onclick="engine('stop')">🛑 ОСТАНОВИТЬ</button>
+<div class="panel"><h3>Шаблоны</h3><textarea id="cfg-tpl" rows="3"></textarea><button onclick="saveTpl()">Сохранить</button></div>
+<div class="panel"><h3>Цели</h3><textarea id="cfg-tgt" rows="3"></textarea><button onclick="saveTgt()">Сохранить</button></div>
+<button class="green" onclick="engine('start')">🚀 ЗАПУСТИТЬ</button>
+<button onclick="engine('stop')">🛑 ОСТАНОВИТЬ</button>
 </div>
 
 <div id="tab-shop" class="tab-content hidden">
@@ -373,7 +368,7 @@ async function load(){
         document.getElementById('m-acc').textContent=u.accounts;
         const st = document.getElementById('eng-status');
         st.textContent = u.running ? 'РАБОТАЕТ' : 'ОСТАНОВЛЕН';
-        st.style.color = u.running ? 'var(--ok)' : 'var(--warn)';
+        st.style.color = u.running ? '#37d99a' : '#8792a8';
         document.getElementById('cfg-mode').value=u.mode;
         document.getElementById('cfg-delay').value=u.gap;
         document.getElementById('cfg-warmup').value=u.warmup;
@@ -386,7 +381,7 @@ async function load(){
                 <tr>
                     <td>${x.user_id}</td>
                     <td>${x.balance} ₽</td>
-                    <td><button class="ok" style="padding:5px;font-size:11px;width:auto;margin:0" onclick="addBal(${x.user_id})">+Баланс</button></td>
+                    <td><button class="gray" style="padding:5px;font-size:11px;width:auto;margin:0" onclick="addBal(${x.user_id})">+Баланс</button></td>
                 </tr>
             `).join('');
         }
@@ -458,7 +453,6 @@ def login():
     if not uid or not uid.isdigit():
         return "Неверный ID. Запросите ссылку в боте (/panel)."
     
-    # Проверка, что этот ID есть в базе админов (чтобы никто чужой не зашел)
     if int(uid) not in SUPER_ADMINS:
         return "Доступ к панели разрешен только администраторам."
         
