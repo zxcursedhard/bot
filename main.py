@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-TITAN Enterprise v15.5 — True Omni-Core
+TITAN Enterprise v15.5 (GPT UI Edition) — True Omni-Core
 Single-file high-performance Telegram automation platform.
-Features: Multi-account, Extreme Mode, Warmup, Queue Rotation, Deep Analytics.
 """
 from __future__ import annotations
 
@@ -28,7 +27,7 @@ from urllib.parse import urlparse
 import aiosqlite
 import aiohttp
 import psutil
-from flask import Flask, abort, jsonify, redirect, render_template_string, request, session
+from flask import Flask, abort, jsonify, redirect, render_template_string, request, session, url_for
 from telethon import TelegramClient, events, Button
 from telethon.errors import (
     FloodWaitError, RPCError, SessionPasswordNeededError,
@@ -38,7 +37,7 @@ from telethon.sessions import StringSession
 from waitress import serve
 
 # ------------------------------- Configuration -------------------------------
-APP_NAME, VERSION = "TITAN Enterprise", "15.5 True Omni-Core"
+APP_NAME, VERSION = "TITAN Enterprise", "15.5 Omni-Core"
 API_ID = int(os.getenv("API_ID", "2040") or "2040")
 API_HASH = os.getenv("API_HASH", "b18441a1ff607e10a989891a5462e627")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8732669492:AAGjBx_kMW4JRpo4DyhCoRwAISSS-lJ1IhE")
@@ -369,149 +368,36 @@ app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SECURE=os.getenv(
                   MAX_CONTENT_LENGTH=1024 * 1024)
 
 CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap');
-:root{--bg:#050505;--panel:#0f0f12;--line:#222;--txt:#e0e0e0;--muted:#666;--primary:#ff003c;--accent:#00f0ff}
-*{box-sizing:border-box;margin:0;padding:0}body{background:var(--bg);color:var(--txt);font:14px 'Inter',sans-serif;display:flex;height:100vh;overflow:hidden}
-.sidebar{width:260px;background:var(--panel);border-right:1px solid var(--line);padding:30px;display:flex;flex-direction:column}
-.logo{font-family:'Space Mono';font-size:24px;font-weight:700;color:#fff;margin-bottom:40px;border-bottom:1px solid var(--line);padding-bottom:20px}
-.logo span{color:var(--primary)}
-.nav-item{padding:12px 15px;border-radius:8px;color:var(--muted);cursor:pointer;transition:0.2s;font-weight:600;margin-bottom:5px;text-decoration:none;display:block}
-.nav-item:hover,.nav-item.active{background:rgba(255,0,60,0.1);color:#fff;border-left:2px solid var(--primary)}
-.main{flex:1;padding:40px;overflow-y:auto}
-.header{display:flex;justify-content:space-between;align-items:center;margin-bottom:30px}
-h1{font-size:28px;font-weight:800;letter-spacing:-1px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:20px;margin-bottom:30px}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:24px}
-.metric{font-size:32px;font-family:'Space Mono';font-weight:700;margin-top:15px;color:var(--primary)}
-.label{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:1px;font-weight:700}
-.panel{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:25px;margin-bottom:25px}
-.panel h3{margin-bottom:15px;font-size:16px;color:var(--accent)}
-textarea,input,select{width:100%;background:#000;border:1px solid var(--line);color:#fff;padding:12px;border-radius:8px;font-family:'Space Mono';font-size:12px;margin-bottom:15px}
-textarea:focus,input:focus,select:focus{outline:none;border-color:var(--primary)}
-button{padding:12px 20px;background:var(--primary);border:none;border-radius:8px;color:#fff;font-weight:700;cursor:pointer;transition:0.2s}
-button:hover{opacity:0.8}
-button.outline{background:transparent;border:1px solid var(--line);color:var(--txt)}
-button.green{background:var(--accent);color:#000}
-.hidden{display:none!important}
-.terminal{background:#000;color:#00ff00;font-family:'Space Mono';padding:15px;border-radius:8px;height:400px;overflow-y:auto;font-size:12px;line-height:1.5}
-table{width:100%;border-collapse:collapse}
-th,td{text-align:left;padding:12px;border-bottom:1px solid var(--line);font-size:13px}
-th{color:var(--muted);font-size:11px;text-transform:uppercase}
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Space+Mono:wght@400;700&display=swap');
+:root{--bg:#050505;--panel:#0d1118;--line:#252c38;--red:#ff003c;--cyan:#00f0ff;--green:#35ff9a;--muted:#8994a5;--text:#eef3fa}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at 80% 0%,#1b0710,transparent 38%),var(--bg);color:var(--text);font-family:Inter,sans-serif}
+a{color:var(--cyan);text-decoration:none}button{border:1px solid #6b1630;background:linear-gradient(135deg,#ff003c,#a0002b);color:#fff;padding:11px 16px;border-radius:8px;font-weight:700;cursor:pointer}
+input,textarea,select{width:100%;background:#070a0f;border:1px solid var(--line);color:var(--text);padding:12px;border-radius:8px;font:inherit}textarea{min-height:125px}
+.shell{display:flex;min-height:100vh}.side{position:fixed;inset:0 auto 0 0;width:235px;padding:25px 17px;background:#080a0e;border-right:1px solid var(--line)}
+.brand{font:700 17px 'Space Mono';letter-spacing:1px}.brand b{color:var(--red)}.tag{font:10px 'Space Mono';color:var(--cyan);margin:8px 0 28px}
+.nav a{display:block;padding:12px;border-radius:8px;color:#aeb8c6;margin:5px 0}.nav a:hover{background:#1b1018;color:white;border-left:2px solid var(--red)}
+.main{margin-left:235px;width:calc(100% - 235px);padding:30px;max-width:1600px}.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:25px}
+h1{font-size:25px;margin:0 0 5px}h2{font-size:14px;margin:0 0 16px}.muted{color:var(--muted);font-size:13px}.mono{font-family:'Space Mono',monospace}
+.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.card{background:linear-gradient(145deg,#111722,#0a0d12);border:1px solid var(--line);border-radius:13px;padding:19px;box-shadow:0 12px 40px #0005}
+.metric{font:700 28px 'Space Mono';margin-top:12px}.red{color:var(--red)}.cyan{color:var(--cyan)}.green{color:var(--green)}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px}.field{margin:13px 0}.field label{display:block;color:#aeb8c6;font-size:12px;margin-bottom:7px}
+table{width:100%;border-collapse:collapse;font-size:12px}th,td{text-align:left;padding:11px;border-bottom:1px solid var(--line)}th{color:var(--muted);font:10px 'Space Mono'}
+.pill{display:inline-block;padding:5px 9px;border-radius:30px;background:#15251e;color:var(--green);font:10px 'Space Mono'}
+.terminal{background:#020604;border:1px solid #164c32;border-radius:10px;padding:17px;color:var(--green);font:12px/1.8 'Space Mono';height:450px;overflow:auto;white-space:pre-wrap}
+.notice{padding:12px;border:1px solid #512332;background:#1a0b11;border-radius:9px;color:#ff9eb4;margin:14px 0}.panel{margin-top:17px}.login{max-width:450px;margin:10vh auto;padding:28px}
+.footer{margin-top:30px;color:#687487;font:10px 'Space Mono'}
+@media(max-width:850px){.side{width:185px}.main{margin-left:185px;width:calc(100% - 185px);padding:20px}.grid{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:600px){.side{position:relative;width:100%;height:auto;border:0;border-bottom:1px solid var(--line)}.nav{display:flex;overflow:auto}.nav a{white-space:nowrap}.main{margin:0;width:100%;padding:16px}.grid,.row{grid-template-columns:1fr}.top{align-items:flex-start;gap:12px;flex-direction:column}}
 """
 
-UI_HTML = r"""
-<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>TITAN // Omni-Core</title><style>""" + CSS + r"""</style></head><body>
-<div class="sidebar">
-<div class="logo">TITAN<span>//15</span></div>
-<a class="nav-item active" onclick="tab('dash')">Обзор</a>
-<a class="nav-item" onclick="tab('acc')">Аккаунты</a>
-<a class="nav-item" onclick="tab('cfg')">Конфигурация</a>
-<a class="nav-item" onclick="tab('term')">Терминал</a>
-{% if admin %}<a class="nav-item" onclick="tab('adm')">Админка</a>{% endif %}
-<div style="margin-top:auto"><a class="nav-item" href="/logout">Выход</a></div>
-</div>
-<div class="main">
-<div class="header"><h1 id="title">Обзор системы</h1><span class="label" style="color:var(--accent)">● ONLINE</span></div>
-
-<div id="tab-dash" class="tab">
-<div class="grid">
-<div class="card"><div class="label">Отправлено</div><div class="metric" id="m-sent">0</div></div>
-<div class="card"><div class="label">Ошибки</div><div class="metric" id="m-err" style="color:var(--accent)">0</div></div>
-<div class="card"><div class="label">Аккаунтов</div><div class="metric" id="m-acc">0</div></div>
-</div>
-<div class="panel"><h3>Статус движка</h3><div id="eng-status">ОСТАНОВЛЕН</div></div>
-</div>
-
-<div id="tab-acc" class="tab hidden">
-<div class="panel">
-<h3>Добавить аккаунт</h3>
-<input type="text" id="acc-phone" placeholder="+79990000000">
-<button onclick="startAuth()">Получить код</button>
-<div id="auth-code-div" class="hidden" style="margin-top:15px">
-<input type="text" id="acc-code" placeholder="Код из Telegram">
-<button onclick="verifyAuth()">Войти</button>
-</div>
-</div>
-</div>
-
-<div id="tab-cfg" class="tab hidden">
-<div class="panel">
-<h3>Режим</h3>
-<select id="cfg-mode"><option value="AUTO">AUTO (Безопасный)</option><option value="EXTREME">EXTREME (Максимальная скорость)</option></select>
-<h3>Задержка (сек)</h3><input type="number" id="cfg-delay" value="3" step="0.1">
-<h3>Рандомизация букв</h3><select id="cfg-rand"><option value="0">Выкл</option><option value="1">Вкл</option></select>
-<h3>Прогрев (Анти-бан)</h3><select id="cfg-warmup"><option value="1">Вкл</option><option value="0">Выкл</option></select>
-<button onclick="saveCfg()">Сохранить</button>
-</div>
-<div class="panel"><h3>Шаблоны</h3><textarea id="cfg-tpl" rows="4"></textarea><button onclick="saveTpl()">Сохранить</button></div>
-<div class="panel"><h3>Цели</h3><textarea id="cfg-tgt" rows="4"></textarea><button onclick="saveTgt()">Сохранить</button></div>
-<button class="green" onclick="engine('start')" style="width:100%;margin-bottom:10px">🚀 ЗАПУСК</button>
-<button onclick="engine('stop')" style="width:100%">🛑 СТОП</button>
-</div>
-
-<div id="tab-term" class="tab hidden">
-<div class="panel"><h3>Логи</h3><div class="terminal" id="term-out"></div></div>
-</div>
-
-{% if admin %}
-<div id="tab-adm" class="tab hidden">
-<div class="panel">
-<h3>Пользователи</h3>
-<table><thead><tr><th>ID</th><th>Роль</th><th>Баланс</th><th>Подписка</th><th>Действия</th></tr></thead>
-<tbody id="adm-rows"></tbody></table>
-</div>
-</div>
-{% endif %}
-
-</div>
-<script>
-let csrf="";
-function tab(id){document.querySelectorAll('.tab').forEach(x=>x.classList.add('hidden'));document.getElementById('tab-'+id).classList.remove('hidden');document.querySelectorAll('.nav-item').forEach(x=>x.classList.remove('active'));event.target.classList.add('active');document.getElementById('title').textContent=event.target.textContent}
-async function api(url,opts={}){const r=await fetch(url,{...opts,headers:{'Content-Type':'application/json','X-CSRF-Token':csrf,...opts.headers}});if(r.status===401){location.href='/';return}const t=await r.text();try{const d=JSON.parse(t);if(!r.ok)throw new Error(d.error||r.status);return d}catch(e){alert(t);throw e}}
-async function load(){
-    try{
-        const u=await api('/api/me'); csrf=u.csrf;
-        document.getElementById('m-sent').textContent=u.stats.sent;
-        document.getElementById('m-err').textContent=u.stats.failed;
-        document.getElementById('m-acc').textContent=u.accounts;
-        document.getElementById('eng-status').textContent=u.running?'РАБОТАЕТ':'ОСТАНОВЛЕН';
-        document.getElementById('eng-status').style.color=u.running?'var(--accent)':'var(--muted)';
-        document.getElementById('cfg-mode').value=u.mode;
-        document.getElementById('cfg-delay').value=u.gap;
-        document.getElementById('cfg-rand').value=u.randomize;
-        document.getElementById('cfg-warmup').value=u.warmup;
-        document.getElementById('cfg-tpl').value=u.templates.join('\n');
-        document.getElementById('cfg-tgt').value=u.targets.join('\n');
-        
-        const logs=await api('/api/logs');
-        document.getElementById('term-out').innerHTML=logs.logs.map(l=>`<div>${l}</div>`).join('');
-        
-        if(u.admin){
-            const d=await api('/api/admin/users');
-            document.getElementById('adm-rows').innerHTML=d.users.map(x=>`<tr><td>${x.user_id}</td><td>${x.plan}</td><td>${x.balance}₽</td><td>${x.subscribed?'Да':'Нет'}</td><td><button onclick="addBal(${x.user_id})">+Бал</button> <button onclick="addSub(${x.user_id})">+30д</button></td></tr>`).join('');
-        }
-    }catch(e){}
-}
-async function startAuth(){
-    const phone=document.getElementById('acc-phone').value;
-    const r=await api('/api/auth/start',{method:'POST',body:JSON.stringify({phone})});
-    if(r.ok) document.getElementById('auth-code-div').classList.remove('hidden');
-}
-async function verifyAuth(){
-    const code=document.getElementById('acc-code').value;
-    const r=await api('/api/auth/verify',{method:'POST',body:JSON.stringify({code})});
-    if(r.ok) alert('Аккаунт добавлен!'); load();
-}
-async function saveCfg(){await api('/api/cfg',{method:'POST',body:JSON.stringify({mode:document.getElementById('cfg-mode').value,delay:parseFloat(document.getElementById('cfg-delay').value),randomize:document.getElementById('cfg-rand').value,warmup:document.getElementById('cfg-warmup').value})});alert('Сохранено')}
-async function saveTpl(){await api('/api/tpl',{method:'POST',body:JSON.stringify({text:document.getElementById('cfg-tpl').value})});alert('Сохранено')}
-async function saveTgt(){await api('/api/tgt',{method:'POST',body:JSON.stringify({text:document.getElementById('cfg-tgt').value})});alert('Сохранено')}
-async function engine(a){await api('/api/engine/'+a,{method:'POST'});load()}
-async function addBal(id){const a=prompt("Сумма для начисления:");if(!a)return;await api('/api/admin/bal',{method:'POST',body:JSON.stringify({user_id:id,amount:parseInt(a)})});load()}
-async function addSub(id){await api('/api/admin/sub',{method:'POST',body:JSON.stringify({user_id:id})});load()}
-load();setInterval(load,5000);
-</script></body></html>
-"""
+LAYOUT = """<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{ title }} | TITAN</title><style>""" + CSS + """</style></head><body><div class="shell">
+<aside class="side"><div class="brand">TITAN <b>ENTERPRISE</b></div><div class="tag">OMNI-CORE // v15.5</div><nav class="nav">
+<a href="/">◈ Дашборд</a><a href="/accounts">▣ Аккаунты</a><a href="/config">⚙ Конфигурация</a><a href="/terminal">⌁ Терминал</a>
+{% if admin %}<a href="/admin">♜ Админка</a>{% endif %}<a href="/logout">↗ Выход</a></nav><div class="footer">SECURE CONTROL SURFACE<br>ALL SYSTEMS MONITORED</div></aside>
+<main class="main"><header class="top"><div><h1>{{ title }}</h1><div class="muted">TITAN Enterprise / Control Center</div></div>
+<div><span class="pill">● {{ state }}</span> <span class="muted mono">UID {{ uid }}</span></div></header>
+{% if flash %}<div class="notice">{{ flash }}</div>{% endif %}{{ content|safe }}</main></div></body></html>"""
 
 def csrf_token():
     if "csrf" not in session: session["csrf"] = secrets.token_urlsafe(32)
@@ -543,161 +429,201 @@ def admin_required(fn):
         return fn(*args, **kwargs)
     return wrapped
 
+def page(title, content):
+    return render_template_string(LAYOUT, title=title, content=content,
+                                  uid=uid(), admin=uid() in SUPER_ADMINS,
+                                  state=rt.state, flash="")
+
 @app.before_request
 def before_request(): check_csrf()
 
 @app.get("/login")
 def login():
-    return render_template_string("""<!doctype html><html><head><title>TITAN Login</title><style>""" + CSS + """</style></head>
-<body style="display:grid;place-items:center"><div class="card" style="width:400px;margin-top:20vh">
-<h1>Вход в панель</h1><p class="label">Введите токен из бота</p>
-<form method="post" action="/login"><input type="hidden" name="csrf" value="{{ csrf }}"><input name="token" placeholder="Токен" required><button>Войти</button></form>
-</div></body></html>""", csrf=csrf_token())
+    return render_template_string("""<!doctype html><html lang="ru"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>TITAN Login</title><style>""" + CSS + """</style>
+<body><div class="card login"><div class="brand">TITAN <b>ENTERPRISE</b></div><div class="tag">SECURE AUTH GATE</div>
+<h1>Вход в панель</h1><p class="muted">Создай одноразовую ссылку командой /panel в Telegram.</p>
+<form method="post"><input type="hidden" name="csrf" value="{{ csrf }}"><div class="field"><label>Одноразовый токен</label>
+<input name="token" value="{{ token }}" required></div><button>Авторизоваться →</button></form>
+{% if error %}<div class="notice">{{ error }}</div>{% endif %}</div></body></html>""",
+        csrf=csrf_token(), token=request.args.get("token", ""), error=request.args.get("error", ""))
 
 @app.post("/login")
 def login_post():
     raw = request.form.get("token", "").strip()
-    record = submit(database.one("SELECT * FROM tokens WHERE token_hash=? AND used=0 AND expires_at>?", (digest(raw), time.time()))).result(10)
-    if not record: return "Токен недействителен"
-    submit(database.execute("UPDATE tokens SET used=1 WHERE id=?", (record["id"],))).result(10)
+    if not raw or len(raw) > 256: return redirect("/login?error=Invalid+token")
+    record = submit(database.one("SELECT * FROM tokens WHERE token_hash=? AND used=0 AND expires_at>?",
+                                 (digest(raw), time.time()))).result(10)
+    if not record: return redirect("/login?error=Link+expired+or+invalid")
+    submit(database.execute("UPDATE tokens SET used=1 WHERE id=? AND used=0", (record["id"],))).result(10)
     session.clear()
     session.permanent = True
     session["user_id"] = int(record["owner_id"])
+    session["session_id"] = secrets.token_urlsafe(32)
     session["csrf"] = secrets.token_urlsafe(32)
     submit(database.execute("INSERT INTO sessions(owner_id,session_id,expires_at,created_at,last_seen) VALUES(?,?,?,?,?)",
-                            (record["owner_id"], session["csrf"], time.time()+COOKIE_DAYS*86400, now(), now()))).result(10)
+                            (record["owner_id"], session["session_id"], time.time()+COOKIE_DAYS*86400, now(), now()))).result(10)
+    submit(database.audit(record["owner_id"], "web_login")).result(10)
     return redirect("/")
 
 @app.get("/logout")
 def logout():
-    session.clear(); return redirect("/login")
+    sid = session.get("session_id")
+    if sid:
+        with contextlib.suppress(Exception):
+            submit(database.execute("DELETE FROM sessions WHERE session_id=?", (sid,))).result(5)
+    session.clear()
+    return redirect("/login")
 
 @app.get("/")
 @login_required
 def dashboard():
-    return render_template_string(UI_HTML, admin=uid() in SUPER_ADMINS)
+    owner = uid()
+    stats = submit(database.one("SELECT * FROM stats WHERE owner_id=?", (owner,))).result(10) or {}
+    subs = submit(database.one("SELECT COUNT(*) n FROM users WHERE subscribed=1")).result(10)["n"]
+    accs = submit(database.one("SELECT COUNT(*) n FROM accounts WHERE owner_id=? AND status='active'", (owner,))).result(10)["n"]
+    jobs = submit(database.all("SELECT * FROM broadcasts WHERE owner_id=? ORDER BY created_at DESC LIMIT 8", (owner,))).result(10)
+    content = render_template_string("""
+<div class="grid"><div class="card"><div class="muted">ОТПРАВЛЕНО</div><div class="metric red">{{ stats.get('sent',0) }}</div></div>
+<div class="card"><div class="muted">ОШИБКИ</div><div class="metric">{{ stats.get('failed',0) }}</div></div>
+<div class="card"><div class="muted">ПОДПИСЧИКИ</div><div class="metric cyan">{{ subs }}</div></div>
+<div class="card"><div class="muted">АККАУНТЫ</div><div class="metric green">{{ accs }}</div></div></div>
+<div class="row"><section class="card"><h2>НОВАЯ КАМПАНИЯ</h2><form method="post" action="/broadcast">
+<input type="hidden" name="csrf" value="{{ csrf }}"><div class="field"><label>Текст уведомления</label>
+<textarea name="body" maxlength="4000" required placeholder="Сообщение для подписавшихся пользователей"></textarea></div>
+<button>Запустить кампанию →</button></form><p class="muted">Только opt-in подписчики. Интервал настраивается отдельно.</p></section>
+<section class="card"><h2>СОСТОЯНИЕ СИСТЕМЫ</h2><p>Engine: <span class="pill">{{ state }}</span></p>
+<p class="muted">CPU {{ cpu }}% · RAM {{ ram }}%</p><p class="muted">Активные кампании: {{ active }}</p>
+<p class="muted">Uptime: {{ uptime }} сек.</p></section></div>
+<section class="card panel"><h2>ПОСЛЕДНИЕ КАМПАНИИ</h2><table><tr><th>ID</th><th>СТАТУС</th><th>ОХВАТ</th><th>ДОСТАВЛЕНО</th><th>ОШИБКИ</th><th>ДАТА</th></tr>
+{% for j in jobs %}<tr><td>{{ j.id }}</td><td>{{ j.status }}</td><td>{{ j.total }}</td><td>{{ j.sent }}</td><td>{{ j.failed }}</td><td>{{ j.created_at }}</td></tr>
+{% else %}<tr><td colspan="6">Кампаний пока нет</td></tr>{% endfor %}</table></section>
+""", stats=stats, subs=subs, accs=accs, jobs=jobs, csrf=csrf_token(),
+        state=rt.state, cpu=psutil.cpu_percent(), ram=psutil.virtual_memory().percent,
+        active=rt.active, uptime=int(time.time()-rt.started))
+    return page("Дашборд", content)
 
-# --- API ---
-def get_u():
-    value = session.get("user_id")
-    if value is None: return None
-    return submit(database.one("SELECT * FROM users WHERE user_id=?", (int(value),))).result(5)
-
-@app.get("/api/me")
+@app.get("/accounts")
 @login_required
-def api_me():
-    u = get_u()
-    cfg = submit(database.config(uid())).result(5)
-    accs = submit(database.all("SELECT id FROM accounts WHERE owner_id=?", (uid(),))).result(5)
-    stats = submit(database.one("SELECT sent,failed FROM stats WHERE owner_id=?", (uid(),))).result(5) or {}
-    return jsonify({
-        "admin": uid() in SUPER_ADMINS, "accounts": len(accs),
-        "running": uid() in rt.active_engines,
-        "mode": cfg["mode"], "gap": cfg["send_gap"], "randomize": cfg["randomize"], "warmup": cfg["warmup"],
-        "templates": cfg["templates"], "targets": cfg["targets"],
-        "stats": stats, "csrf": csrf_token()
-    })
+def accounts_page():
+    rows = submit(database.all("SELECT * FROM accounts WHERE owner_id=? ORDER BY id DESC", (uid(),))).result(10)
+    content = render_template_string("""<section class="card"><h2>TELEGRAM ИНТЕГРАЦИИ</h2>
+<p class="muted">Эта версия работает через Telegram Bot API. Вход в пользовательские аккаунты по номеру и коду не используется.</p>
+<table><tr><th>ID</th><th>НАЗВАНИЕ</th><th>ТИП</th><th>СТАТУС</th><th>ДАТА</th></tr>
+{% for r in rows %}<tr><td>{{ r.id }}</td><td>{{ r.label }}</td><td>{{ r.kind }}</td><td>{{ r.status }}</td><td>{{ r.created_at }}</td></tr>
+{% else %}<tr><td colspan="5">Интеграции появятся здесь</td></tr>{% endfor %}</table></section>""", rows=rows)
+    return page("Аккаунты", content)
 
-@app.get("/api/logs")
+@app.get("/config")
 @login_required
-def api_logs():
-    return jsonify({"logs": list(rt.logs)})
+def config_page():
+    cfg = submit(database.config(uid())).result(10)
+    content = render_template_string("""<div class="row"><section class="card"><h2>ПАРАМЕТРЫ ДВИЖКА</h2>
+<form method="post"><input type="hidden" name="csrf" value="{{ csrf }}">
+<div class="field"><label>Режим</label><select disabled><option selected>AUTO — ограниченная скорость</option></select></div>
+<div class="field"><label>Интервал отправки (1–60 секунд)</label><input name="gap" type="number" min="1" max="60" step="0.5" value="{{ gap }}"></div>
+<div class="field"><label>Шаблоны (одна строка — один шаблон, строго по очереди)</label>
+<textarea name="templates" maxlength="30000">{{ templates }}</textarea></div><button>Сохранить</button></form></section>
+<section class="card"><h2>ПОЛИТИКА ДОСТАВКИ</h2><p class="muted">Получатели должны самостоятельно включить подписку через /subscribe или меню бота.</p>
+<p class="muted">При FloodWait платформа ждёт срок, указанный Telegram.</p><p class="muted">Маскировка текста и обход антиспам-фильтров не используются.</p></section></div>""",
+        csrf=csrf_token(), gap=cfg["send_gap"], templates="\n".join(cfg["templates"]))
+    return page("Конфигурация", content)
 
-@app.post("/api/auth/start")
+@app.post("/config")
 @login_required
-def api_auth_start():
-    data = request.get_json() or {}
-    phone = data.get("phone", "")
-    if not re.match(r"^\+\d{10,15}$", phone): return jsonify({"error":"Формат +7999..."}), 400
-    async def _s():
-        client = TelegramClient(StringSession(), API_ID, API_HASH)
-        await client.connect()
-        s = await client.send_code_request(phone)
-        rt.template_queues[f"auth_{uid()}"] = {"client": client, "phone": phone, "hash": s.phone_code_hash}
-        return True
-    try: submit(_s()).result(20); return jsonify({"ok":True})
-    except Exception as e: return jsonify({"error":str(e)[:50]}), 400
+def config_save():
+    templates = [x.strip() for x in request.form.get("templates", "").splitlines() if x.strip()]
+    if len(templates) > MAX_TEMPLATES: abort(400, "Too many templates")
+    gap = bounded_float(request.form.get("gap"))
+    submit(database.save_config(uid(), gap, templates, [], "AUTO", 0, 1)).result(10)
+    submit(database.audit(uid(), "config_updated", {"gap": gap, "templates": len(templates)})).result(10)
+    return redirect("/config")
 
-@app.post("/api/auth/verify")
+@app.get("/terminal")
 @login_required
-def api_auth_verify():
-    code = (request.get_json() or {}).get("code", "")
-    f = rt.template_queues.get(f"auth_{uid()}")
-    if not f: return jsonify({"error":"Истекло"}), 400
-    async def _v():
-        try:
-            await f["client"].sign_in(phone=f["phone"], code=code, phone_code_hash=f["hash"])
-            sess = f["client"].session.save()
-            await database.execute("INSERT INTO accounts(owner_id, session, phone, created_at) VALUES(?,?,?,?)", (uid(), sess, f["phone"], now()))
-            await f["client"].disconnect()
-            return {"ok": True}
-        except Exception as e: return {"error":str(e)[:50]}
-    res = submit(_v()).result(20)
-    rt.template_queues.pop(f"auth_{uid()}", None)
-    return jsonify(res)
+def terminal():
+    logs = "\n".join(html.escape(line) for line in rt.logs)
+    content = render_template_string("""<section class="card"><h2>LIVE SYSTEM LOG</h2>
+<div class="terminal">{{ logs|safe }}</div></section><script>setTimeout(()=>location.reload(),5000)</script>""", logs=logs)
+    return page("Терминал", content)
 
-@app.post("/api/cfg")
-@login_required
-def api_cfg():
-    d = request.get_json() or {}
-    cfg = submit(database.config(uid())).result(5)
-    submit(database.save_config(uid(), d.get("delay", 3), cfg["templates"], cfg["targets"], d.get("mode", "AUTO"), d.get("randomize", 0), d.get("warmup", 1))).result(5)
-    return jsonify({"ok":True})
-
-@app.post("/api/tpl")
-@login_required
-def api_tpl():
-    v = list(dict.fromkeys(x.strip() for x in (request.get_json() or {}).get("text","").splitlines() if x.strip()))
-    cfg = submit(database.config(uid())).result(5)
-    submit(database.save_config(uid(), cfg["send_gap"], v, cfg["targets"], cfg["mode"], cfg["randomize"], cfg["warmup"])).result(5)
-    return jsonify({"ok":True})
-
-@app.post("/api/tgt")
-@login_required
-def api_tgt():
-    v = parse_targets((request.get_json() or {}).get("text",""))
-    cfg = submit(database.config(uid())).result(5)
-    submit(database.save_config(uid(), cfg["send_gap"], cfg["templates"], v, cfg["mode"], cfg["randomize"], cfg["warmup"])).result(5)
-    return jsonify({"ok":True})
-
-@app.post("/api/engine/<action>")
-@login_required
-def api_engine(action):
-    if action == "start":
-        if uid() in rt.active_engines: return jsonify({"error":"Уже запущено"})
-        accs = submit(database.all("SELECT * FROM accounts WHERE owner_id=?", (uid(),))).result(5)
-        if not accs: return jsonify({"error":"Нет аккаунтов"}), 400
-        cfg = submit(database.config(uid())).result(5)
-        engine = SpamEngine(uid(), cfg, accs)
-        rt.active_engines[uid()] = engine
-        submit(engine.start())
-    else:
-        if uid() in rt.active_engines:
-            rt.active_engines[uid()].stop()
-            del rt.active_engines[uid()]
-    return jsonify({"ok":True})
-
-@app.get("/api/admin/users")
+@app.get("/admin")
 @admin_required
-def api_admin_users():
-    users = submit(database.all("SELECT user_id,plan,balance,subscribed FROM users LIMIT 100")).result(5)
-    return jsonify({"users": users})
+def admin():
+    users = submit(database.all("SELECT * FROM users ORDER BY created_at DESC LIMIT 100")).result(10)
+    audits = submit(database.all("SELECT * FROM audit ORDER BY id DESC LIMIT 30")).result(10)
+    content = render_template_string("""<div class="row"><section class="card"><h2>ВЫДАТЬ БАЛАНС И ТАРИФ</h2>
+<form method="post" action="/admin/grant"><input type="hidden" name="csrf" value="{{ csrf }}">
+<div class="field"><label>Telegram user ID</label><input name="user_id" type="number" required></div>
+<div class="field"><label>Изменение баланса</label><input name="balance" type="number" value="0"></div>
+<div class="field"><label>Тариф</label><select name="plan"><option>FREE</option><option>PRO</option><option>ULTIMATE</option></select></div>
+<button>Применить</button></form></section><section class="card"><h2>ADMIN CORE</h2>
+<p class="muted">Администраторы задаются через SUPER_ADMINS. Все операции записываются в audit.</p></section></div>
+<section class="card panel"><h2>ПОЛЬЗОВАТЕЛИ</h2><table><tr><th>ID</th><th>USERNAME</th><th>ИМЯ</th><th>SUB</th><th>PLAN</th><th>BALANCE</th></tr>
+{% for u in users %}<tr><td>{{ u.user_id }}</td><td>{{ u.username }}</td><td>{{ u.first_name }}</td><td>{{ u.subscribed }}</td><td>{{ u.plan }}</td><td>{{ u.balance }}</td></tr>{% endfor %}</table></section>
+<section class="card panel"><h2>AUDIT TRAIL</h2><table><tr><th>ACTOR</th><th>ACTION</th><th>DETAILS</th><th>DATE</th></tr>
+{% for a in audits %}<tr><td>{{ a.actor_id }}</td><td>{{ a.action }}</td><td>{{ a.details }}</td><td>{{ a.created_at }}</td></tr>{% endfor %}</table></section>""",
+        users=users, audits=audits, csrf=csrf_token())
+    return page("Админка", content)
 
-@app.post("/api/admin/bal")
+@app.post("/admin/grant")
 @admin_required
-def api_admin_bal():
-    d = request.get_json() or {}
-    submit(database.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (d.get("amount",0), d.get("user_id",0)))).result(5)
-    return jsonify({"ok":True})
+def admin_grant():
+    target = bounded_int(request.form.get("user_id"), 0, 1)
+    delta = bounded_int(request.form.get("balance"), 0, 0, 1_000_000)
+    plan = request.form.get("plan", "FREE")
+    if plan not in {"FREE", "PRO", "ULTIMATE"}: abort(400)
+    exists = submit(database.one("SELECT user_id FROM users WHERE user_id=?", (target,))).result(10)
+    if not exists: abort(404, "User not found")
+    submit(database.execute("UPDATE users SET balance=balance+?,plan=?,updated_at=? WHERE user_id=?",
+                            (delta, plan, now(), target))).result(10)
+    submit(database.audit(uid(), "admin_grant", {"target": target, "delta": delta, "plan": plan})).result(10)
+    return redirect("/admin")
 
-@app.post("/api/admin/sub")
+@app.post("/broadcast")
 @admin_required
-def api_admin_sub():
-    d = request.get_json() or {}
-    submit(database.execute("UPDATE users SET subscribed=1 WHERE user_id=?", (d.get("user_id",0),))).result(5)
-    return jsonify({"ok":True})
+def create_broadcast():
+    try: submit(queue_broadcast(uid(), request.form.get("body", ""))).result(10)
+    except Exception as exc: abort(400, str(exc))
+    return redirect("/")
+
+@app.get("/health")
+def health():
+    return jsonify(app=APP_NAME, version=VERSION, state=rt.state, uptime=int(time.time()-rt.started))
+
+@app.errorhandler(400)
+def err400(error): return page("Ошибка запроса", f'<div class="notice">{html.escape(str(error))}</div>'), 400
+
+@app.errorhandler(403)
+def err403(error): return page("Доступ запрещён", '<div class="notice">403 // ACCESS DENIED</div>'), 403
+
+@app.errorhandler(404)
+def err404(error): return page("Не найдено", '<div class="notice">404 // NOT FOUND</div>'), 404
+
+def run_web():
+    try: serve(app, host=HOST, port=PORT, threads=8, connection_limit=100)
+    except Exception: log.exception("Waitress server failed")
 
 # ------------------------------ Background tasks -----------------------------
+async def worker():
+    while not rt.stop.is_set():
+        try: job = await asyncio.wait_for(rt.queue.get(), timeout=1)
+        except asyncio.TimeoutError: continue
+        try: await broadcast(job)
+        except Exception as exc: rt.write(f"Worker exception: {exc}", "ERROR")
+        finally: rt.queue.task_done()
+
+async def queue_broadcast(uid, body):
+    if uid not in SUPER_ADMINS: raise PermissionError("Administrator only")
+    if not body.strip(): raise ValueError("Message is empty")
+    if rt.queue.full(): raise RuntimeError("Queue is full")
+    bid = uuid.uuid4().hex[:16]
+    await database.execute("INSERT INTO broadcasts(id,owner_id,body,status,created_at) VALUES(?,?,?,'queued',?)",
+                            (bid, uid, body[:4000], now()))
+    await rt.queue.put({"id": bid, "owner_id": uid, "body": body})
+    await database.audit(uid, "broadcast_queued", {"id": bid})
+    return bid
+
 async def maintenance():
     while not rt.stop.is_set():
         try:
@@ -719,15 +645,15 @@ async def shutdown(tasks):
 async def main():
     rt.loop = asyncio.get_running_loop()
     rt.semaphore = asyncio.Semaphore(MAX_CLIENTS)
-    rt.queue = asyncio.Queue()
+    rt.queue = asyncio.Queue(maxsize=100)
     rt.stop = asyncio.Event()
     await database.init()
+    rt.http = aiohttp.ClientSession(headers={"User-Agent": f"{APP_NAME}/{VERSION}"})
     await telegram_start()
-    threading.Thread(target=lambda: serve(app, host=HOST, port=PORT, threads=8), name="titan-waitress", daemon=True).start()
+    threading.Thread(target=run_web, name="titan-waitress", daemon=True).start()
     rt.write(f"{APP_NAME} {VERSION} initialized")
-    tasks = [asyncio.create_task(maintenance())]
-    try:
-        await rt.bot.run_until_disconnected()
+    tasks = [asyncio.create_task(worker()), asyncio.create_task(maintenance())]
+    try: await rt.bot.run_until_disconnected()
     except KeyboardInterrupt: rt.write("Shutdown requested", "WARNING")
     except Exception as exc: rt.write(f"Main loop failed: {exc}", "ERROR")
     finally: await shutdown(tasks)
