@@ -1478,9 +1478,19 @@ def api_me():
 def api_templates():
     uid = int(request.titan_user["user_id"])
     raw = (request.get_json(silent=True) or {}).get("text", "")
-    values = list(dict.fromkeys(x.strip() for x in raw.splitlines() if x.strip()))[:MAX_TEMPLATES]
+
+    # Принудительно режем по \n, \r\n, и «голым» \r.
+    # Если элемент сам содержит \n — тоже режется.
+    chunks = []
+    for part in raw.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        for sub in part.splitlines():  # страховка, если \n пришёл экранированным
+            s = sub.strip()
+            if s:
+                chunks.append(s)
+
+    values = list(dict.fromkeys(chunks))[:MAX_TEMPLATES]
     run_async(db.update_user_lists(uid, templates=values))
-    return jsonify({"ok": True, "count": len(values)})
+    return jsonify({"ok": True, "count": len(values), "templates": values})
 
 @app.post("/api/targets")
 @login_required
