@@ -1,4 +1,4 @@
-# TITAN Enterprise — compact Flask + Telethon + SQLite (FULL FIXED v10.6)
+# TITAN Enterprise — compact Flask + Telethon + SQLite (FULL FIXED v10.7)
 # Install: pip install telethon flask waitress aiosqlite psutil aiohttp
 
 import os
@@ -580,7 +580,6 @@ main{padding:19px 14px}h1{font-size:23px}.grid{grid-template-columns:repeat(2,mi
 </aside><main><div class="top"><div><h1 id="heading">Личный кабинет</h1>
 <div class="muted" id="identity">Загрузка профиля…</div></div><button class="secondary" onclick="load()">↻ Обновить</button></div>
 
-<!-- ВКЛАДКА 1: ОБЗОР -->
 <div id="tab-overview" class="tab-content">
 <div id="overview" class="grid">
 <div class="card">Подписка<div class="metric" id="subscription">—</div><div class="muted" id="expiry"></div></div>
@@ -591,7 +590,6 @@ main{padding:19px 14px}h1{font-size:23px}.grid{grid-template-columns:repeat(2,mi
 </div>
 </div>
 
-<!-- ВКЛАДКА 2: НАСТРОЙКИ -->
 <div id="tab-settings" class="tab-content hidden">
 <div class="section"><h2>Мои настройки</h2><div class="grid">
 <div class="card field"><b>Шаблоны уведомлений</b><p class="muted">Каждая строка — отдельный шаблон. Только для разрешённых получателей.</p>
@@ -607,7 +605,6 @@ main{padding:19px 14px}h1{font-size:23px}.grid{grid-template-columns:repeat(2,mi
 <button class="danger" onclick="jobAction('stop')">Остановить</button></div><div class="notice" id="notice"></div></div>
 </div>
 
-<!-- ВКЛАДКА 3: МАГАЗИН -->
 <div id="tab-shop" class="tab-content hidden">
 <div class="section"><h2>Магазин аккаунтов</h2>
 <p class="muted">Цены уже включают наценку. Для покупки нужен баланс.</p>
@@ -618,14 +615,12 @@ main{padding:19px 14px}h1{font-size:23px}.grid{grid-template-columns:repeat(2,mi
 </tbody></table></div></div>
 </div>
 
-<!-- ВКЛАДКА 4: ЗАКАЗЫ -->
 <div id="tab-orders" class="tab-content hidden">
 <div class="section"><h2>Мои заказы</h2>
 <div class="tablewrap"><table><thead><tr><th>Дата</th><th>Товар</th><th>Сумма</th><th>Статус</th><th>Данные</th></tr></thead>
 <tbody id="orderRows"><tr><td colspan="5" class="muted">Загрузка...</td></tr></tbody></table></div></div>
 </div>
 
-<!-- ВКЛАДКА 5: ПОМОЩЬ -->
 <div id="tab-help" class="tab-content hidden">
 <div class="section"><h2>Инструкция по использованию</h2>
 <div class="help-box">
@@ -654,7 +649,6 @@ main{padding:19px 14px}h1{font-size:23px}.grid{grid-template-columns:repeat(2,mi
 </div>
 </div>
 
-<!-- ВКЛАДКА 6: АДМИН ПОЛЬЗОВАТЕЛИ -->
 <div id="tab-users" class="tab-content hidden admin-only">
 <div class="section"><h2>Состояние сервера</h2>
 <div class="grid"><div class="card">RAM<div class="metric" id="ram">—</div></div>
@@ -666,7 +660,6 @@ main{padding:19px 14px}h1{font-size:23px}.grid{grid-template-columns:repeat(2,mi
 <tbody id="userRows"></tbody></table></div></div>
 </div>
 
-<!-- ВКЛАДКА 7: АДМИН МАГАЗИН -->
 <div id="tab-admin-shop" class="tab-content hidden admin-only">
 <div class="section"><h2>Управление магазином</h2>
 <div class="grid">
@@ -734,18 +727,27 @@ function showTab(name) {
   const target = document.getElementById('tab-' + name);
   if (target) target.classList.remove('hidden');
   
-  // Подсветка активного меню
   document.querySelectorAll('aside .nav').forEach(el => el.classList.remove('active'));
   const clicked = Array.from(document.querySelectorAll('aside .nav')).find(el => el.getAttribute('onclick') === `showTab('${name}')`);
   if (clicked) clicked.classList.add('active');
 
-  // Загрузка заказов при переходе
   if(name === 'orders') loadUserOrders();
 }
 
 async function api(path,opts={}){const r=await fetch(path,{...opts,headers:{
 'Content-Type':'application/json','X-CSRF-Token':csrf,...(opts.headers||{})}});
-if(r.status===401){location.href='/';return null}const d=await r.json();if(!r.ok)throw Error(d.error||'Ошибка запроса');return d}
+if(r.status===401){location.href='/';return null}
+const text = await r.text();
+try {
+  const d = JSON.parse(text);
+  if (!r.ok) throw new Error(d.error || `Ошибка сервера: ${r.status}`);
+  return d;
+} catch (e) {
+  console.error("Ответ сервера:", text);
+  throw new Error(`Сервер вернул ошибку (статус ${r.status}). Проверьте логи Render.`);
+}
+}
+
 function msg(s){const el=document.getElementById('notice'); if(el)el.textContent=s; else alert(s)}
 
 async function load(){try{
@@ -796,7 +798,6 @@ async function loadUserOrders(){
   }
 }
 
-// Модальное окно подключения аккаунта
 function openAccModal(){document.getElementById('accModal').style.display='grid';document.getElementById('accStep1').classList.remove('hidden');document.getElementById('accStep2').classList.add('hidden');document.getElementById('accStep3').classList.add('hidden');document.getElementById('accNotice').textContent=''}
 function closeAccModal(){document.getElementById('accModal').style.display='none'}
 async function sendCode(){
@@ -841,7 +842,6 @@ async function addBal(id){const amount=prompt("Сумма для начисле�
 async function addSub(id){if(!confirm('Выдать подписку на 30 дней пользователю '+id+'?'))return;try{await api('/api/admin/add_subscription',{method:'POST',body:JSON.stringify({user_id:id,days:30})});await load()}catch(e){msg(e.message)}}
 async function savePayment(){try{await api('/api/admin/set_payment',{method:'POST',body:JSON.stringify({details:document.getElementById('payment_details').value})});msg('Реквизиты сохранены')}catch(e){msg(e.message)}}
 
-// Выдача заказа Админом
 function openAdminOrder(id){
   document.getElementById('ao_id').textContent = id;
   document.getElementById('ao_order_id').value = id;
@@ -951,7 +951,6 @@ def api_me():
         "csrf": session["csrf"]
     })
 
-# --- ЗАПРОСЫ НАСТРОЕК ---
 @app.post("/api/templates")
 @login_required
 @csrf_required
@@ -981,7 +980,6 @@ def api_delay():
     run_async(db.update_user_lists(uid, delay=delay))
     return jsonify({"ok": True})
 
-# --- АВТОРИЗАЦИЯ TELEGRAM (ВЕБ) ---
 @app.post("/api/auth/send_code")
 @login_required
 @csrf_required
@@ -1040,7 +1038,6 @@ def api_auth_verify_2fa():
     web_flows.pop(uid, None)
     return jsonify(res)
 
-# --- МАГАЗИН И ЗАКАЗЫ ---
 @app.get("/api/payment_details")
 @login_required
 def api_payment_details():
@@ -1100,7 +1097,6 @@ def api_admin_set_payment():
     run_async(db.set_setting("payment_details", (request.get_json(silent=True) or {}).get("details", "")))
     return jsonify({"ok": True})
 
-# --- ВЫДАЧА ЗАКАЗА АДМИНОМ (СОСТОЯНИЯ) ---
 @app.post("/api/admin/start_order")
 @admin_required
 @csrf_required
@@ -1134,15 +1130,17 @@ def api_admin_send_2fa():
     run_async(db.update_order(oid, "completed", order_data))
     return jsonify({"ok": True})
 
-# --- РАССЫЛКА ---
 @app.post("/api/job/start")
 @login_required
 @csrf_required
 def api_job_start():
     uid = int(request.titan_user["user_id"])
     u = run_async(db.get_user(uid))
-    if not u["subscription_active"] and u["role"] != "ADMIN":
+    
+    # ИСПРАВЛЕНО: проверка подписки через функцию, а не через ключ словаря
+    if u["role"] != "ADMIN" and not run_async(db.subscription_active(uid)):
         return jsonify({"error": "Подписка истекла. Продлите подписку."}), 403
+        
     if not u["session_string"]: return jsonify({"error": "Подключите аккаунт"}), 400
     templates = json.loads(u["templates"] or "[]")
     targets = json.loads(u["targets"] or "[]")
