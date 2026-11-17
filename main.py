@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TITAN Enterprise v18.0 — SPA + Chat Picker
+TITAN Enterprise v19.0 — Direct Auth + Chat Picker
 Single-file high-performance Telegram automation platform.
 """
 from __future__ import annotations
@@ -25,7 +25,7 @@ from functools import wraps
 import aiosqlite
 import aiohttp
 import psutil
-from flask import Flask, abort, jsonify, request, session, Response
+from flask import Flask, abort, jsonify, request, session, Response, redirect
 from telethon import TelegramClient, events, Button
 from telethon.errors import FloodWaitError, SessionPasswordNeededError
 from telethon.sessions import StringSession
@@ -40,7 +40,7 @@ DB_PATH = os.getenv("DATABASE_PATH", "titan_omnicore.db")
 HOST, PORT = os.getenv("HOST", "0.0.0.0"), int(os.getenv("PORT", "10000"))
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 SUPER_ADMINS = {int(x) for x in os.getenv("SUPER_ADMINS", "8655682794,8773171051").split(",") if x.strip().isdigit()}
-COOKIE_DAYS, TOKEN_TTL = 14, 300
+COOKIE_DAYS = 14
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("titan")
@@ -110,7 +110,6 @@ class Database:
                 CREATE TABLE IF NOT EXISTS accounts(id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER, session TEXT, phone TEXT, status TEXT DEFAULT 'active', created_at TEXT);
                 CREATE TABLE IF NOT EXISTS configs(owner_id INTEGER PRIMARY KEY, mode TEXT DEFAULT 'AUTO', send_gap REAL DEFAULT 3, templates TEXT DEFAULT '[]', targets TEXT DEFAULT '[]', randomize INTEGER DEFAULT 0, warmup INTEGER DEFAULT 1, updated_at TEXT);
                 CREATE TABLE IF NOT EXISTS stats(owner_id INTEGER PRIMARY KEY, sent INTEGER DEFAULT 0, failed INTEGER DEFAULT 0, updated_at TEXT);
-                CREATE TABLE IF NOT EXISTS tokens(id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER, token_hash TEXT UNIQUE, expires_at REAL, used INTEGER DEFAULT 0, created_at TEXT);
             """)
             await conn.commit()
             await conn.close()
@@ -154,20 +153,17 @@ async def on_command(event):
     uid = int(event.sender_id)
     sender = await event.get_sender()
     await database.ensure_user(uid, getattr(sender, "username", "") or "", getattr(sender, "first_name", "") or "")
+    
     if event.raw_text.startswith("/start"):
-        await event.respond("Добро пожаловать в TITAN.", buttons=[[Button.inline("Войти в панель", b"login")]])
+        await event.respond("TITAN Enterprise", buttons=[[Button.inline("🌐 Войти в панель", b"login")]])
     elif event.raw_text.startswith("/panel"):
         if uid not in SUPER_ADMINS: return await event.respond("Доступ запрещён.")
-        raw = secrets.token_urlsafe(32)
-        await database.execute("INSERT INTO tokens(owner_id,token_hash,expires_at,created_at) VALUES(?,?,?,?)", (uid, digest(raw), time.time()+300, now()))
-        await event.respond(f"Ссылка (5 мин): {PUBLIC_BASE_URL}/login?token={raw}")
+        await event.respond(f"Ссылка для входа:\n{PUBLIC_BASE_URL}/login?uid={uid}")
 
 async def on_callback(event):
     if event.data == b"login":
         uid = int(event.sender_id)
-        raw = secrets.token_urlsafe(32)
-        await database.execute("INSERT INTO tokens(owner_id,token_hash,expires_at,created_at) VALUES(?,?,?,?)", (uid, digest(raw), time.time()+300, now()))
-        await event.respond(f"Ссылка (5 мин): {PUBLIC_BASE_URL}/login?token={raw}")
+        await event.respond(f"Ссылка для входа:\n{PUBLIC_BASE_URL}/login?uid={uid}")
         await event.answer()
 
 async def telegram_start():
@@ -228,7 +224,7 @@ class SpamEngine:
 # ------------------------------ Web ------------------------------
 app = Flask(__name__)
 app.secret_key = FLASK_SECRET
-app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax", PERMANENT_SESSION_LIFETIME=COOKIE_DAYS*86400)
 
 HTML = r"""
 <!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
@@ -388,8 +384,6 @@ async function engine(action){
     await api('/api/engine/'+action,{method:'POST'});
     load();
 }
-
-// Логика загрузки чатов
 async function loadChats(){
     document.getElementById('chat-list').innerHTML='Загрузка...';
     try {
@@ -412,26 +406,23 @@ async function saveSelectedChats(){
     const checkboxes = document.querySelectorAll('#chat-list input[type="checkbox"]:checked');
     const selected = Array.from(checkboxes).map(cb => cb.value);
     if(selected.length === 0) return alert('Ничего не выбрано');
-    
     await api('/api/tgt/add', {method:'POST', body:JSON.stringify({targets: selected})});
     alert('Добавлено в цели!');
     load();
 }
-
 load(); setInterval(load, 5000);
 </script></body></html>
 """
 
 @app.route("/login")
 def login():
-    token = request.args.get("token", "")
-    if not token: return "Токен отсутствует"
-    row = submit(database.one("SELECT * FROM tokens WHERE token_hash=? AND used=0 AND expires_at>?", (digest(token), time.time()))).result()
-    if not row: return "Токен истек или неверный"
-    submit(database.execute("UPDATE tokens SET used=1 WHERE id=?", (row["id"],))).result()
-    session["user_id"] = row["owner_id"]
+    uid = request.args.get("uid")
+    if not uid or not uid.isdigit():
+        return "Неверный ID."
+    session.permanent = True
+    session["user_id"] = int(uid)
     session["csrf"] = secrets.token_urlsafe(32)
-    return app.redirect("/")
+    return redirect("/")
 
 @app.route("/")
 def index():
@@ -441,7 +432,7 @@ def index():
 @app.route("/logout")
 def logout():
     session.clear()
-    return "Вы вышли."
+    return redirect("/")
 
 def get_u():
     uid = session.get("user_id")
@@ -479,7 +470,7 @@ def api_chats():
     async def _get_chats():
         client = TelegramClient(StringSession(accs[0]["session"]), API_ID, API_HASH)
         await client.connect()
-        dialogs = await client.get_dialogs(limit=100) # Берем первые 100 чатов
+        dialogs = await client.get_dialogs(limit=100)
         res = []
         for d in dialogs:
             if d.is_group or d.is_channel:
@@ -487,12 +478,10 @@ def api_chats():
                 res.append({"id": str(d.id), "title": d.name, "type": ctype})
         await client.disconnect()
         return res
-
     try:
         chats = submit(_get_chats()).result(30)
         return jsonify({"chats": chats})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception as e: return jsonify({"error": str(e)}), 500
 
 @app.route("/api/tgt/add", methods=["POST"])
 @login_req
