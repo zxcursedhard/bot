@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TITAN Enterprise v19.0 — Direct Auth + Chat Picker
+TITAN Enterprise v20.0 — Secure Auth + Chat Picker
 Single-file high-performance Telegram automation platform.
 """
 from __future__ import annotations
@@ -41,6 +41,7 @@ HOST, PORT = os.getenv("HOST", "0.0.0.0"), int(os.getenv("PORT", "10000"))
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 SUPER_ADMINS = {int(x) for x in os.getenv("SUPER_ADMINS", "8655682794,8773171051").split(",") if x.strip().isdigit()}
 COOKIE_DAYS = 14
+TOKEN_TTL = 86400  # 24 часа
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("titan")
@@ -110,6 +111,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS accounts(id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER, session TEXT, phone TEXT, status TEXT DEFAULT 'active', created_at TEXT);
                 CREATE TABLE IF NOT EXISTS configs(owner_id INTEGER PRIMARY KEY, mode TEXT DEFAULT 'AUTO', send_gap REAL DEFAULT 3, templates TEXT DEFAULT '[]', targets TEXT DEFAULT '[]', randomize INTEGER DEFAULT 0, warmup INTEGER DEFAULT 1, updated_at TEXT);
                 CREATE TABLE IF NOT EXISTS stats(owner_id INTEGER PRIMARY KEY, sent INTEGER DEFAULT 0, failed INTEGER DEFAULT 0, updated_at TEXT);
+                CREATE TABLE IF NOT EXISTS tokens(id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER, token_hash TEXT UNIQUE, expires_at REAL, used INTEGER DEFAULT 0, created_at TEXT);
             """)
             await conn.commit()
             await conn.close()
@@ -158,12 +160,16 @@ async def on_command(event):
         await event.respond("TITAN Enterprise", buttons=[[Button.inline("🌐 Войти в панель", b"login")]])
     elif event.raw_text.startswith("/panel"):
         if uid not in SUPER_ADMINS: return await event.respond("Доступ запрещён.")
-        await event.respond(f"Ссылка для входа:\n{PUBLIC_BASE_URL}/login?uid={uid}")
+        raw = secrets.token_urlsafe(32)
+        await database.execute("INSERT INTO tokens(owner_id,token_hash,expires_at,created_at) VALUES(?,?,?,?)", (uid, digest(raw), time.time()+TOKEN_TTL, now()))
+        await event.respond(f"Ссылка (24 часа):\n{PUBLIC_BASE_URL}/login?token={raw}")
 
 async def on_callback(event):
     if event.data == b"login":
         uid = int(event.sender_id)
-        await event.respond(f"Ссылка для входа:\n{PUBLIC_BASE_URL}/login?uid={uid}")
+        raw = secrets.token_urlsafe(32)
+        await database.execute("INSERT INTO tokens(owner_id,token_hash,expires_at,created_at) VALUES(?,?,?,?)", (uid, digest(raw), time.time()+TOKEN_TTL, now()))
+        await event.respond(f"Ссылка (24 часа):\n{PUBLIC_BASE_URL}/login?token={raw}")
         await event.answer()
 
 async def telegram_start():
@@ -416,11 +422,19 @@ load(); setInterval(load, 5000);
 
 @app.route("/login")
 def login():
-    uid = request.args.get("uid")
-    if not uid or not uid.isdigit():
-        return "Неверный ID."
+    token = request.args.get("token", "")
+    if not token:
+        return "Токен отсутствует."
+    
+    row = submit(database.one("SELECT * FROM tokens WHERE token_hash=? AND used=0 AND expires_at>?", (digest(token), time.time()))).result()
+    if not row:
+        return "Ссылка истекла или недействительна. Запросите новую в боте (/panel)."
+    
+    # Помечаем как использованный (но он живет 24 часа, так что можно зайти по нему только раз)
+    submit(database.execute("UPDATE tokens SET used=1 WHERE id=?", (row["id"],))).result()
+    
     session.permanent = True
-    session["user_id"] = int(uid)
+    session["user_id"] = row["owner_id"]
     session["csrf"] = secrets.token_urlsafe(32)
     return redirect("/")
 
