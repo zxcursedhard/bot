@@ -52,7 +52,7 @@ except ImportError:
 
 API_ID = int(os.getenv("API_ID", "2040"))
 API_HASH = os.getenv("API_HASH", "b18441a1ff607e10a989891a5462e627")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8732669492:AAGh5vNOpmmzW6qlmlv7WxgiT7UFT2wQgj0")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8732669492:AAFAMyL3dIlKBH3E_EqnRDGyQ5t0rrNU1hc")
 FLASK_SECRET = os.getenv("FLASK_SECRET", "titan_omnicore_secret_key_2026_001")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 DB_PATH = os.getenv("DB_PATH", "titan_omnicore.db")
