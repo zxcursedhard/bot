@@ -1,5 +1,5 @@
-# TITAN Enterprise v15.2 Omni-Core + Admin Logs + EXTREME BURST + QR/2FA + Multi-Account
-# pip install telethon flask waitress aiosqlite psutil aiohttp qrcode[pil]
+# TITAN Enterprise v15.4 Omni-Core + Admin Logs + EXTREME BURST + QR/2FA + Multi-Account
+# pip install telethon flask waitress aiosqlite psutil aiohttp qrcode
 
 import os
 import re
@@ -16,6 +16,7 @@ import datetime as dt
 from collections import deque
 from contextlib import asynccontextmanager
 from functools import wraps
+import io
 
 import aiosqlite
 import aiohttp
@@ -36,7 +37,7 @@ from telethon.tl.functions.account import UpdateStatusRequest
 
 try:
     import qrcode
-    import io
+    import qrcode.image.svg
 except ImportError:
     qrcode = None
 
@@ -71,7 +72,7 @@ MAX_LOGS = 500
 LOG_TABLE_LIMIT = 5000
 
 EXTREME_BURST_SIZE = 10
-EXTREME_BURST_INTERVAL = 0.3
+EXTREME_BURST_INTERVAL = 0.1 # Уменьшили паузу между пачками для жесткого экстрима
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -83,7 +84,7 @@ app = Flask(__name__)
 app.secret_key = FLASK_SECRET
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SECURE=bool(PUBLIC_BASE_URL.startswith("https")),
+    SESSION_COOKIE_SECURE=False, # Принудительно False для работы на Render и http
     SESSION_COOKIE_SAMESITE="Lax",
     PERMANENT_SESSION_LIFETIME=dt.timedelta(days=SESSION_DAYS),
     MAX_CONTENT_LENGTH=64 * 1024
@@ -206,16 +207,6 @@ def randomize_text(text, enabled=True):
             last_replaced = False
     return "".join(out)
 
-def check_rate_limit(key, limit=180, window=60):
-    now = time.time()
-    with rate_lock:
-        stamps = rate_limit_map.setdefault(key, [])
-        stamps[:] = [t for t in stamps if now - t < window]
-        if len(stamps) >= limit:
-            return False
-        stamps.append(now)
-        return True
-
 def tail_log(limit=200):
     return list(log_buffer)[-limit:]
 
@@ -233,6 +224,20 @@ class _BufferHandler(logging.Handler):
 _bh = _BufferHandler()
 _bh.setLevel(logging.INFO)
 logging.getLogger().addHandler(_bh)
+
+def make_qr_svg(url: str) -> str:
+    if not qrcode:
+        import urllib.parse
+        return f'<img src="https://api.qrserver.com/v1/create-qr-code/?size=260x260&data={urllib.parse.quote(url)}" style="width:260px;height:260px;border-radius:3px;">'
+    try:
+        factory = qrcode.image.svg.SvgPathImage
+        img = qrcode.make(url, image_factory=factory)
+        buf = io.BytesIO()
+        img.save(buf)
+        return buf.getvalue().decode('utf-8')
+    except Exception:
+        import urllib.parse
+        return f'<img src="https://api.qrserver.com/v1/create-qr-code/?size=260x260&data={urllib.parse.quote(url)}" style="width:260px;height:260px;border-radius:3px;">'
 
 # =====================================================================
 # DATABASE
@@ -525,7 +530,6 @@ class Database:
             await c.commit()
         return raw
 
-    # FIX: сначала проверяем пользователя/подписку, только потом "сжигаем" токен
     async def peek_login_token(self, raw):
         async with self.connect() as c:
             c.row_factory = aiosqlite.Row
@@ -538,19 +542,10 @@ class Database:
                 return None
             return int(row["user_id"])
 
-    async def consume_login_token(self, raw):
+    async def delete_login_token(self, raw):
         async with self.connect() as c:
-            c.row_factory = aiosqlite.Row
-            cur = await c.execute(
-                "SELECT user_id, expires_at FROM tokens WHERE token_hash=?",
-                (token_hash(raw),)
-            )
-            row = await cur.fetchone()
-            if not row or time.time() > row["expires_at"]:
-                return None
             await c.execute("DELETE FROM tokens WHERE token_hash=?", (token_hash(raw),))
             await c.commit()
-            return int(row["user_id"])
 
     async def create_web_session(self, uid):
         raw = secrets.token_urlsafe(40)
@@ -807,7 +802,7 @@ async def setup_bot():
             )
             return
         await event.respond(
-            "⚡ TITAN Enterprise v15.2 Omni-Core\n\nВойдите в панель:",
+            "⚡ TITAN Enterprise v15.4 Omni-Core\n\nВойдите в панель:",
             buttons=[[Button.inline("🌐 Открыть панель", b"web_login")]]
         )
 
@@ -890,7 +885,7 @@ def csrf_required(fn):
     return wrapper
 
 # =====================================================================
-# UI HTML (добавлены QR-модалка и мультиаккаунт-подсказки)
+# UI HTML
 # =====================================================================
 
 LOGIN_HTML = r"""
@@ -932,7 +927,7 @@ animation:scan 3.2s linear infinite;opacity:.8}
 DASHBOARD_HTML = r"""
 <!doctype html><html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>TITAN Omni-Core v15.2</title>
+<title>TITAN Omni-Core v15.4</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Inter:wght@400;500;600;900&display=swap" rel="stylesheet">
 <style>
@@ -1074,7 +1069,7 @@ main{padding:18px 14px}h1{font-size:20px}.grid{grid-template-columns:repeat(2,mi
 <div class="mode-toggle">
 <button id="modeAuto" onclick="setMode('AUTO')">AUTO // БЕЗОПАСНЫЙ</button>
 <button id="modeExtreme" onclick="setMode('EXTREME')">EXTREME // ЭКСТРИМ</button></div>
-<p class="muted" style="font-size:12px;margin-top:10px">AUTO: плавная отправка. EXTREME: минимальная задержка, спит ровно по требованию Telegram.</p></div>
+<p class="muted" style="font-size:12px;margin-top:10px">AUTO: плавная отправка. EXTREME: минимальная задержка.</p></div>
 <div class="section"><h2>Шаблоны (строго по очереди)</h2>
 <textarea id="templates" placeholder="Шаблон #1&#10;Шаблон #2"></textarea>
 <div class="row" style="margin-top:10px"><button onclick="saveTemplates()">СОХРАНИТЬ ШАБЛОНЫ</button>
@@ -1530,24 +1525,30 @@ def consume_login():
     if not raw or len(raw) > 200:
         return render_template_string(LOGIN_HTML, message="Ссылка недействительна."), 400
 
-    # FIX: сначала убеждаемся, что пользователь и подписка валидны, и только потом сжигаем токен
+    # 1. Проверяем токен (не удаляя!)
     uid = run_async(db.peek_login_token(raw))
     if not uid:
-        return render_template_string(LOGIN_HTML, message="Ссылка истекла."), 401
+        return render_template_string(LOGIN_HTML, message="Ссылка истекла или была использована ранее. Запросите новую в боте."), 401
+
+    # 2. Проверяем пользователя
     user = run_async(db.get_user(uid))
-    if not user or (not has_active_subscription(user)):
-        return render_template_string(LOGIN_HTML, message="Доступ не активирован."), 403
+    if not user:
+        return render_template_string(LOGIN_HTML, message="Пользователь не найден."), 404
+        
+    # 3. Проверяем подписку (ссылка не сгорит, если нет подписки!)
+    if not has_active_subscription(user):
+        return render_template_string(LOGIN_HTML, message="Доступ не активирован. Оплатите подписку или обратитесь в поддержку, затем обновите страницу."), 403
 
-    uid2 = run_async(db.consume_login_token(raw))
-    if not uid2:
-        return render_template_string(LOGIN_HTML, message="Ссылка уже использована."), 401
-
+    # 4. Все ок — теперь сжигаем токен и даем сессию
+    run_async(db.delete_login_token(raw))
     sid = run_async(db.create_web_session(uid))
     run_async(db.audit(uid, "WEB_LOGIN", "token"))
+    
     resp = redirect(url_for("dashboard"))
+    is_https = PUBLIC_BASE_URL.startswith("https") or request.is_secure
+    # Secure=False помогает избежать проблем на Render, если https не определился
     resp.set_cookie("titan_sid", sid, max_age=SESSION_DAYS * 86400,
-                    httponly=True, secure=bool(PUBLIC_BASE_URL.startswith("https")),
-                    samesite="Lax", path="/")
+                    httponly=True, secure=False, samesite="Lax", path="/")
     return resp
 
 @app.get("/dashboard")
@@ -1659,7 +1660,6 @@ def api_job_start():
     u = run_async(db.get_user(uid))
     if not u:
         return jsonify({"error": "Пользователь не найден"}), 400
-    # FIX: берём все активные аккаунты (основной + твинки)
     accs = run_async(db.list_account_sessions(uid)) or []
     if not accs and not u["session_string"]:
         return jsonify({"error": "Подключите аккаунт"}), 400
@@ -1702,7 +1702,6 @@ def api_accounts_delete():
     run_async(db.remove_account(uid, account_id))
     return jsonify({"ok": True})
 
-# --- AUTH TELEGRAM: PHONE ---
 @app.post("/api/auth/send_code")
 @login_required
 @csrf_required
@@ -1771,7 +1770,6 @@ def api_auth_verify_code():
         web_flows.pop(uid, None)
     return jsonify(res)
 
-# --- AUTH TELEGRAM: QR ---
 @app.post("/api/auth/qr_start")
 @login_required
 @csrf_required
@@ -1793,16 +1791,7 @@ def api_auth_qr_start():
     except Exception as e:
         return jsonify({"error": str(e)[:120]}), 400
 
-    qr_svg = ""
-    if qrcode:
-        try:
-            img = qrcode.make(url)
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            b64 = base64.b64encode(buf.getvalue()).decode()
-            qr_svg = f'<img src="data:image/png;base64,{b64}" style="width:260px;height:260px">'
-        except Exception:
-            qr_svg = ""
+    qr_svg = make_qr_svg(url)
     return jsonify({"ok": True, "qr_link": url, "qr_svg": qr_svg})
 
 @app.post("/api/auth/qr_poll")
@@ -1819,7 +1808,6 @@ def api_auth_qr_poll():
     async def _poll():
         try:
             await qr.wait(timeout=25)
-            # Успешная авторизация
             await db.set_session(uid, client.session.save(), "", "qr")
             try:
                 await client.disconnect()
@@ -1827,10 +1815,8 @@ def api_auth_qr_poll():
                 pass
             return {"done": True}
         except SessionPasswordNeededError:
-            # QR отсканирован, но нужен пароль 2FA — оставляем клиент живым
             return {"need_2fa": True}
         except asyncio.TimeoutError:
-            # QR истёк — создаём новый в этом же flow
             try:
                 await client.disconnect()
             except Exception:
@@ -1851,7 +1837,6 @@ def api_auth_qr_poll():
         return jsonify({"error": str(e)[:120]}), 400
     return jsonify(res)
 
-# --- 2FA (общий для phone и qr) ---
 @app.post("/api/auth/verify_2fa")
 @login_required
 @csrf_required
@@ -1887,7 +1872,6 @@ def api_auth_verify_2fa():
         web_flows.pop(uid, None)
     return jsonify(res)
 
-# --- PARSER ---
 @app.post("/api/parser/run")
 @login_required
 @csrf_required
@@ -1931,7 +1915,6 @@ def api_parser_run():
     except Exception as e:
         return jsonify({"error": str(e)[:180]}), 400
 
-# --- INVITER ---
 @app.post("/api/invites/save")
 @login_required
 @csrf_required
@@ -1978,13 +1961,11 @@ def api_inviter_run():
     except Exception as e:
         return jsonify({"error": str(e)[:180]}), 400
 
-# --- TERMINAL ---
 @app.get("/api/terminal")
 @login_required
 def api_terminal():
     return jsonify({"lines": tail_log(200)})
 
-# --- ADMIN ---
 @app.get("/api/admin/users")
 @admin_required
 def api_admin_users():
@@ -2079,7 +2060,7 @@ def api_admin_logs_clear():
     return jsonify({"ok": True})
 
 # =====================================================================
-# WORKER + WARMUP (с ротацией аккаунтов)
+# WORKER + WARMUP
 # =====================================================================
 
 async def warmup_client(client):
@@ -2134,11 +2115,19 @@ async def send_to_target(uid, session_str, target, message, delay, stop_event, m
         await db.inc_stat(uid, "errors", 1)
         await db.audit(uid, "NOTIFY_ERROR", f"{target}: {str(exc)[:300]}")
 
+    # В режиме EXTREME нет задержки, если delay=0. Если delay>0, она соблюдается.
     if mode == "AUTO":
         actual_delay = max(1, delay)
         if actual_delay > 0:
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=actual_delay)
+            except asyncio.TimeoutError:
+                pass
+    else:
+        # В EXTREME пауза только если явно указана (delay > 0)
+        if delay > 0:
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=delay)
             except asyncio.TimeoutError:
                 pass
 
@@ -2155,7 +2144,6 @@ async def notification_worker(uid, stop_event):
             if not user:
                 break
 
-            # FIX: мультиаккаунт — собираем все активные сессии, основной + твинки
             accs = await db.list_account_sessions(uid) or []
             sessions = [a["session_string"] for a in accs if a.get("session_string")]
             if not sessions and user["session_string"]:
@@ -2180,7 +2168,6 @@ async def notification_worker(uid, stop_event):
                 except Exception as e:
                     log.warning(f"Warmup failed: {e}")
 
-            # Ротация аккаунтов: распределяем цели по кругу
             def session_for(i):
                 return sessions[i % len(sessions)]
 
@@ -2265,7 +2252,7 @@ async def main():
     client_manager = ClientManager(db, MAX_ACTIVE_CLIENTS)
     threading.Thread(target=run_web, daemon=True, name="titan-web").start()
     await setup_bot()
-    log.info("TITAN Omni-Core v15.2 online")
+    log.info("TITAN Omni-Core v15.4 online")
     await bot.run_until_disconnected()
 
 if __name__ == "__main__":
