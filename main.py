@@ -1,5 +1,5 @@
-# TITAN Enterprise v15.1 Omni-Core + Admin Logs + EXTREME BURST
-# pip install telethon flask waitress aiosqlite psutil aiohttp
+# TITAN Enterprise v15.2 Omni-Core + Admin Logs + EXTREME BURST + QR/2FA + Multi-Account
+# pip install telethon flask waitress aiosqlite psutil aiohttp qrcode[pil]
 
 import os
 import re
@@ -35,6 +35,12 @@ from telethon.tl.functions.messages import ImportChatInviteRequest
 from telethon.tl.functions.account import UpdateStatusRequest
 
 try:
+    import qrcode
+    import io
+except ImportError:
+    qrcode = None
+
+try:
     import psutil
 except ImportError:
     psutil = None
@@ -64,9 +70,8 @@ MAX_TEMPLATES = 9999
 MAX_LOGS = 500
 LOG_TABLE_LIMIT = 5000
 
-# FIX: параметры "пулемётного" режима EXTREME
-EXTREME_BURST_SIZE = 10      # сколько сообщений летят одновременно
-EXTREME_BURST_INTERVAL = 0.3 # пауза между пачками (сек)
+EXTREME_BURST_SIZE = 10
+EXTREME_BURST_INTERVAL = 0.3
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -494,6 +499,15 @@ class Database:
             )
             return [dict(r) for r in await cur.fetchall()]
 
+    async def list_account_sessions(self, uid):
+        async with self.connect() as c:
+            c.row_factory = aiosqlite.Row
+            cur = await c.execute(
+                "SELECT id, session_string, label, phone FROM accounts "
+                "WHERE user_id=? AND status='active' ORDER BY id ASC", (int(uid),)
+            )
+            return [dict(r) for r in await cur.fetchall()]
+
     async def remove_account(self, uid, account_id):
         async with self.connect() as c:
             await c.execute("DELETE FROM accounts WHERE id=? AND user_id=?",
@@ -510,6 +524,19 @@ class Database:
             )
             await c.commit()
         return raw
+
+    # FIX: сначала проверяем пользователя/подписку, только потом "сжигаем" токен
+    async def peek_login_token(self, raw):
+        async with self.connect() as c:
+            c.row_factory = aiosqlite.Row
+            cur = await c.execute(
+                "SELECT user_id, expires_at FROM tokens WHERE token_hash=?",
+                (token_hash(raw),)
+            )
+            row = await cur.fetchone()
+            if not row or time.time() > row["expires_at"]:
+                return None
+            return int(row["user_id"])
 
     async def consume_login_token(self, raw):
         async with self.connect() as c:
@@ -780,7 +807,7 @@ async def setup_bot():
             )
             return
         await event.respond(
-            "⚡ TITAN Enterprise v15.1 Omni-Core\n\nВойдите в панель:",
+            "⚡ TITAN Enterprise v15.2 Omni-Core\n\nВойдите в панель:",
             buttons=[[Button.inline("🌐 Открыть панель", b"web_login")]]
         )
 
@@ -863,7 +890,7 @@ def csrf_required(fn):
     return wrapper
 
 # =====================================================================
-# UI HTML
+# UI HTML (добавлены QR-модалка и мультиаккаунт-подсказки)
 # =====================================================================
 
 LOGIN_HTML = r"""
@@ -905,7 +932,7 @@ animation:scan 3.2s linear infinite;opacity:.8}
 DASHBOARD_HTML = r"""
 <!doctype html><html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>TITAN Omni-Core v15.1</title>
+<title>TITAN Omni-Core v15.2</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Inter:wght@400;500;600;900&display=swap" rel="stylesheet">
 <style>
@@ -958,6 +985,7 @@ button.secondary{background:#0d1016;color:var(--cyan);border:1px solid #00f0ff44
 button.danger{background:linear-gradient(100deg,var(--red),#a80028);color:#fff;box-shadow:0 0 16px #ff003c33}
 button.success{background:linear-gradient(100deg,var(--green),#009955);color:#050505}
 button.ghost{background:transparent;color:var(--muted);border:1px solid #ffffff18;box-shadow:none}
+button.qrbtn{background:#0d1016;color:var(--yellow);border:1px solid #ffd50066}
 table{width:100%;border-collapse:collapse;min-width:650px}
 th,td{text-align:left;padding:12px;border-bottom:1px solid #ffffff0a;font-size:13px}
 th{color:var(--muted);font-weight:600;font-family:'Space Mono',monospace;font-size:11px;letter-spacing:1px}
@@ -1029,9 +1057,13 @@ main{padding:18px 14px}h1{font-size:20px}.grid{grid-template-columns:repeat(2,mi
 
 <!-- 02: АККАУНТЫ -->
 <div id="tab-accounts" class="tab-content hidden">
-<div class="section"><h2>Подключенные аккаунты</h2>
+<div class="section"><h2>Подключенные аккаунты (основной + твинки)</h2>
+<div class="help-box" style="font-size:12px">
+<b>Основной аккаунт</b> — используется как session_string пользователя; твинки добавляются туда же и участвуют в ротации при запуске движка. Порядок: сверху — последний добавленный. Удаление основного (первого) делает основным следующий.
+</div>
 <div class="row" style="margin-bottom:14px">
-<button onclick="openAccModal()">+ ДОБАВИТЬ АККАУНТ</button>
+<button onclick="openAccModal('phone')">+ ПО НОМЕРУ</button>
+<button class="qrbtn" onclick="openAccModal('qr')">+ QR-ВХОД</button>
 <button class="secondary" onclick="loadAccounts()">↻ ОБНОВИТЬ</button></div>
 <div class="tablewrap"><table><thead><tr><th>ID</th><th>Телефон</th><th>Метка</th><th>Статус</th><th>Действие</th></tr></thead>
 <tbody id="accountRows"><tr><td colspan="5" class="muted">Загрузка...</td></tr></tbody></table></div></div></div>
@@ -1115,7 +1147,7 @@ main{padding:18px 14px}h1{font-size:20px}.grid{grid-template-columns:repeat(2,mi
 <th>Баланс</th><th>Отправки</th><th>Сессия</th><th>Действия</th></tr></thead>
 <tbody id="userRows"><tr><td colspan="8" class="muted">Загрузка...</td></tr></tbody></table></div></div></div>
 
-<!-- 09: ЛОГИ ЮЗЕРОВ (NEW) -->
+<!-- 09: ЛОГИ ЮЗЕРОВ -->
 <div id="tab-adminlogs" class="tab-content hidden admin-only">
 <div class="section"><h2>Логи по пользователям</h2>
 <div class="logfilter">
@@ -1133,31 +1165,42 @@ main{padding:18px 14px}h1{font-size:20px}.grid{grid-template-columns:repeat(2,mi
 <th style="width:180px">Действие</th><th>Детали</th></tr></thead>
 <tbody id="userLogRows"><tr><td colspan="4" class="muted">Нет данных</td></tr></tbody></table></div></div></div>
 
-<!-- МОДАЛКА АККАУНТА -->
+<!-- МОДАЛКА АККАУНТА (номер / QR) -->
 <div class="modal" id="accModal"><div class="modal-content">
 <h3 style="margin-top:0;font-family:'Space Mono',monospace">// ПОДКЛЮЧЕНИЕ АККАУНТА</h3>
 <div id="accStep1">
-<p class="muted" style="font-size:13px">Введите номер телефона (+7999...)</p>
+<p class="muted" style="font-size:13px">Введите номер телефона (+7999...) или используйте QR.</p>
 <input type="text" id="phoneInput" placeholder="+79991234567" style="margin-bottom:10px">
 <div class="row"><button onclick="sendCode()">ПОЛУЧИТЬ КОД</button>
+<button class="qrbtn" onclick="startQR()">QR-ВХОД</button>
 <button class="secondary" onclick="closeAccModal()">ОТМЕНА</button></div>
 <p class="notice" id="accNotice"></p></div>
 <div id="accStep2" class="hidden">
 <p class="muted" style="font-size:13px">Введите код</p>
 <input type="text" id="codeInput" placeholder="12345" style="margin-bottom:10px">
 <div class="row"><button onclick="verifyCode()">ВОЙТИ</button>
-<button class="secondary" onclick="closeAccModal()">ОТМЕНА</button></div></div>
+<button class="secondary" onclick="closeAccModal()">ОТМЕНА</button></div>
+<p class="notice" id="accNotice2"></p></div>
 <div id="accStep3" class="hidden">
 <p class="muted" style="font-size:13px">Пароль 2FA</p>
 <input type="password" id="passInput" placeholder="Пароль" style="margin-bottom:10px">
 <div class="row"><button onclick="verify2FA()">ВОЙТИ</button>
-<button class="secondary" onclick="closeAccModal()">ОТМЕНА</button></div></div>
+<button class="secondary" onclick="closeAccModal()">ОТМЕНА</button></div>
+<p class="notice" id="accNotice3"></p></div>
+<div id="accStepQR" class="hidden">
+<p class="muted" style="font-size:13px">Отсканируйте QR в Telegram → Настройки → Устройства → Подключить устройство.</p>
+<div id="qrBox" style="background:#fff;padding:10px;border-radius:3px;display:grid;place-items:center;margin:10px 0"></div>
+<p class="muted" style="font-size:11px;word-break:break-all" id="qrLink"></p>
+<div class="row"><button class="secondary" onclick="closeAccModal()">ОТМЕНА</button></div>
+<p class="notice" id="accNoticeQR"></p>
+</div>
 </div></div>
 
 </main></div>
 <script>
 let csrf='', role='USER', currentTab='overview';
-let configDirty = false; // FIX: флаг, что юзер менял чекбоксы вручную
+let configDirty = false;
+let qrPollTimer = null;
 const esc = v => String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
 function showTab(name){
@@ -1202,7 +1245,6 @@ async function load(){
     document.getElementById('engineMode').textContent='MODE: '+p.mode;
     document.getElementById('templates').value=(p.templates||[]).join('\\n');
     document.getElementById('targets').value=(p.targets||[]).join('\\n');
-    // FIX: не перезаписываем контролы, если юзер их менял, но ещё не сохранил
     if(!configDirty){
       document.getElementById('delay').value=p.delay;
       document.getElementById('randomize').checked=!!p.randomize;
@@ -1234,7 +1276,7 @@ async function saveTargets(){
 }
 async function saveConfig(){
   const randEl = document.getElementById('randomize');
-  const wanted = randEl.checked; // что хочет пользователь СЕЙЧАС
+  const wanted = randEl.checked;
   try{
     const res = await api('/api/config',{method:'POST',body:JSON.stringify({
       delay:parseInt(document.getElementById('delay').value)||10,
@@ -1243,14 +1285,9 @@ async function saveConfig(){
       autosender_enabled:document.getElementById('autosender_enabled').checked,
       webhook_url:document.getElementById('webhook_url').value||''
     })});
-    // FIX: после сохранения принудительно выставляем чекбокс по ответу сервера,
-    // чтобы UI не «откатывался» на старое значение при следующем load().
-    if (res && typeof res.randomize === 'boolean') {
-      randEl.checked = res.randomize;
-    } else {
-      randEl.checked = wanted; // fallback
-    }
-    configDirty = false; // FIX
+    if (res && typeof res.randomize === 'boolean') randEl.checked = res.randomize;
+    else randEl.checked = wanted;
+    configDirty = false;
     msg('Конфигурация сохранена');
   }catch(e){ msg(e.message); }
 }
@@ -1266,7 +1303,8 @@ async function jobAction(action){
 async function loadAccounts(){
   try{const d=await api('/api/accounts'); if(!d) return;
   document.getElementById('accountRows').innerHTML=d.accounts.length?
-    d.accounts.map(a=>`<tr><td>${a.id}</td><td>${esc(a.phone||'—')}</td>
+    d.accounts.map((a,idx)=>`<tr><td>${a.id}${idx===d.accounts.length-1?' <span class="badge green">MAIN</span>':''}</td>
+      <td>${esc(a.phone||'—')}</td>
       <td>${esc(a.label||'—')}</td><td><span class="dot ${a.status==='active'?'':'off'}"></span>${esc(a.status)}</td>
       <td><button class="danger" onclick="delAccount(${a.id})">УДАЛИТЬ</button></td></tr>`).join('')
     : '<tr><td colspan="5" class="muted">Аккаунтов нет</td></tr>';
@@ -1278,14 +1316,21 @@ async function delAccount(id){
     await loadAccounts()}catch(e){alert(e.message)}
 }
 
-function openAccModal(){
+function openAccModal(mode){
   document.getElementById('accModal').style.display='grid';
   document.getElementById('accStep1').classList.remove('hidden');
   document.getElementById('accStep2').classList.add('hidden');
   document.getElementById('accStep3').classList.add('hidden');
+  document.getElementById('accStepQR').classList.add('hidden');
   document.getElementById('accNotice').textContent='';
+  document.getElementById('accNotice2').textContent='';
+  document.getElementById('accNotice3').textContent='';
+  document.getElementById('accNoticeQR').textContent='';
 }
-function closeAccModal(){document.getElementById('accModal').style.display='none'}
+function closeAccModal(){
+  document.getElementById('accModal').style.display='none';
+  if(qrPollTimer){clearInterval(qrPollTimer); qrPollTimer=null;}
+}
 async function sendCode(){
   try{await api('/api/auth/send_code',{method:'POST',
     body:JSON.stringify({phone:document.getElementById('phoneInput').value})});
@@ -1300,13 +1345,43 @@ async function verifyCode(){
       document.getElementById('accStep2').classList.add('hidden');
       document.getElementById('accStep3').classList.remove('hidden');
     }else{closeAccModal(); await load(); await loadAccounts();}
-  }catch(e){document.getElementById('accNotice').textContent=e.message}
+  }catch(e){document.getElementById('accNotice2').textContent=e.message}
 }
 async function verify2FA(){
   try{await api('/api/auth/verify_2fa',{method:'POST',
     body:JSON.stringify({pass:document.getElementById('passInput').value})});
     closeAccModal(); await load(); await loadAccounts()
-  }catch(e){document.getElementById('accNotice').textContent=e.message}
+  }catch(e){document.getElementById('accNotice3').textContent=e.message}
+}
+
+async function startQR(){
+  try{
+    document.getElementById('accStep1').classList.add('hidden');
+    document.getElementById('accStepQR').classList.remove('hidden');
+    const r = await api('/api/auth/qr_start',{method:'POST',body:'{}'});
+    document.getElementById('qrBox').innerHTML = r.qr_svg || '';
+    document.getElementById('qrLink').textContent = r.qr_link || '';
+    pollQR();
+  }catch(e){document.getElementById('accNoticeQR').textContent=e.message}
+}
+function pollQR(){
+  if(qrPollTimer) clearInterval(qrPollTimer);
+  qrPollTimer = setInterval(async ()=>{
+    try{
+      const r = await api('/api/auth/qr_poll',{method:'POST',body:'{}'});
+      if(r.done){
+        clearInterval(qrPollTimer); qrPollTimer=null;
+        closeAccModal(); await load(); await loadAccounts();
+      } else if(r.need_2fa){
+        clearInterval(qrPollTimer); qrPollTimer=null;
+        document.getElementById('accStepQR').classList.add('hidden');
+        document.getElementById('accStep3').classList.remove('hidden');
+      } else if(r.expired){
+        clearInterval(qrPollTimer); qrPollTimer=null;
+        document.getElementById('accNoticeQR').textContent='QR истёк. Нажмите QR-ВХОД снова.';
+      }
+    }catch(e){ /* ignore */ }
+  }, 2500);
 }
 
 async function runParser(){
@@ -1426,7 +1501,6 @@ async function refreshTerminal(){
 }
 function clearTerminal(){document.getElementById('terminal').innerHTML=''}
 
-// FIX: помечаем конфиг грязным при ручном изменении чекбоксов
 ['randomize','warmup','autosender_enabled'].forEach(id=>{
   const el = document.getElementById(id);
   if (el) el.addEventListener('change', ()=>{ configDirty = true; });
@@ -1455,12 +1529,19 @@ def consume_login():
     raw = request.args.get("token", "")
     if not raw or len(raw) > 200:
         return render_template_string(LOGIN_HTML, message="Ссылка недействительна."), 400
-    uid = run_async(db.consume_login_token(raw))
+
+    # FIX: сначала убеждаемся, что пользователь и подписка валидны, и только потом сжигаем токен
+    uid = run_async(db.peek_login_token(raw))
     if not uid:
         return render_template_string(LOGIN_HTML, message="Ссылка истекла."), 401
     user = run_async(db.get_user(uid))
     if not user or (not has_active_subscription(user)):
         return render_template_string(LOGIN_HTML, message="Доступ не активирован."), 403
+
+    uid2 = run_async(db.consume_login_token(raw))
+    if not uid2:
+        return render_template_string(LOGIN_HTML, message="Ссылка уже использована."), 401
+
     sid = run_async(db.create_web_session(uid))
     run_async(db.audit(uid, "WEB_LOGIN", "token"))
     resp = redirect(url_for("dashboard"))
@@ -1520,13 +1601,11 @@ def api_me():
 def api_templates():
     uid = int(request.titan_user["user_id"])
     raw = (request.get_json(silent=True) or {}).get("text", "")
-
     chunks = []
     for line in raw.split("\n"):
         s = line.strip()
         if s:
             chunks.append(s)
-
     values = list(dict.fromkeys(chunks))[:MAX_TEMPLATES]
     run_async(db.update_user_lists(uid, templates=values))
     return jsonify({"ok": True, "count": len(values), "templates": values})
@@ -1578,7 +1657,11 @@ def api_mode():
 def api_job_start():
     uid = int(request.titan_user["user_id"])
     u = run_async(db.get_user(uid))
-    if not u or not u["session_string"]:
+    if not u:
+        return jsonify({"error": "Пользователь не найден"}), 400
+    # FIX: берём все активные аккаунты (основной + твинки)
+    accs = run_async(db.list_account_sessions(uid)) or []
+    if not accs and not u["session_string"]:
         return jsonify({"error": "Подключите аккаунт"}), 400
     templates = safe_json_loads(u["templates"], [])
     targets = safe_json_loads(u["targets"], [])
@@ -1591,7 +1674,7 @@ def api_job_start():
     worker_stops[uid] = stop_event
     run_async(db.set_job_status(uid, "running"))
     workers[uid] = asyncio.run_coroutine_threadsafe(notification_worker(uid, stop_event), loop)
-    return jsonify({"ok": True, "message": "Движок запущен"})
+    return jsonify({"ok": True, "message": f"Движок запущен ({len(accs) or 1} акк.)"})
 
 @app.post("/api/job/stop")
 @login_required
@@ -1619,7 +1702,7 @@ def api_accounts_delete():
     run_async(db.remove_account(uid, account_id))
     return jsonify({"ok": True})
 
-# --- AUTH TELEGRAM ---
+# --- AUTH TELEGRAM: PHONE ---
 @app.post("/api/auth/send_code")
 @login_required
 @csrf_required
@@ -1634,7 +1717,7 @@ def api_auth_send_code():
         try:
             await asyncio.wait_for(client.connect(), timeout=20)
             sent = await client.send_code_request(phone)
-            web_flows[uid] = {"client": client, "phone": phone,
+            web_flows[uid] = {"kind": "phone", "client": client, "phone": phone,
                               "hash": sent.phone_code_hash, "ts": time.time()}
             return True
         except Exception:
@@ -1655,7 +1738,7 @@ def api_auth_verify_code():
     uid = int(request.titan_user["user_id"])
     code = (request.get_json(silent=True) or {}).get("code", "")
     flow = web_flows.get(uid)
-    if not flow:
+    if not flow or flow.get("kind") != "phone":
         return jsonify({"error": "Сессия истекла"}), 400
     if time.time() - flow.get("ts", 0) > 900:
         web_flows.pop(uid, None)
@@ -1688,6 +1771,87 @@ def api_auth_verify_code():
         web_flows.pop(uid, None)
     return jsonify(res)
 
+# --- AUTH TELEGRAM: QR ---
+@app.post("/api/auth/qr_start")
+@login_required
+@csrf_required
+def api_auth_qr_start():
+    uid = int(request.titan_user["user_id"])
+
+    async def _start():
+        client = TelegramClient(StringSession(), API_ID, API_HASH)
+        await asyncio.wait_for(client.connect(), timeout=20)
+        qr = await client.qr_login()
+        web_flows[uid] = {
+            "kind": "qr", "client": client, "qr": qr,
+            "qr_url": qr.url, "ts": time.time()
+        }
+        return qr.url
+
+    try:
+        url = asyncio.run_coroutine_threadsafe(_start(), loop).result(timeout=25)
+    except Exception as e:
+        return jsonify({"error": str(e)[:120]}), 400
+
+    qr_svg = ""
+    if qrcode:
+        try:
+            img = qrcode.make(url)
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            b64 = base64.b64encode(buf.getvalue()).decode()
+            qr_svg = f'<img src="data:image/png;base64,{b64}" style="width:260px;height:260px">'
+        except Exception:
+            qr_svg = ""
+    return jsonify({"ok": True, "qr_link": url, "qr_svg": qr_svg})
+
+@app.post("/api/auth/qr_poll")
+@login_required
+@csrf_required
+def api_auth_qr_poll():
+    uid = int(request.titan_user["user_id"])
+    flow = web_flows.get(uid)
+    if not flow or flow.get("kind") != "qr":
+        return jsonify({"error": "QR-сессия не найдена"}), 400
+    qr = flow["qr"]
+    client = flow["client"]
+
+    async def _poll():
+        try:
+            await qr.wait(timeout=25)
+            # Успешная авторизация
+            await db.set_session(uid, client.session.save(), "", "qr")
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            return {"done": True}
+        except SessionPasswordNeededError:
+            # QR отсканирован, но нужен пароль 2FA — оставляем клиент живым
+            return {"need_2fa": True}
+        except asyncio.TimeoutError:
+            # QR истёк — создаём новый в этом же flow
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            web_flows.pop(uid, None)
+            return {"expired": True}
+        except Exception as e:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            web_flows.pop(uid, None)
+            return {"error": str(e)[:120]}
+
+    try:
+        res = asyncio.run_coroutine_threadsafe(_poll(), loop).result(timeout=30)
+    except Exception as e:
+        return jsonify({"error": str(e)[:120]}), 400
+    return jsonify(res)
+
+# --- 2FA (общий для phone и qr) ---
 @app.post("/api/auth/verify_2fa")
 @login_required
 @csrf_required
@@ -1702,8 +1866,13 @@ def api_auth_verify_2fa():
         client = flow["client"]
         try:
             await client.sign_in(password=passwd)
-            await db.set_session(uid, client.session.save(), flow["phone"], "auto")
-            await client.disconnect()
+            phone = flow.get("phone", "")
+            label = "qr" if flow.get("kind") == "qr" else "auto"
+            await db.set_session(uid, client.session.save(), phone, label)
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
             return {"ok": True}
         except PasswordHashInvalidError:
             return {"error": "Неверный пароль"}
@@ -1714,7 +1883,8 @@ def api_auth_verify_2fa():
         res = asyncio.run_coroutine_threadsafe(_verify(), loop).result(timeout=25)
     except Exception as e:
         return jsonify({"error": str(e)[:120]}), 400
-    web_flows.pop(uid, None)
+    if res.get("ok"):
+        web_flows.pop(uid, None)
     return jsonify(res)
 
 # --- PARSER ---
@@ -1729,11 +1899,15 @@ def api_parser_run():
     if not chat:
         return jsonify({"error": "Укажите чат"}), 400
     u = run_async(db.get_user(uid))
-    if not u or not u["session_string"]:
+    if not u:
+        return jsonify({"error": "Нет пользователя"}), 400
+    accs = run_async(db.list_account_sessions(uid)) or []
+    session_str = accs[0]["session_string"] if accs else u["session_string"]
+    if not session_str:
         return jsonify({"error": "Нет аккаунта"}), 400
 
     async def _parse():
-        async with client_manager.acquire(u["session_string"]) as cli:
+        async with client_manager.acquire(session_str) as cli:
             try:
                 entity = await cli.get_entity(chat)
             except Exception as e:
@@ -1774,15 +1948,19 @@ def api_invites_save():
 def api_inviter_run():
     uid = int(request.titan_user["user_id"])
     u = run_async(db.get_user(uid))
-    if not u or not u["session_string"]:
-        return jsonify({"error": "Нет аккаунта"}), 400
+    if not u:
+        return jsonify({"error": "Нет пользователя"}), 400
     links = safe_json_loads(u["invite_links"], [])
     if not links:
         return jsonify({"error": "Сохраните инвайт-ссылки"}), 400
+    accs = run_async(db.list_account_sessions(uid)) or []
+    session_str = accs[0]["session_string"] if accs else u["session_string"]
+    if not session_str:
+        return jsonify({"error": "Нет аккаунта"}), 400
 
     async def _invite():
         ok, failed = 0, 0
-        async with client_manager.acquire(u["session_string"]) as cli:
+        async with client_manager.acquire(session_str) as cli:
             for h in links:
                 try:
                     await cli(ImportChatInviteRequest(h))
@@ -1857,7 +2035,7 @@ def api_admin_approve():
 def api_admin_grant():
     payload = request.get_json(silent=True) or {}
     uid = int(payload.get("user_id", 0))
-    days = int(payload.get("days", 30))
+    days = max(1, min(3650, int(payload.get("days", 30))))
     expiry = run_async(db.grant_subscription(uid, days))
     run_async(db.audit(request.titan_user["user_id"],
                         "ADMIN_GRANT_SUB", f"{uid} → {expiry}"))
@@ -1901,7 +2079,7 @@ def api_admin_logs_clear():
     return jsonify({"ok": True})
 
 # =====================================================================
-# WORKER + WARMUP
+# WORKER + WARMUP (с ротацией аккаунтов)
 # =====================================================================
 
 async def warmup_client(client):
@@ -1956,7 +2134,6 @@ async def send_to_target(uid, session_str, target, message, delay, stop_event, m
         await db.inc_stat(uid, "errors", 1)
         await db.audit(uid, "NOTIFY_ERROR", f"{target}: {str(exc)[:300]}")
 
-    # В режиме EXTREME пауза НЕ применяется вообще
     if mode == "AUTO":
         actual_delay = max(1, delay)
         if actual_delay > 0:
@@ -1969,19 +2146,28 @@ async def notification_worker(uid, stop_event):
     log.info(f"Engine started for user {uid}")
     sent_before = (await db.get_stats(uid))["sent"]
     errors_before = (await db.get_stats(uid))["errors"]
-    
-    tpl_idx = 0 
-    
+    tpl_idx = 0
+
     try:
         while not stop_event.is_set():
             user = await db.get_user(uid)
             cfg = await db.get_config(uid)
-            if not user or not user["session_string"]:
+            if not user:
                 break
+
+            # FIX: мультиаккаунт — собираем все активные сессии, основной + твинки
+            accs = await db.list_account_sessions(uid) or []
+            sessions = [a["session_string"] for a in accs if a.get("session_string")]
+            if not sessions and user["session_string"]:
+                sessions = [user["session_string"]]
+            if not sessions:
+                break
+
             templates = safe_json_loads(user["templates"], [])
             targets = safe_json_loads(user["targets"], [])
             if not templates or not targets:
                 break
+
             mode = (cfg["mode"] if cfg else "AUTO").upper()
             delay = max(0, int(cfg["delay"] if cfg else 10))
             randomize = bool(cfg["randomize"] if cfg else True)
@@ -1989,54 +2175,45 @@ async def notification_worker(uid, stop_event):
 
             if do_warmup and mode == "AUTO":
                 try:
-                    async with client_manager.acquire(user["session_string"]) as wcli:
+                    async with client_manager.acquire(sessions[0]) as wcli:
                         await warmup_client(wcli)
                 except Exception as e:
                     log.warning(f"Warmup failed: {e}")
 
-            # FIX: Для EXTREME используем пачки (concurrent), чтобы получить 5+ сообщений в секунду
+            # Ротация аккаунтов: распределяем цели по кругу
+            def session_for(i):
+                return sessions[i % len(sessions)]
+
             if mode == "EXTREME":
                 batch = []
-                for target in targets:
+                for i, target in enumerate(targets):
                     if stop_event.is_set():
                         break
-                    
                     tpl_raw = templates[tpl_idx % len(templates)]
                     tpl_idx += 1
                     tpl = randomize_text(tpl_raw, randomize)
                     if len(tpl) > 4000: tpl = tpl[:4000]
-                    
                     batch.append(asyncio.create_task(
-                        send_to_target(uid, user["session_string"], target,
+                        send_to_target(uid, session_for(i), target,
                                        tpl, delay, stop_event, mode)
                     ))
-                    
-                    # Отправляем пачками по 10 штук
                     if len(batch) >= EXTREME_BURST_SIZE:
                         await asyncio.gather(*batch, return_exceptions=True)
                         batch = []
-                        # Пауза между пачками (можно убрать в 0)
                         await asyncio.sleep(EXTREME_BURST_INTERVAL)
-                        
-                # Остаток
                 if batch:
                     await asyncio.gather(*batch, return_exceptions=True)
-                    
-            # Для AUTO — классическая последовательная отправка
             else:
                 tasks = []
-                for target in targets:
+                for i, target in enumerate(targets):
                     if stop_event.is_set():
                         break
-                    
                     tpl_raw = templates[tpl_idx % len(templates)]
                     tpl_idx += 1
-                    
                     tpl = randomize_text(tpl_raw, randomize)
                     if len(tpl) > 4000: tpl = tpl[:4000]
-                    
                     tasks.append(asyncio.create_task(
-                        send_to_target(uid, user["session_string"], target,
+                        send_to_target(uid, session_for(i), target,
                                        tpl, delay, stop_event, mode)
                     ))
                 await asyncio.gather(*tasks, return_exceptions=True)
@@ -2088,7 +2265,7 @@ async def main():
     client_manager = ClientManager(db, MAX_ACTIVE_CLIENTS)
     threading.Thread(target=run_web, daemon=True, name="titan-web").start()
     await setup_bot()
-    log.info("TITAN Omni-Core v15.1 online")
+    log.info("TITAN Omni-Core v15.2 online")
     await bot.run_until_disconnected()
 
 if __name__ == "__main__":
